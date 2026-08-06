@@ -5,10 +5,22 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.11.1",
     "numpy",
+    "onnx>=1.22.0",
+    "onnxruntime>=1.28.0",
     "openai",
+    "opencv-python>=5.0.0.93",
     "pillow",
+    "pycocotools>=2.0.11",
+    "requests>=2.34.2",
+    "torch>=2.13.0",
+    "torchvision>=0.28.0",
+    "tqdm>=4.70.0",
+    "transformers>=4.36.2",
+    "trimesh>=4.12.2",
     "tyro",
+    "viser>=1.0.30",
 ]
 
 [build-system]
@@ -28,6 +40,10 @@ dev = [
     "torch>=2.0",
     "transforms3d>=0.4",
     "trimesh>=4.0",
+    "transformers==4.36.2",
+    "timm>=1.0.28",
+    "addict>=2.4.0",
+    "yapf>=0.43.0",
 ]
 
 [tool.pytest.ini_options]

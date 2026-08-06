@@ -11,3 +11,5 @@ wheels/
 
 private
 src/r2st/models/sam_vit_h_4b8939.pth
+src/r2st/models/groundingdino_swint_ogc.pth
+data/

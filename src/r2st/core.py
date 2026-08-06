@@ -1,4 +1,4 @@
-"""Real2Sim core pipeline — toolkit port of mpcm/real2sim_core.py.
+"""Real2Sim core pipeline — toolkit port of real2sim_core.
 
 Implements the same public helpers as the original (intrinsics, depth alignment,
 pose transforms, rendering stubs) but without hard ROS/Sapien dependencies.
@@ -7,8 +7,13 @@ tests run with only numpy.
 """
 
 import os
+import sys
+import warnings
 from datetime import datetime
 from pathlib import Path
+
+# Make groundingdino importable as top-level (internal code does `from groundingdino.util ...`)
+sys.path.insert(0, str(Path(__file__).parent / "GroundingDINO"))
 
 import cv2
 import matplotlib
@@ -42,15 +47,16 @@ __all__ = [
     "transform_pose_cam_to_world",
 ]
 
-# ---------------------------------------------------------------------------
-# Lazy GroundedSAM imports (mirrors original file structure)
-# ---------------------------------------------------------------------------
+_R2ST_DIR = Path(__file__).resolve().parent
+GROUNDING_DINO_CONFIG = _R2ST_DIR / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"
+GROUNDING_DINO_CHECKPOINT = _R2ST_DIR / "models" / "groundingdino_swint_ogc.pth"
+SAM_CHECKPOINT = _R2ST_DIR / "models" / "sam_vit_h_4b8939.pth"
+SAM_VERSION = "vit_h"
+MESHY_ASSET_DIR = Path("data/meshyai")
 
-SCRIPT_DIR_STR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT_STR = os.path.dirname(os.path.dirname(SCRIPT_DIR_STR))
-
-
-# GroundedSAM helpers
+assert GROUNDING_DINO_CONFIG.is_file(), f"GroundingDINO config not found: {GROUNDING_DINO_CONFIG}"
+assert GROUNDING_DINO_CHECKPOINT.is_file(), f"GroundingDINO checkpoint not found: {GROUNDING_DINO_CHECKPOINT}"
+assert SAM_CHECKPOINT.is_file(), f"SAM checkpoint not found: {SAM_CHECKPOINT}"
 
 
 # ---------------------------------------------------------------------------
@@ -125,8 +131,6 @@ def get_camera_extrinsic(camera_name: str, extrinsics: dict) -> np.ndarray:
 # Pointcloud helpers (thin wrappers that degrade gracefully without open3d)
 # ---------------------------------------------------------------------------
 
-MESHY_ASSET_DIR = Path("data/meshyai")
-
 
 class GroundedSAMPredictor:
     """GroundedSAM predictor with _sam_predictor for full pipeline."""
@@ -141,27 +145,39 @@ class GroundedSAMPredictor:
         self._debug_output_dir = debug_output_dir
         if self._debug_output_dir is not None:
             os.makedirs(self._debug_output_dir, exist_ok=True)
-        bert_config_file = (
-            "thirdparty/Grounded-Segment-Anything/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
-        )
-        bert_checkpoint = "thirdparty/Grounded-Segment-Anything/groundingdino_swint_ogc.pth"
-        sam_checkpoint = "thirdparty/Grounded-Segment-Anything/sam_vit_h_4b8939.pth"
-        sam_version = "vit_h"
         from r2st.segment_anything.segment_anything import (
             SamPredictor,
             sam_model_registry,
         )
 
-        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._device = device or "cpu"
         self._box_threshold = box_threshold
         self._text_threshold = text_threshold
-        self._bert_model = self._load_bert_model(bert_config_file, bert_checkpoint, None, self._device)
-        self._sam_predictor = SamPredictor(sam_model_registry[sam_version](checkpoint=sam_checkpoint).to(self._device))
+        self._bert_model = self._load_bert_model(
+            str(GROUNDING_DINO_CONFIG), str(GROUNDING_DINO_CHECKPOINT), None, self._device
+        )
+        self._sam_predictor = SamPredictor(
+            sam_model_registry[SAM_VERSION](checkpoint=str(SAM_CHECKPOINT)).to(self._device)
+        )
         assert self._bert_model is not None, "GroundedSAM bert model not loaded"
         assert self._sam_predictor is not None, "GroundedSAM predictor not loaded"
 
     @staticmethod
     def _load_bert_model(model_config_path: str, model_checkpoint_path: str, bert_base_uncased_path, device: str):
+        # Third-party FutureWarnings from transformers / huggingface_hub on current torch.
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*_register_pytree_node.*is deprecated.*",
+            category=FutureWarning,
+            module=r"transformers(\..*)?",
+        )
+        warnings.filterwarnings(
+            "ignore",
+            message=r".*resume_download.*is deprecated.*",
+            category=FutureWarning,
+            module=r"huggingface_hub(\..*)?",
+        )
+
         from r2st.GroundingDINO.groundingdino.models import build_model
         from r2st.GroundingDINO.groundingdino.util.slconfig import SLConfig
         from r2st.GroundingDINO.groundingdino.util.utils import clean_state_dict
@@ -186,10 +202,13 @@ class GroundedSAMPredictor:
         with_logits: bool = True,
         device: str = "cpu",
     ):
+        import torch
+
+        assert getattr(model, "tokenizer", None) is not None, "GroundingDINO model has no tokenizer"
         import r2st.GroundingDINO.groundingdino.datasets.transforms as T
         from r2st.GroundingDINO.groundingdino.util.utils import get_phrases_from_posmap
 
-        def load_image(image_: np.ndarray) -> torch.Tensor:
+        def load_image(image_: np.ndarray):
             image_pil = PILImage.fromarray(image_).convert("RGB")
             transform = T.Compose(
                 [
