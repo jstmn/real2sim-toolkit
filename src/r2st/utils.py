@@ -1,4 +1,4 @@
-"""Mesh visualization utilities."""
+"""Shared image and mesh visualization utilities."""
 
 from __future__ import annotations
 
@@ -8,8 +8,53 @@ from pathlib import Path
 import numpy as np
 
 
+class ImageUtils:
+    """Helpers for image masking and cropping."""
+
+    @staticmethod
+    def crop_to_mask(image_bgr: np.ndarray, mask: np.ndarray, pad: int = 8) -> np.ndarray:
+        assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
+        assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
+        assert mask.shape == image_bgr.shape[:2], f"Mask shape {mask.shape} != image {image_bgr.shape[:2]}"
+        assert mask.any(), "Cannot crop empty mask"
+        assert pad >= 0, f"pad must be >= 0, got {pad}"
+        ys, xs = np.where(mask)
+        y0 = max(int(ys.min()) - pad, 0)
+        y1 = min(int(ys.max()) + pad + 1, mask.shape[0])
+        x0 = max(int(xs.min()) - pad, 0)
+        x1 = min(int(xs.max()) + pad + 1, mask.shape[1])
+        assert y1 > y0 and x1 > x0, f"Invalid crop box: ({y0}:{y1}, {x0}:{x1})"
+        return image_bgr[y0:y1, x0:x1]
+
+
 class MeshUtils:
     """Helpers for inspecting and exporting mesh assets."""
+
+    @staticmethod
+    def visualize_glb(glb_path: str | Path) -> None:
+        import viser
+
+        glb_path = Path(glb_path)
+        assert glb_path.is_file(), f"GLB not found at {glb_path}"
+        glb_data = glb_path.read_bytes()
+        assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
+        server = viser.ViserServer()
+        server.scene.world_axes.visible = True
+        server.scene.world_axes.scale = 0.25
+        server.scene.add_grid(
+            "/xy_grid",
+            width=2.0,
+            height=2.0,
+            plane="xy",
+            cell_size=0.05,
+            section_size=0.25,
+            cell_color=(220, 220, 220),
+            section_color=(200, 200, 200),
+            plane_opacity=0.05,
+        )
+        server.scene.add_glb(name="/mesh", glb_data=glb_data)
+        print(f"[info] Viser serving {glb_path} at http://{server.get_host()}:{server.get_port()}")
+        server.sleep_forever()
 
     @staticmethod
     def _scene_to_triangle_mesh(glb_path: Path):

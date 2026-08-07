@@ -7,10 +7,11 @@ import tyro
 
 from r2st.core import GroundedSAMPredictor
 from r2st.openai import list_objects_in_image
+from r2st.utils import ImageUtils, MeshUtils
 
 """
 # Example usage:
-uv run python scripts/main.py --image data/red_T_block_1.png
+uv run python scripts/generate_mesh.py --image data/red_T_block_1.png
 """
 
 
@@ -64,46 +65,6 @@ def _generate_mesh_with_meshy(image_path: pathlib.Path, output_dir: pathlib.Path
     return result_path
 
 
-def _crop_to_mask(image_bgr: np.ndarray, mask: np.ndarray, pad: int = 8) -> np.ndarray:
-    assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
-    assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
-    assert mask.shape == image_bgr.shape[:2], f"Mask shape {mask.shape} != image {image_bgr.shape[:2]}"
-    assert mask.any(), "Cannot crop empty mask"
-    ys, xs = np.where(mask)
-    y0 = max(int(ys.min()) - pad, 0)
-    y1 = min(int(ys.max()) + pad + 1, mask.shape[0])
-    x0 = max(int(xs.min()) - pad, 0)
-    x1 = min(int(xs.max()) + pad + 1, mask.shape[1])
-    assert y1 > y0 and x1 > x0, f"Invalid crop box: ({y0}:{y1}, {x0}:{x1})"
-    return image_bgr[y0:y1, x0:x1]
-
-
-def _visualize_glb(glb_path: pathlib.Path) -> None:
-    import viser
-
-    assert glb_path.exists(), f"GLB not found at {glb_path}"
-    assert glb_path.is_file(), f"GLB path is not a file: {glb_path}"
-    glb_data = glb_path.read_bytes()
-    assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
-    server = viser.ViserServer()
-    server.scene.world_axes.visible = True
-    server.scene.world_axes.scale = 0.25
-    server.scene.add_grid(
-        "/xy_grid",
-        width=2.0,
-        height=2.0,
-        plane="xy",
-        cell_size=0.05,
-        section_size=0.25,
-        cell_color=(220, 220, 220),
-        section_color=(200, 200, 200),
-        plane_opacity=0.05,
-    )
-    server.scene.add_glb(name="/mesh", glb_data=glb_data)
-    print(f"[info] Viser serving {glb_path} at http://{server.get_host()}:{server.get_port()}")
-    server.sleep_forever()
-
-
 def main(args: Args) -> None:
     assert args.image.exists(), f"Image file '{args.image}' not found"
     assert args.image.is_file(), f"Image path '{args.image}' is not a file"
@@ -127,7 +88,7 @@ def main(args: Args) -> None:
     asset_dir.mkdir(parents=True, exist_ok=True)
     masked = image_bgr.copy()
     masked[np.logical_not(mask)] = 0
-    masked_cropped = _crop_to_mask(masked, mask)
+    masked_cropped = ImageUtils.crop_to_mask(masked, mask)
     demo = image_bgr.copy().astype(np.float32)
     demo[np.logical_not(mask)] *= 0.25
     demo = demo.astype(np.uint8)
@@ -154,13 +115,11 @@ def main(args: Args) -> None:
     print(f"Mask: {mask.shape}, {int(mask.sum())} foreground pixels")
     print(f"Mesh: {glb_path} ({glb_path.stat().st_size} bytes)")
     if args.gif:
-        from r2st.utils import MeshUtils
-
         gif_path = asset_dir / f"{target_slug}__orbit.gif"
         gif_path = MeshUtils.save_orbit_gif(glb_path, gif_path)
         print(f"[info] Saved orbit GIF to {gif_path}")
     if args.visualize:
-        _visualize_glb(glb_path)
+        MeshUtils.visualize_glb(glb_path)
 
 
 if __name__ == "__main__":
