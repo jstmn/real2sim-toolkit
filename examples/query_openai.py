@@ -8,7 +8,7 @@ from r2st.openai import list_objects_in_image
 """
 
 # Example usage:
-uv run python scripts/query_openai.py --image data/red_T_block_1.png
+uv run python examples/query_openai.py --image data/red_T_block_1.png
 """
 
 

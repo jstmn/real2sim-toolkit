@@ -36,10 +36,16 @@ uv sync
 Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
 
 ```bash
-uv run python scripts/generate_mesh.py --image data/red_T_block_1.png --visualize
+uv run python examples/generate_mesh.py --image data/red_T_block_1.png --visualize
 ```
 
-Example 2: Track the object in :
+Example 2: Track an object over time:
+
+```python
+uv run python examples/track_object.py --h5_filepath data/bowl_episode_0.h5 --visualize
+```
+
+
 
 
 ## Third party models used

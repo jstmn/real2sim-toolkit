@@ -11,7 +11,7 @@ from r2st.utils import ImageUtils, MeshUtils
 
 """
 # Example usage:
-uv run python scripts/generate_mesh.py --image data/red_T_block_1.png
+uv run python examples/generate_mesh.py --image data/red_T_block_1.png
 """
 
 

@@ -39,11 +39,14 @@ class MeshyAPI:
         enable_pbr: bool,
     ) -> str:
         payload = {
-            "image_url": image_url,
-            "ai_model": MESHY_MODEL_ID,
-            "should_texture": True,
+            "model_type": "standard",
+            "image_enhancement": True,
+            "pose_mode": "",
             "enable_pbr": enable_pbr,
             "target_formats": ["glb"],
+            "image_url": image_url,
+            "ai_model": MESHY_MODEL_ID,
+            "should_remesh": False,
         }
         response = requests.post(
             f"{MESHY_API_BASE}/image-to-3d",
