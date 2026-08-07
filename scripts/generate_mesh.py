@@ -99,7 +99,9 @@ def main(args: Args) -> None:
     cv2.imwrite(str(masked_cropped_path), masked_cropped)
     cv2.imwrite(str(demo_path), demo)
     print(f"[info] Saved masked image to {masked_path}")
-    print(f"[info] Saved masked cropped image to {masked_cropped_path} ({masked_cropped.shape[1]}x{masked_cropped.shape[0]})")
+    print(
+        f"[info] Saved masked cropped image to {masked_cropped_path} ({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
+    )
     print(f"[info] Saved demo overlay to {demo_path}")
     glb_path = asset_dir / f"{target_slug}_glb.glb"
     meshy_result = _generate_mesh_with_meshy(masked_cropped_path, asset_dir)

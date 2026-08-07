@@ -17,9 +17,9 @@ export OPENAI_API_KEY=your_openai_api_key
 # (refiner: 2023-10-28-18-33-37, scorer: 2024-01-11-20-02-45)
 # https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i
 
-# Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+# Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
-# current-gen GPUs (e.g. RTX 50-series/Blackwell); pinned to your driver/GPU is not needed since
+# current-gen GPUs (e.g. RTX 50-series/Blackwell); pinning to your driver/GPU isn't needed b/c
 # CUDA 12.8 covers everything back through sm_70.
 cd src/r2st/FoundationPose/docker
 docker build --network host -t foundationpose -f dockerfile ..
@@ -47,6 +47,9 @@ Example 2: Track the object in :
 * [Segment Anything](https://github.com/facebookresearch/segment-anything)
 * [Grounding DINO](https://github.com/IDEA-Research/Grounded-Segment-Anything/tree/main/GroundingDINO)
 * [FoundationPose](https://github.com/OpenGVLab/FoundationPose)
+* [Cutie](https://github.com/hkchengrex/Cutie) — optional 2D tracker used by `FoundationPoseTracker(use_2d_tracker=True)` to
+  re-anchor FoundationPose's translation each frame (ported from
+  [FoundationPose++](https://github.com/lidingsheng/FoundationPose-plus-plus))
 
 
 

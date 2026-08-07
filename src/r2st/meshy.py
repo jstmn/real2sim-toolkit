@@ -12,6 +12,7 @@ _POLL_INTERVAL_S = 5.0
 _POLL_TIMEOUT_S = 600.0
 MESHY_MODEL_ID = "latest"
 
+
 def _image_path_to_data_uri(image_path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(image_path))
     assert mime in ("image/jpeg", "image/png"), f"Unsupported image MIME type {mime!r} for {image_path}"

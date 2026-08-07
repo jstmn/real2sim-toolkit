@@ -89,9 +89,10 @@ class MeshUtils:
         diffuse: float = 0.65,
     ) -> np.ndarray:
         assert base_colors.ndim == 2 and base_colors.shape[1] == 3, f"Bad base colors: {base_colors.shape}"
-        assert face_normals.shape == (len(base_colors), 3), (
-            f"Normals shape {face_normals.shape} != colors {base_colors.shape}"
-        )
+        assert face_normals.shape == (
+            len(base_colors),
+            3,
+        ), f"Normals shape {face_normals.shape} != colors {base_colors.shape}"
         assert 0.0 <= ambient <= 1.0, f"ambient out of range: {ambient}"
         assert 0.0 <= diffuse <= 1.0, f"diffuse out of range: {diffuse}"
         assert ambient + diffuse > 0, "ambient + diffuse must be > 0"

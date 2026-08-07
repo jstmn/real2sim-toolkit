@@ -7,13 +7,15 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
-import os,sys
+import os
+import sys
 from dataclasses import dataclass
-from typing import Iterator, List, Optional, Set, Union
+
 import numpy as np
 import torch
+
 code_dir = os.path.dirname(os.path.realpath(__file__))
-sys.path.append(f'{code_dir}/../../../../')
+sys.path.append(f"{code_dir}/../../../../")
 from Utils import *
 
 
@@ -25,10 +27,11 @@ class PoseData:
     bbox: (4, ) int
     K: (3, 3) float32
     """
+
     rgb: np.ndarray = None
     bbox: np.ndarray = None
     K: np.ndarray = None
-    depth: Optional[np.ndarray] = None
+    depth: np.ndarray | None = None
     object_data = None
     mesh_diameter: float = None
     rgbA: np.ndarray = None
@@ -37,30 +40,52 @@ class PoseData:
     depthB: np.ndarray = None
     maskA = None
     maskB = None
-    poseA: np.ndarray = None   #(4,4)
+    poseA: np.ndarray = None  # (4,4)
     target: float = None
 
-    def __init__(self, rgbA=None, rgbB=None, depthA=None, depthB=None, maskA=None, maskB=None, normalA=None, normalB=None, xyz_mapA=None, xyz_mapB=None, poseA=None, poseB=None, K=None, target=None, mesh_diameter=None, tf_to_crop=None, crop_mask=None, model_pts=None, label=None, model_scale=None):
-      self.rgbA = rgbA      #(H,W,3) or (H,W*n_view,3) when multiview
-      self.rgbB = rgbB
-      self.depthA = depthA
-      self.depthB = depthB
-      self.poseA = poseA
-      self.poseB = poseB
-      self.maskA = maskA
-      self.maskB = maskB
-      self.crop_mask = crop_mask
-      self.normalA = normalA
-      self.normalB = normalB
-      self.xyz_mapA = xyz_mapA
-      self.xyz_mapB = xyz_mapB
-      self.target = target
-      self.K = K
-      self.mesh_diameter = mesh_diameter
-      self.tf_to_crop = tf_to_crop
-      self.model_pts = model_pts
-      self.label = label
-      self.model_scale = model_scale
+    def __init__(
+        self,
+        rgbA=None,
+        rgbB=None,
+        depthA=None,
+        depthB=None,
+        maskA=None,
+        maskB=None,
+        normalA=None,
+        normalB=None,
+        xyz_mapA=None,
+        xyz_mapB=None,
+        poseA=None,
+        poseB=None,
+        K=None,
+        target=None,
+        mesh_diameter=None,
+        tf_to_crop=None,
+        crop_mask=None,
+        model_pts=None,
+        label=None,
+        model_scale=None,
+    ):
+        self.rgbA = rgbA  # (H,W,3) or (H,W*n_view,3) when multiview
+        self.rgbB = rgbB
+        self.depthA = depthA
+        self.depthB = depthB
+        self.poseA = poseA
+        self.poseB = poseB
+        self.maskA = maskA
+        self.maskB = maskB
+        self.crop_mask = crop_mask
+        self.normalA = normalA
+        self.normalB = normalB
+        self.xyz_mapA = xyz_mapA
+        self.xyz_mapB = xyz_mapB
+        self.target = target
+        self.K = K
+        self.mesh_diameter = mesh_diameter
+        self.tf_to_crop = tf_to_crop
+        self.model_pts = model_pts
+        self.label = label
+        self.model_scale = model_scale
 
 
 @dataclass
@@ -76,18 +101,38 @@ class BatchPoseData:
     object_datas = None
     bboxes: torch.Tensor = None
     K: torch.Tensor = None
-    depths: Optional[torch.Tensor] = None
+    depths: torch.Tensor | None = None
     rgbAs = None
     rgbBs = None
     depthAs = None
     depthBs = None
     normalAs = None
     normalBs = None
-    poseA = None  #(B,4,4)
+    poseA = None  # (B,4,4)
     poseB = None
     targets = None  # Score targets, torch tensor (B)
 
-    def __init__(self, rgbAs=None, rgbBs=None, depthAs=None, depthBs=None, normalAs=None, normalBs=None, maskAs=None, maskBs=None, poseA=None, poseB=None, xyz_mapAs=None, xyz_mapBs=None, tf_to_crops=None, Ks=None, crop_masks=None, model_pts=None, mesh_diameters=None, labels=None):
+    def __init__(
+        self,
+        rgbAs=None,
+        rgbBs=None,
+        depthAs=None,
+        depthBs=None,
+        normalAs=None,
+        normalBs=None,
+        maskAs=None,
+        maskBs=None,
+        poseA=None,
+        poseB=None,
+        xyz_mapAs=None,
+        xyz_mapBs=None,
+        tf_to_crops=None,
+        Ks=None,
+        crop_masks=None,
+        model_pts=None,
+        mesh_diameters=None,
+        labels=None,
+    ):
         self.rgbAs = rgbAs
         self.rgbBs = rgbBs
         self.depthAs = depthAs
@@ -107,29 +152,27 @@ class BatchPoseData:
         self.mesh_diameters = mesh_diameters
         self.labels = labels
 
-
     def pin_memory(self) -> "BatchPoseData":
         for k in self.__dict__:
             if self.__dict__[k] is not None:
-              try:
-                self.__dict__[k] = self.__dict__[k].pin_memory()
-              except Exception as e:
-                pass
+                try:
+                    self.__dict__[k] = self.__dict__[k].pin_memory()
+                except Exception:
+                    pass
         return self
 
     def cuda(self):
         for k in self.__dict__:
             if self.__dict__[k] is not None:
-              try:
-                self.__dict__[k] = self.__dict__[k].cuda()
-              except:
-                pass
+                try:
+                    self.__dict__[k] = self.__dict__[k].cuda()
+                except:
+                    pass
         return self
 
     def select_by_indices(self, ids):
-      out = BatchPoseData()
-      for k in self.__dict__:
-        if self.__dict__[k] is not None:
-          out.__dict__[k] = self.__dict__[k][ids.to(self.__dict__[k].device)]
-      return out
-
+        out = BatchPoseData()
+        for k in self.__dict__:
+            if self.__dict__[k] is not None:
+                out.__dict__[k] = self.__dict__[k][ids.to(self.__dict__[k].device)]
+        return out

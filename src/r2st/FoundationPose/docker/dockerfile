@@ -94,7 +94,7 @@ RUN conda activate my &&\
 ENV OPENCV_IO_ENABLE_OPENEXR=1
 
 RUN conda activate my &&\
-    pip install --no-cache-dir scikit-image meshcat webdataset omegaconf pypng roma seaborn opencv-contrib-python openpyxl wandb imgaug Ninja xlsxwriter timm albumentations xatlas rtree nodejs jupyterlab objaverse g4f ultralytics==8.0.120 pycocotools videoio numba &&\
+    pip install --no-cache-dir scikit-image meshcat webdataset omegaconf pypng roma seaborn opencv-contrib-python openpyxl wandb imgaug Ninja xlsxwriter timm albumentations xatlas rtree nodejs jupyterlab objaverse g4f ultralytics==8.0.120 pycocotools videoio numba hydra-core &&\
     conda install -y -c anaconda h5py
 
 

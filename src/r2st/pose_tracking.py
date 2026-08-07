@@ -18,8 +18,7 @@ FOUNDATIONPOSE_DIR = Path(__file__).resolve().parent / "FoundationPose"
 
 def _ensure_foundationpose_on_path() -> None:
     assert FOUNDATIONPOSE_DIR.is_dir(), (
-        f"FoundationPose not found at {FOUNDATIONPOSE_DIR}. "
-        "Vendor or symlink the FoundationPose repo there."
+        f"FoundationPose not found at {FOUNDATIONPOSE_DIR}. " "Vendor or symlink the FoundationPose repo there."
     )
     path_str = str(FOUNDATIONPOSE_DIR)
     if path_str not in sys.path:
@@ -35,6 +34,55 @@ def _load_foundationpose_deps():
     from Utils import draw_posed_3d_box, draw_xyz_axis
 
     return dr, FoundationPose, PoseRefinePredictor, ScorePredictor, draw_posed_3d_box, draw_xyz_axis
+
+
+def _pose_mat_to_6d(pose) -> np.ndarray:
+    """Convert a possibly-batched 4x4 pose (torch tensor or ndarray) to [tx,ty,tz,rx,ry,rz]."""
+    import torch
+    from scipy.spatial.transform import Rotation
+
+    if torch.is_tensor(pose):
+        pose = pose.detach().cpu().numpy()
+    pose = np.asarray(pose)
+    if pose.ndim == 3:
+        pose = pose[0]
+    assert pose.shape == (4, 4), f"pose must be 4x4 (optionally batched), got {pose.shape}"
+    xyz = pose[:3, 3]
+    euler = Rotation.from_matrix(pose[:3, :3]).as_euler("xyz", degrees=False)
+    return np.r_[xyz, euler]
+
+
+def _pose_6d_to_mat(pose_6d: np.ndarray) -> np.ndarray:
+    """Inverse of `_pose_mat_to_6d`."""
+    from scipy.spatial.transform import Rotation
+
+    assert pose_6d.shape == (6,), f"pose_6d must be a 6-vector, got {pose_6d.shape}"
+    mat = np.eye(4)
+    mat[:3, :3] = Rotation.from_euler("xyz", pose_6d[3:], degrees=False).as_matrix()
+    mat[:3, 3] = pose_6d[:3]
+    return mat
+
+
+def _pose_xy_at_image_point(pose_cam, K: np.ndarray, x: float, y: float) -> tuple[float, float]:
+    """Camera-frame (tx, ty) such that, at pose_cam's current depth, it projects to image point (x, y)."""
+    pose_2d = pose_cam[0] if pose_cam.ndim == 3 else pose_cam
+    tz = float(pose_2d[2, 3])
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    return (x - cx) * tz / fx, (y - cy) * tz / fy
+
+
+def _reanchor_pose_xy(pose_cam, tx: float, ty: float):
+    """Return a copy of pose_cam (torch tensor, optionally batched) with its translation's
+    (x, y) components set to (tx, ty)."""
+    out = pose_cam.clone()
+    if pose_cam.ndim == 3:
+        out[:, 0, 3] = tx
+        out[:, 1, 3] = ty
+    else:
+        out[0, 3] = tx
+        out[1, 3] = ty
+    return out
 
 
 def draw_pose_overlay(
@@ -96,9 +144,9 @@ class FoundationPoseRunner:
         assert depth_m.ndim == 2, f"depth_m must be HxW, got {depth_m.shape}"
         assert depth_m.shape == color_rgb.shape[:2], f"depth shape {depth_m.shape} != color {color_rgb.shape[:2]}"
         assert mask.shape == color_rgb.shape[:2], f"mask shape {mask.shape} != color {color_rgb.shape[:2]}"
-        assert mask.dtype == bool or np.issubdtype(mask.dtype, np.integer) or np.issubdtype(mask.dtype, np.floating), (
-            f"Unexpected mask dtype: {mask.dtype}"
-        )
+        assert (
+            mask.dtype == bool or np.issubdtype(mask.dtype, np.integer) or np.issubdtype(mask.dtype, np.floating)
+        ), f"Unexpected mask dtype: {mask.dtype}"
         assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
         assert iteration >= 1, f"iteration must be >= 1, got {iteration}"
 
@@ -129,9 +177,27 @@ class FoundationPoseRunner:
 
 
 class FoundationPoseTracker:
-    """Keeps a single FoundationPose instance alive: register on frame 0, track after."""
+    """Keeps a single FoundationPose instance alive: register on frame 0, track after.
 
-    def __init__(self, mesh_file: str | Path, debug_dir: str | Path = Path("debug_fp")):
+    Optionally re-anchors FoundationPose's (x, y) translation each frame using a Cutie 2D
+    tracker (``use_2d_tracker``), and/or fuses that measurement with FoundationPose's own
+    pose via a 6-DoF Kalman filter (``use_kalman_filter``) instead of overwriting it outright.
+    This mirrors the tracking loop in FoundationPose++
+    (https://github.com/lidingsheng/FoundationPose-plus-plus, ``src/obj_pose_track.py``).
+    """
+
+    def __init__(
+        self,
+        mesh_file: str | Path,
+        debug_dir: str | Path = Path("debug_fp"),
+        use_2d_tracker: bool = False,
+        use_kalman_filter: bool = False,
+        kalman_measurement_noise_scale: float = 0.05,
+    ):
+        assert use_2d_tracker or not use_kalman_filter, (
+            "use_kalman_filter requires use_2d_tracker=True: the filter fuses the 2D tracker's "
+            "image-plane measurement with FoundationPose's own pose estimate each frame."
+        )
         dr, FoundationPose, PoseRefinePredictor, ScorePredictor, _, _ = _load_foundationpose_deps()
         mesh_file = Path(mesh_file)
         assert mesh_file.is_file(), f"Mesh not found: {mesh_file}"
@@ -159,6 +225,20 @@ class FoundationPoseTracker:
         )
         self.last_pose_cam: np.ndarray | None = None
         self._initial_mask: np.ndarray | None = None
+
+        self._tracker_2d = None
+        if use_2d_tracker:
+            from r2st.cutie_tracker import CutieTracker
+
+            self._tracker_2d = CutieTracker()
+
+        self._kf = None
+        if use_kalman_filter:
+            from r2st.kalman_filter_6d import KalmanFilter6D
+
+            self._kf = KalmanFilter6D(kalman_measurement_noise_scale)
+        self._kf_mean: np.ndarray | None = None
+        self._kf_covariance: np.ndarray | None = None
 
     @property
     def initial_mask(self) -> np.ndarray | None:
@@ -198,6 +278,12 @@ class FoundationPoseTracker:
         pose_cam = np.asarray(pose_cam, dtype=np.float64)
         assert pose_cam.shape == (4, 4), f"Expected 4x4 pose, got {pose_cam.shape}"
         self.last_pose_cam = pose_cam
+
+        if self._tracker_2d is not None:
+            self._tracker_2d.initialize(color_rgb, self._initial_mask)
+        if self._kf is not None:
+            self._kf_mean, self._kf_covariance = self._kf.initiate(_pose_mat_to_6d(self.est.pose_last))
+
         return pose_cam
 
     def track(
@@ -214,7 +300,29 @@ class FoundationPoseTracker:
         assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
         assert iteration >= 1, f"iteration must be >= 1, got {iteration}"
 
+        if self._tracker_2d is not None:
+            bbox_xywh = self._tracker_2d.track(color_rgb)
+            if bbox_xywh is not None:
+                px = bbox_xywh[0] + bbox_xywh[2] / 2
+                py = bbox_xywh[1] + bbox_xywh[3] / 2
+                tx, ty = _pose_xy_at_image_point(self.est.pose_last, K, px, py)
+                if self._kf is None:
+                    self.est.pose_last = _reanchor_pose_xy(self.est.pose_last, tx, ty)
+                else:
+                    self._kf_mean, self._kf_covariance = self._kf.update(
+                        self._kf_mean, self._kf_covariance, _pose_mat_to_6d(self.est.pose_last)
+                    )
+                    self._kf_mean, self._kf_covariance = self._kf.update_from_xy(
+                        self._kf_mean, self._kf_covariance, np.array([tx, ty])
+                    )
+                    fused_pose = _pose_6d_to_mat(self._kf_mean[:6])
+                    self.est.pose_last = self.est.pose_last.new_tensor(fused_pose).reshape(1, 4, 4)
+
         pose_cam = self.est.track_one(rgb=color_rgb, depth=depth_m, K=K, iteration=iteration)
+
+        if self._kf is not None:
+            self._kf_mean, self._kf_covariance = self._kf.predict(self._kf_mean, self._kf_covariance)
+
         pose_cam = np.asarray(pose_cam, dtype=np.float64)
         assert pose_cam.shape == (4, 4), f"Expected 4x4 pose, got {pose_cam.shape}"
         self.last_pose_cam = pose_cam
