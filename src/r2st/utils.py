@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -26,9 +27,48 @@ class ImageUtils:
         assert y1 > y0 and x1 > x0, f"Invalid crop box: ({y0}:{y1}, {x0}:{x1})"
         return image_bgr[y0:y1, x0:x1]
 
+    @staticmethod
+    def get_sam_mask(predictor, image_bgr: np.ndarray, object_name: str) -> np.ndarray:
+        """Run GroundedSAM and return a bool HxW mask for `object_name`."""
+        import torch
+
+        assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
+        assert len(object_name) > 0, "object_name must not be empty"
+        assert predictor._sam_predictor is not None, "GroundedSAM predictor not loaded"
+        assert predictor._bert_model is not None, "GroundedSAM bert model not loaded"
+        masks = predictor.get_sam_mask(image_bgr, object_name)
+        assert isinstance(masks, torch.Tensor), f"Expected torch.Tensor masks, got {type(masks)}"
+        mask = masks[0, 0].cpu().numpy().astype(bool)
+        assert mask.shape[:2] == image_bgr.shape[:2], f"Mask shape {mask.shape[:2]} != image {image_bgr.shape[:2]}"
+        return mask
+
 
 class MeshUtils:
     """Helpers for inspecting and exporting mesh assets."""
+
+    @staticmethod
+    def generate_with_meshy(
+        image_paths: Sequence[str | Path],
+        output_dir: str | Path,
+        *,
+        enable_pbr: bool = True,
+    ) -> Path:
+        """Generate a GLB via Meshy from one or more images. Reuses `output_dir/model_glb.glb` if present."""
+        from r2st.meshy import MESHY_API_KEY, MeshyAPI
+
+        image_paths = [Path(p) for p in image_paths]
+        assert len(image_paths) > 0, "image_paths must not be empty"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        existing = output_dir / "model_glb.glb"
+        if existing.is_file():
+            print(f"[info] Reusing existing Meshy GLB at {existing}")
+            return existing
+        assert MESHY_API_KEY is not None and len(MESHY_API_KEY) > 0, "MESHY_API_KEY is not set"
+        api = MeshyAPI(MESHY_API_KEY)
+        result_path = Path(api.image_to_3d(image_paths=image_paths, output_dir=output_dir, enable_pbr=enable_pbr))
+        assert result_path.is_file(), f"MeshyAPI did not create result at {result_path}"
+        return result_path
 
     @staticmethod
     def visualize_glb(glb_path: str | Path) -> None:

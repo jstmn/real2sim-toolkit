@@ -1,5 +1,6 @@
 import dataclasses
 import pathlib
+import shutil
 
 import cv2
 import numpy as np
@@ -36,23 +37,10 @@ class Args:
 
 
 def _pick_target_object(objects: list[str]) -> str:
-    assert len(objects) == 1, (
-        f"Expected exactly 1 object per camera (cross-view merging not implemented yet), got {len(objects)}: {objects}"
-    )
+    assert (
+        len(objects) == 1
+    ), f"Expected exactly 1 object per camera (cross-view merging not implemented yet), got {len(objects)}: {objects}"
     return objects[0]
-
-
-def _get_sam_mask(predictor: GroundedSAMPredictor, image_bgr: np.ndarray, object_name: str) -> np.ndarray:
-    assert predictor._sam_predictor is not None, "GroundedSAM predictor not loaded"
-    assert predictor._bert_model is not None, "GroundedSAM bert model not loaded"
-    masks = predictor.get_sam_mask(image_bgr, object_name)
-    import torch
-
-    assert isinstance(masks, torch.Tensor), f"Expected torch.Tensor masks, got {type(masks)}"
-    mask = masks[0, 0].cpu().numpy()
-    mask = mask.astype(bool)
-    assert mask.shape[:2] == image_bgr.shape[:2], f"Mask shape {mask.shape[:2]} != image {image_bgr.shape[:2]}"
-    return mask
 
 
 def _load_camera_image(image_path: pathlib.Path, predictor: GroundedSAMPredictor) -> tuple[CameraImage, str]:
@@ -70,7 +58,7 @@ def _load_camera_image(image_path: pathlib.Path, predictor: GroundedSAMPredictor
     assert image_bgr is not None, f"Failed to load image '{image_path}' with cv2"
     assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
     print(f"[info] Image shape: {image_bgr.shape}")
-    mask = _get_sam_mask(predictor, image_bgr, target)
+    mask = ImageUtils.get_sam_mask(predictor, image_bgr, target)
     assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
     assert mask.sum() > 0, f"Segmentation mask is empty for '{image_path}'"
     print(f"[info] Mask pixels: {int(mask.sum())} / {mask.size}")
@@ -100,19 +88,6 @@ def _save_masked_crop(camera_image: CameraImage, target_slug: str, asset_dir: pa
     return masked_cropped_path
 
 
-def _generate_mesh_with_meshy(image_paths: list[pathlib.Path], output_dir: pathlib.Path) -> pathlib.Path:
-    from r2st.meshy import MESHY_API_KEY, MeshyAPI
-
-    assert MESHY_API_KEY is not None and len(MESHY_API_KEY) > 0, "MESHY_API_KEY is not set"
-    api = MeshyAPI(MESHY_API_KEY)
-    result_path = pathlib.Path(api.image_to_3d(image_paths=image_paths, output_dir=output_dir, enable_pbr=True))
-    assert result_path.exists(), f"MeshyAPI did not create result at {result_path}"
-    for cand in output_dir.rglob("*.glb"):
-        return cand
-    assert result_path.exists(), f"GLB not found in {output_dir}"
-    return result_path
-
-
 def main(args: Args) -> None:
     assert len(args.images) >= 1, "At least one --images path is required"
     assert len(args.images) <= 4, f"Meshy multi-image-to-3d accepts at most 4 images, got {len(args.images)}"
@@ -132,11 +107,9 @@ def main(args: Args) -> None:
     masked_cropped_paths = [_save_masked_crop(ci, target_slug, asset_dir) for ci in camera_images]
 
     glb_path = asset_dir / f"{target_slug}_glb.glb"
-    meshy_result = _generate_mesh_with_meshy(masked_cropped_paths, asset_dir)
+    meshy_result = MeshUtils.generate_with_meshy(masked_cropped_paths, asset_dir)
     assert meshy_result.exists(), f"Mesh file not created at {meshy_result}"
     if meshy_result != glb_path:
-        import shutil
-
         shutil.copy2(str(meshy_result), str(glb_path))
     assert glb_path.exists(), f"Mesh file not created at {glb_path}"
     object_assets.glb_filepath = glb_path

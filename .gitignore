@@ -16,3 +16,4 @@ src/r2st/Cutie/weights/
 data/
 data/*/
 src/r2st/FoundationPose-plus-plus/
+temp.sh

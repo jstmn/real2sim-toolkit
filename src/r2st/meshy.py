@@ -49,7 +49,9 @@ class MeshyAPI:
             "target_formats": ["glb"],
             "ai_model": MESHY_MODEL_ID,
             "texture_resolution": "4k",
-            "ultra_mode": True,
+            # ^ 4k does better than 2k
+            "ultra_mode": False,
+            # ^ not sure if this is better true or false
             "should_remesh": True,
         }
         response = requests.post(

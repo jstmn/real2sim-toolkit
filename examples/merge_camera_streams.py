@@ -9,7 +9,24 @@ import tyro
 
 """
 # Example usage:
-uv run python examples/merge_camera_streams.py --demo-dir data/0802_breadloaf/demonstration_0
+
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_breadloaf/demonstration_0
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_breadloaf/demonstration_1
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_cube/demonstration_0
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_cube/demonstration_1
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_cube/demonstration_2
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_cube/demonstration_3
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_multi/demonstration_0
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_multi/demonstration_1
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_multi/demonstration_2
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_mustard/demonstration_0
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_mustard/demonstration_1
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_mustard/demonstration_2
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_mustard/demonstration_3
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_mustard/demonstration_4
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_oxiclean/demonstration_0
+uv run python examples/merge_camera_streams.py --demo-dir  data/0802/0802_oxiclean/demonstration_1
+
 """
 
 
