@@ -6,7 +6,6 @@ You can inherit the Interaction class to create new interaction types
 undo is (sometimes partially) supported
 """
 
-
 import torch
 import torch.nn.functional as F
 

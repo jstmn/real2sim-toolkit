@@ -7,7 +7,6 @@
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
 
-
 from datareader import *
 from learning.training.predict_pose_refine import *
 from learning.training.predict_score import *

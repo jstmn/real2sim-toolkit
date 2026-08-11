@@ -39,14 +39,50 @@ Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visual
 uv run python examples/generate_mesh.py --image data/red_T_block_1.png --visualize
 ```
 
-Example 2: Track an object over time:
+Example 2: Generate a mesh for the "mustard bottle" seen in the first frame of a merged
+demonstration (see `examples/merge_camera_streams.py`):
 
-```python
-uv run python examples/track_object.py --h5_filepath data/bowl_episode_0.h5 --visualize
+```bash
+uv run python examples/track_object.py \
+    --h5-path data/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --camera cam_1 \
+    --object-description "mustard bottle"
 ```
 
+## Pose tracking (gRPC)
 
+FoundationPose runs inside the Docker container (see Installation above), but the rest of the
+toolkit runs on the host in the `uv` venv. `r2st.pose_grpc` bridges the two: a server
+(`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s
+`register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used
+from host-side code (e.g. `examples/track_object.py`) to call it.
 
+Start the server (inside the container -- `docker exec -it foundationpose bash`, then):
+
+```bash
+PYTHONPATH=/path/to/real2sim_toolkit/src python -m r2st.pose_grpc.server --port 50051
+```
+
+Then, on the host:
+
+```python
+from r2st.pose_grpc.client import FoundationPoseClient
+
+client = FoundationPoseClient("localhost:50051")  # --network=host, so localhost reaches the container
+pose_cam = client.register(mesh_path, color_rgb, depth_m, mask, K)  # first frame
+pose_cam = client.track(color_rgb, depth_m, K)  # every subsequent frame
+```
+
+If you change `src/r2st/pose_grpc/pose_tracking.proto`, regenerate the Python bindings from
+`src/r2st/pose_grpc/`:
+
+```bash
+uv run python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. pose_tracking.proto
+```
+
+then re-apply the `from r2st.pose_grpc import ...` fix noted at the top of
+`pose_tracking_pb2_grpc.py` (protoc emits a bare top-level import that breaks once the file is
+imported as a package).
 
 ## Third party models used
 

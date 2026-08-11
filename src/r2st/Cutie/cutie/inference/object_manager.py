@@ -1,4 +1,3 @@
-
 import torch
 from cutie.inference.object_info import ObjectInfo
 

@@ -1,4 +1,3 @@
-
 import torch
 
 from ...inference.clicker import Click

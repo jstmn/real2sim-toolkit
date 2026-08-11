@@ -2,7 +2,6 @@
 For computing auxiliary outputs for auxiliary losses
 """
 
-
 import torch
 from cutie.model.group_modules import GConv2d
 from cutie.utils.tensor_utils import aggregate

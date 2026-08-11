@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn.functional as F
 from cutie.model.channel_attn import CAResBlock

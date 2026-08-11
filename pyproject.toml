@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "grpcio>=1.83.0",
     "h5py>=3.16.0",
     "matplotlib>=3.11.1",
     "numpy",
@@ -45,6 +46,7 @@ dev = [
     "timm>=1.0.28",
     "addict>=2.4.0",
     "yapf>=0.43.0",
+    "grpcio-tools>=1.83.0",
 ]
 
 [tool.pytest.ini_options]

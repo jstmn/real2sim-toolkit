@@ -1,4 +1,3 @@
-
 import torch
 from cutie.model.group_modules import GConv2d
 from cutie.model.transformer.positional_encoding import PositionalEncoding

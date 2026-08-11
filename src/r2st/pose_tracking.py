@@ -193,7 +193,13 @@ class FoundationPoseTracker:
         use_2d_tracker: bool = False,
         use_kalman_filter: bool = False,
         kalman_measurement_noise_scale: float = 0.05,
+        scorer=None,
+        refiner=None,
+        glctx=None,
     ):
+        """`scorer`/`refiner`/`glctx` may be passed in to reuse already-loaded model weights and
+        CUDA context across multiple trackers (e.g. a long-lived server re-registering on a new
+        mesh per video); if omitted, fresh ones are constructed as before."""
         assert use_2d_tracker or not use_kalman_filter, (
             "use_kalman_filter requires use_2d_tracker=True: the filter fuses the 2D tracker's "
             "image-plane measurement with FoundationPose's own pose estimate each frame."
@@ -210,9 +216,9 @@ class FoundationPoseTracker:
         assert isinstance(self.mesh, trimesh.Trimesh), f"Expected Trimesh, got {type(self.mesh)}"
         assert len(self.mesh.vertices) > 0, f"Mesh has no vertices: {mesh_file}"
 
-        self.scorer = ScorePredictor()
-        self.refiner = PoseRefinePredictor()
-        self.glctx = dr.RasterizeCudaContext()
+        self.scorer = scorer if scorer is not None else ScorePredictor()
+        self.refiner = refiner if refiner is not None else PoseRefinePredictor()
+        self.glctx = glctx if glctx is not None else dr.RasterizeCudaContext()
         self.est = FoundationPose(
             model_pts=self.mesh.vertices,
             model_normals=self.mesh.vertex_normals,

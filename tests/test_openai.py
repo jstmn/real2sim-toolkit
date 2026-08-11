@@ -64,7 +64,6 @@ class TestQueryOpenaiScript:
         from unittest.mock import patch
 
         from PIL import Image
-
         from scripts.query_openai import Args, main
 
         p = tmp_path / "img.png"

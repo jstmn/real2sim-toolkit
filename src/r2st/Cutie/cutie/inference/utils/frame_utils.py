@@ -1,4 +1,3 @@
-
 import torch
 
 from inference.object_info import ObjectInfo

@@ -1,4 +1,3 @@
-
 import torch
 
 from ...inference.clicker import Click
@@ -54,7 +53,11 @@ class ZoomIn(BaseTransform):
                 current_object_roi = 0, image_nd.shape[2] - 1, 0, image_nd.shape[3] - 1
 
         update_object_roi = False
-        if self._object_roi is None or not check_object_roi(self._object_roi, clicks_list) or get_bbox_iou(current_object_roi, self._object_roi) < self.recompute_thresh_iou:
+        if (
+            self._object_roi is None
+            or not check_object_roi(self._object_roi, clicks_list)
+            or get_bbox_iou(current_object_roi, self._object_roi) < self.recompute_thresh_iou
+        ):
             update_object_roi = True
 
         if update_object_roi:
