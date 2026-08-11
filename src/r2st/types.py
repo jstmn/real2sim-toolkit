@@ -88,12 +88,28 @@ class WorkspaceBounds:
 
 
 @dataclass
+class CameraImage:
+    """A single camera's observation of a scene, with a segmentation mask for one object."""
+
+    camera_name: str
+    image: np.ndarray
+    mask: np.ndarray
+
+    def __post_init__(self) -> None:
+        assert isinstance(self.camera_name, str) and len(self.camera_name) > 0
+        assert isinstance(self.image, np.ndarray) and self.image.ndim == 3
+        assert isinstance(self.mask, np.ndarray) and self.mask.ndim == 2
+        assert (
+            self.mask.shape == self.image.shape[:2]
+        ), f"mask shape {self.mask.shape} != image shape {self.image.shape[:2]}"
+
+
+@dataclass
 class ObjectAssets:
-    """Assets and observations for a single detected object."""
+    """Assets and observations for a single detected object, across one or more camera views."""
 
     object_name: str
-    mask: np.ndarray
-    image: np.ndarray
+    camera_images: list[CameraImage]
     glb_filepath: Path | None = None
     obj_filepath: Path | None = None
     fbx_filepath: Path | None = None
@@ -102,8 +118,12 @@ class ObjectAssets:
 
     def __post_init__(self) -> None:
         assert isinstance(self.object_name, str) and len(self.object_name) > 0
-        assert isinstance(self.mask, np.ndarray) and self.mask.ndim == 2
-        assert isinstance(self.image, np.ndarray) and self.image.ndim == 3
+        assert (
+            isinstance(self.camera_images, list) and len(self.camera_images) > 0
+        ), "camera_images must be a non-empty list"
+        assert all(
+            isinstance(camera_image, CameraImage) for camera_image in self.camera_images
+        ), f"All camera_images entries must be CameraImage, got {[type(c) for c in self.camera_images]}"
 
 
 @dataclass

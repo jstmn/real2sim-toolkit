@@ -94,8 +94,9 @@ def _get_sam_mask(image_bgr: np.ndarray, object_description: str) -> np.ndarray:
 
 def _generate_mesh_with_meshy(image_path: pathlib.Path, output_dir: pathlib.Path) -> pathlib.Path:
     from r2st.meshy import MeshyAPI
+
     api = MeshyAPI()
-    result_path = pathlib.Path(api.image_to_3d(image_path=image_path, output_dir=output_dir, enable_pbr=True))
+    result_path = pathlib.Path(api.image_to_3d(image_paths=[image_path], output_dir=output_dir, enable_pbr=True))
     assert result_path.is_file(), f"MeshyAPI did not create result at {result_path}"
     return result_path
 

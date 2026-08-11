@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from r2st.types import (
+    CameraImage,
     CameraIntrinsics,
     ObjectAssets,
     ObjectPose,
@@ -40,18 +41,46 @@ class TestWorkspaceBounds:
             WorkspaceBounds(min_x_m=2, max_x_m=1, min_y_m=0, max_y_m=1, min_z_m=0, max_z_m=1)
 
 
+class TestCameraImage:
+    def test_valid(self):
+        mask = np.zeros((480, 640), dtype=bool)
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        ci = CameraImage(camera_name="cam_1", image=img, mask=mask)
+        assert ci.camera_name == "cam_1"
+
+    def test_mismatched_mask_shape_raises(self):
+        mask = np.zeros((10, 10), dtype=bool)
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        with pytest.raises(AssertionError):
+            CameraImage(camera_name="cam_1", image=img, mask=mask)
+
+
 class TestObjectAssets:
     def test_valid(self):
         mask = np.zeros((480, 640), dtype=bool)
         img = np.zeros((480, 640, 3), dtype=np.uint8)
-        oa = ObjectAssets(object_name="red cup", mask=mask, image=img)
+        camera_images = [CameraImage(camera_name="cam_1", image=img, mask=mask)]
+        oa = ObjectAssets(object_name="red cup", camera_images=camera_images)
         assert oa.object_name == "red cup"
+        assert len(oa.camera_images) == 1
 
-    def test_bad_mask_shape_raises(self):
-        mask = np.zeros((480,), dtype=bool)
+    def test_multiple_camera_images(self):
+        mask = np.zeros((480, 640), dtype=bool)
         img = np.zeros((480, 640, 3), dtype=np.uint8)
+        camera_images = [
+            CameraImage(camera_name="cam_1", image=img, mask=mask),
+            CameraImage(camera_name="cam_2", image=img, mask=mask),
+        ]
+        oa = ObjectAssets(object_name="red cup", camera_images=camera_images)
+        assert len(oa.camera_images) == 2
+
+    def test_empty_camera_images_raises(self):
         with pytest.raises(AssertionError):
-            ObjectAssets(object_name="x", mask=mask, image=img)  # type: ignore
+            ObjectAssets(object_name="x", camera_images=[])
+
+    def test_bad_camera_images_type_raises(self):
+        with pytest.raises(AssertionError):
+            ObjectAssets(object_name="x", camera_images=["not a CameraImage"])  # type: ignore
 
 
 class TestObjectPose:

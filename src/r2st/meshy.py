@@ -40,6 +40,7 @@ class MeshyAPI:
         enable_pbr: bool,
     ) -> str:
         assert 1 <= len(image_urls) <= 4, f"multi-image-to-3d accepts 1-4 images, got {len(image_urls)}"
+        assert len(image_urls) == 1, "meshy seems to make better results with only one image"
         payload = {
             "image_urls": image_urls,
             "image_enhancement": True,
@@ -47,7 +48,9 @@ class MeshyAPI:
             "enable_pbr": enable_pbr,
             "target_formats": ["glb"],
             "ai_model": MESHY_MODEL_ID,
-            "should_remesh": False,
+            "texture_resolution": "4k",
+            "ultra_mode": True,
+            "should_remesh": True,
         }
         response = requests.post(
             f"{MESHY_API_BASE}/multi-image-to-3d",

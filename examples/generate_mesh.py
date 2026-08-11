@@ -7,18 +7,23 @@ import tyro
 
 from r2st.core import GroundedSAMPredictor
 from r2st.openai import list_objects_in_image
+from r2st.types import CameraImage, ObjectAssets
 from r2st.utils import ImageUtils, MeshUtils
 
 """
-# Example usage:
-uv run python examples/generate_mesh.py --image data/red_T_block_1.png
+# Example usage (single image):
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png
+
+# Example usage (multiple camera views of the same object, 1-4 images):
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png data/red_T_block_2.png
 """
 
 
 @dataclasses.dataclass
 class Args:
-    image: pathlib.Path
-    """Path to input image (JPG/PNG) of the T block."""
+    images: list[pathlib.Path]
+    """Paths to input images (JPG/PNG) of the object, e.g. from different camera views. Meshy's
+    multi-image-to-3d endpoint accepts 1-4 images."""
 
     output_dir: pathlib.Path = pathlib.Path("data/meshyai")
     """Directory to save generated mesh assets."""
@@ -31,15 +36,13 @@ class Args:
 
 
 def _pick_target_object(objects: list[str]) -> str:
-    assert len(objects) >= 1, f"Expected at least one object from VLM, got {objects}"
-    if len(objects) > 1:
-        print(f"[warning] Expected 1 object, got {len(objects)}: {objects}")
-        print(f"[warning] Picking first object: {objects[0]}")
+    assert len(objects) == 1, (
+        f"Expected exactly 1 object per camera (cross-view merging not implemented yet), got {len(objects)}: {objects}"
+    )
     return objects[0]
 
 
-def _get_sam_mask(image_bgr: np.ndarray, object_name: str) -> np.ndarray:
-    predictor = GroundedSAMPredictor()
+def _get_sam_mask(predictor: GroundedSAMPredictor, image_bgr: np.ndarray, object_name: str) -> np.ndarray:
     assert predictor._sam_predictor is not None, "GroundedSAM predictor not loaded"
     assert predictor._bert_model is not None, "GroundedSAM bert model not loaded"
     masks = predictor.get_sam_mask(image_bgr, object_name)
@@ -52,12 +55,57 @@ def _get_sam_mask(image_bgr: np.ndarray, object_name: str) -> np.ndarray:
     return mask
 
 
-def _generate_mesh_with_meshy(image_path: pathlib.Path, output_dir: pathlib.Path) -> pathlib.Path:
+def _load_camera_image(image_path: pathlib.Path, predictor: GroundedSAMPredictor) -> tuple[CameraImage, str]:
+    """Detect the single target object in `image_path` and segment it.
+
+    Asserts exactly one object per camera. Cross-view object matching/merging is not
+    implemented yet — a separate VLM call will handle that later.
+    """
+    print(f"[info] Querying VLM for objects in {image_path} ...")
+    objects = list_objects_in_image(str(image_path))
+    print(f"[info] VLM objects: {' . '.join(objects)}")
+    target = _pick_target_object(objects)
+    print(f"[info] Target object for '{image_path.name}': '{target}'")
+    image_bgr = cv2.imread(str(image_path))
+    assert image_bgr is not None, f"Failed to load image '{image_path}' with cv2"
+    assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
+    print(f"[info] Image shape: {image_bgr.shape}")
+    mask = _get_sam_mask(predictor, image_bgr, target)
+    assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
+    assert mask.sum() > 0, f"Segmentation mask is empty for '{image_path}'"
+    print(f"[info] Mask pixels: {int(mask.sum())} / {mask.size}")
+    return CameraImage(camera_name=image_path.stem, image=image_bgr, mask=mask), target
+
+
+def _save_masked_crop(camera_image: CameraImage, target_slug: str, asset_dir: pathlib.Path) -> pathlib.Path:
+    prefix = f"{target_slug}__{camera_image.camera_name}"
+    masked = camera_image.image.copy()
+    masked[np.logical_not(camera_image.mask)] = 0
+    masked_cropped = ImageUtils.crop_to_mask(masked, camera_image.mask)
+    demo = camera_image.image.copy().astype(np.float32)
+    demo[np.logical_not(camera_image.mask)] *= 0.25
+    demo = demo.astype(np.uint8)
+    masked_path = asset_dir / f"{prefix}__masked.png"
+    masked_cropped_path = asset_dir / f"{prefix}__masked_cropped.png"
+    demo_path = asset_dir / f"{prefix}__demo.png"
+    cv2.imwrite(str(masked_path), masked)
+    cv2.imwrite(str(masked_cropped_path), masked_cropped)
+    cv2.imwrite(str(demo_path), demo)
+    print(f"[info] Saved masked image to {masked_path}")
+    print(
+        f"[info] Saved masked cropped image to {masked_cropped_path} "
+        f"({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
+    )
+    print(f"[info] Saved demo overlay to {demo_path}")
+    return masked_cropped_path
+
+
+def _generate_mesh_with_meshy(image_paths: list[pathlib.Path], output_dir: pathlib.Path) -> pathlib.Path:
     from r2st.meshy import MESHY_API_KEY, MeshyAPI
 
     assert MESHY_API_KEY is not None and len(MESHY_API_KEY) > 0, "MESHY_API_KEY is not set"
     api = MeshyAPI(MESHY_API_KEY)
-    result_path = pathlib.Path(api.image_to_3d(image_path=image_path, output_dir=output_dir, enable_pbr=True))
+    result_path = pathlib.Path(api.image_to_3d(image_paths=image_paths, output_dir=output_dir, enable_pbr=True))
     assert result_path.exists(), f"MeshyAPI did not create result at {result_path}"
     for cand in output_dir.rglob("*.glb"):
         return cand
@@ -66,55 +114,35 @@ def _generate_mesh_with_meshy(image_path: pathlib.Path, output_dir: pathlib.Path
 
 
 def main(args: Args) -> None:
-    assert args.image.exists(), f"Image file '{args.image}' not found"
-    assert args.image.is_file(), f"Image path '{args.image}' is not a file"
-    print(f"[info] Querying VLM for objects in {args.image} ...")
-    objects = list_objects_in_image(str(args.image))
-    print(f"[info] VLM objects: {' . '.join(objects)}")
-    assert len(objects) >= 1, f"Expected at least one object, got {objects}"
-    target = _pick_target_object(objects)
-    print(f"[info] Target object for mesh: '{target}'")
-    image_bgr = cv2.imread(str(args.image))
-    assert image_bgr is not None, f"Failed to load image '{args.image}' with cv2"
-    assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
-    print(f"[info] Image shape: {image_bgr.shape}")
-    mask = _get_sam_mask(image_bgr, target)
-    assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
-    assert mask.shape[:2] == image_bgr.shape[:2], f"Mask shape {mask.shape[:2]} != image {image_bgr.shape[:2]}"
-    assert mask.sum() > 0, "Segmentation mask is empty"
-    print(f"[info] Mask pixels: {int(mask.sum())} / {mask.size}")
+    assert len(args.images) >= 1, "At least one --images path is required"
+    assert len(args.images) <= 4, f"Meshy multi-image-to-3d accepts at most 4 images, got {len(args.images)}"
+    for image_path in args.images:
+        assert image_path.exists(), f"Image file '{image_path}' not found"
+        assert image_path.is_file(), f"Image path '{image_path}' is not a file"
+
+    predictor = GroundedSAMPredictor()
+    loaded = [_load_camera_image(image_path, predictor) for image_path in args.images]
+    camera_images = [camera_image for camera_image, _ in loaded]
+    target = loaded[0][1]
+    object_assets = ObjectAssets(object_name=target, camera_images=camera_images)
     target_slug = target.replace(" ", "_")
     asset_dir = args.output_dir / target_slug
     asset_dir.mkdir(parents=True, exist_ok=True)
-    masked = image_bgr.copy()
-    masked[np.logical_not(mask)] = 0
-    masked_cropped = ImageUtils.crop_to_mask(masked, mask)
-    demo = image_bgr.copy().astype(np.float32)
-    demo[np.logical_not(mask)] *= 0.25
-    demo = demo.astype(np.uint8)
-    masked_path = asset_dir / f"{target_slug}__masked.png"
-    masked_cropped_path = asset_dir / f"{target_slug}__masked_cropped.png"
-    demo_path = asset_dir / f"{target_slug}__demo.png"
-    cv2.imwrite(str(masked_path), masked)
-    cv2.imwrite(str(masked_cropped_path), masked_cropped)
-    cv2.imwrite(str(demo_path), demo)
-    print(f"[info] Saved masked image to {masked_path}")
-    print(
-        f"[info] Saved masked cropped image to {masked_cropped_path} ({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
-    )
-    print(f"[info] Saved demo overlay to {demo_path}")
+
+    masked_cropped_paths = [_save_masked_crop(ci, target_slug, asset_dir) for ci in camera_images]
+
     glb_path = asset_dir / f"{target_slug}_glb.glb"
-    meshy_result = _generate_mesh_with_meshy(masked_cropped_path, asset_dir)
+    meshy_result = _generate_mesh_with_meshy(masked_cropped_paths, asset_dir)
     assert meshy_result.exists(), f"Mesh file not created at {meshy_result}"
     if meshy_result != glb_path:
         import shutil
 
         shutil.copy2(str(meshy_result), str(glb_path))
     assert glb_path.exists(), f"Mesh file not created at {glb_path}"
+    object_assets.glb_filepath = glb_path
     print("✅ Mesh generated successfully!")
-    print(f"Objects: {' . '.join(objects)}")
     print(f"Target: {target}")
-    print(f"Mask: {mask.shape}, {int(mask.sum())} foreground pixels")
+    print(f"Camera views used: {[ci.camera_name for ci in camera_images]}")
     print(f"Mesh: {glb_path} ({glb_path.stat().st_size} bytes)")
     if args.gif:
         gif_path = asset_dir / f"{target_slug}__orbit.gif"
