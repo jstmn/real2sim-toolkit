@@ -6,11 +6,48 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-
 from datareader import *
 from learning.training.predict_pose_refine import *
 from learning.training.predict_score import *
 from Utils import *
+
+import uuid
+
+
+def _cluster_poses(
+    poses: np.ndarray,
+    symmetry_tfs: np.ndarray,
+    angle_diff_deg: float = 30.0,
+    dist_diff: float = 99999.0,
+) -> np.ndarray:
+    """Python stand-in for mycpp.cluster_poses (Eigen/pybind often segfaults on Nx4x4 numpy)."""
+    poses = np.ascontiguousarray(poses, dtype=np.float32)
+    symmetry_tfs = np.ascontiguousarray(symmetry_tfs, dtype=np.float32)
+    assert poses.ndim == 3 and poses.shape[1:] == (4, 4), f"poses must be Nx4x4, got {poses.shape}"
+    if symmetry_tfs.ndim == 2:
+        symmetry_tfs = symmetry_tfs[None]
+    assert symmetry_tfs.ndim == 3 and symmetry_tfs.shape[1:] == (
+        4,
+        4,
+    ), f"symmetry_tfs must be Nx4x4, got {symmetry_tfs.shape}"
+    radian_thres = float(np.deg2rad(angle_diff_deg))
+    kept = [poses[0]]
+    for cur_pose in poses[1:]:
+        is_new = True
+        for cluster in kept:
+            if np.linalg.norm(cluster[:3, 3] - cur_pose[:3, 3]) >= dist_diff:
+                continue
+            for tf in symmetry_tfs:
+                R = (cur_pose @ tf)[:3, :3]
+                cos = float(np.clip((np.trace(R @ cluster[:3, :3].T) - 1.0) / 2.0, -1.0, 1.0))
+                if np.arccos(cos) < radian_thres:
+                    is_new = False
+                    break
+            if not is_new:
+                break
+        if is_new:
+            kept.append(cur_pose)
+    return np.stack(kept, axis=0)
 
 
 class FoundationPose:
@@ -61,7 +98,6 @@ class FoundationPose:
         model_pts = mesh.vertices
         self.diameter = compute_mesh_diameter(model_pts=mesh.vertices, n_sample=10000)
         self.vox_size = max(self.diameter / 20.0, 0.003)
-        logging.info(f"self.diameter:{self.diameter}, vox_size:{self.vox_size}")
         self.dist_bin = self.vox_size / 2
         self.angle_bin = 20  # Deg
         pcd = toOpen3dCloud(model_pts, normals=model_normals)
@@ -70,7 +106,6 @@ class FoundationPose:
         self.min_xyz = np.asarray(pcd.points).min(axis=0)
         self.pts = torch.tensor(np.asarray(pcd.points), dtype=torch.float32, device="cuda")
         self.normals = F.normalize(torch.tensor(np.asarray(pcd.normals), dtype=torch.float32, device="cuda"), dim=-1)
-        logging.info(f"self.pts:{self.pts.shape}")
         self.mesh_path = None
         self.mesh = mesh
         if self.mesh is not None:
@@ -83,8 +118,6 @@ class FoundationPose:
         else:
             self.symmetry_tfs = torch.as_tensor(symmetry_tfs, device="cuda", dtype=torch.float)
 
-        logging.info("reset done")
-
     def get_tf_to_centered_mesh(self):
         tf_to_center = torch.eye(4, dtype=torch.float, device="cuda")
         tf_to_center[:3, 3] = -torch.as_tensor(self.model_center, device="cuda", dtype=torch.float)
@@ -94,10 +127,8 @@ class FoundationPose:
         for k in self.__dict__:
             self.__dict__[k] = self.__dict__[k]
             if torch.is_tensor(self.__dict__[k]) or isinstance(self.__dict__[k], nn.Module):
-                logging.info(f"Moving {k} to device {s}")
                 self.__dict__[k] = self.__dict__[k].to(s)
         for k in self.mesh_tensors:
-            logging.info(f"Moving {k} to device {s}")
             self.mesh_tensors[k] = self.mesh_tensors[k].to(s)
         if self.refiner is not None:
             self.refiner.model.to(s)
@@ -108,7 +139,6 @@ class FoundationPose:
 
     def make_rotation_grid(self, min_n_views=40, inplane_step=60):
         cam_in_obs = sample_views_icosphere(n_views=min_n_views)
-        logging.info(f"cam_in_obs:{cam_in_obs.shape}")
         rot_grid = []
         for i in range(len(cam_in_obs)):
             for inplane_rot in np.deg2rad(np.arange(0, 360, inplane_step)):
@@ -119,12 +149,10 @@ class FoundationPose:
                 rot_grid.append(ob_in_cam)
 
         rot_grid = np.asarray(rot_grid)
-        logging.info(f"rot_grid:{rot_grid.shape}")
-        rot_grid = mycpp.cluster_poses(30, 99999, rot_grid, self.symmetry_tfs.data.cpu().numpy())
+        symmetry_tfs = self.symmetry_tfs.detach().cpu().contiguous().numpy()
+        rot_grid = _cluster_poses(rot_grid, symmetry_tfs, angle_diff_deg=30, dist_diff=99999)
         rot_grid = np.asarray(rot_grid)
-        logging.info(f"after cluster, rot_grid:{rot_grid.shape}")
         self.rot_grid = torch.as_tensor(rot_grid, device="cuda", dtype=torch.float)
-        logging.info(f"self.rot_grid: {self.rot_grid.shape}")
 
     def generate_random_pose_hypo(self, K, rgb, depth, mask, scene_pts=None):
         """
@@ -138,13 +166,11 @@ class FoundationPose:
     def guess_translation(self, depth, mask, K):
         vs, us = np.where(mask > 0)
         if len(us) == 0:
-            logging.info("mask is all zero")
             return np.zeros(3)
         uc = (us.min() + us.max()) / 2.0
         vc = (vs.min() + vs.max()) / 2.0
         valid = mask.astype(bool) & (depth >= 0.001)
         if not valid.any():
-            logging.info("valid is empty")
             return np.zeros(3)
 
         zc = np.median(depth[valid])
@@ -161,7 +187,6 @@ class FoundationPose:
         @pts: (N,3) np array, downsampled scene points
         """
         set_seed(0)
-        logging.info("Welcome")
 
         if self.glctx is None:
             if glctx is None:
@@ -183,7 +208,6 @@ class FoundationPose:
         normal_map = None
         valid = (depth >= 0.001) & (ob_mask > 0)
         if valid.sum() < 4:
-            logging.info("valid too small, return")
             pose = np.eye(4)
             pose[:3, 3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
             return pose
@@ -202,14 +226,12 @@ class FoundationPose:
 
         poses = self.generate_random_pose_hypo(K=K, rgb=rgb, depth=depth, mask=ob_mask, scene_pts=None)
         poses = poses.data.cpu().numpy()
-        logging.info(f"poses:{poses.shape}")
         center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
 
         poses = torch.as_tensor(poses, device="cuda", dtype=torch.float)
         poses[:, :3, 3] = torch.as_tensor(center.reshape(1, 3), device="cuda")
 
         add_errs = self.compute_add_err_to_gt_pose(poses)
-        logging.info(f"after viewpoint, add_errs min:{add_errs.min()}")
 
         xyz_map = depth2xyzmap(depth, K)
         poses, vis = self.refiner.predict(
@@ -245,14 +267,10 @@ class FoundationPose:
             imageio.imwrite(f"{self.debug_dir}/vis_score.png", vis)
 
         add_errs = self.compute_add_err_to_gt_pose(poses)
-        logging.info(f"final, add_errs min:{add_errs.min()}")
 
         ids = torch.as_tensor(scores).argsort(descending=True)
-        logging.info(f"sort ids:{ids}")
         scores = scores[ids]
         poses = poses[ids]
-
-        logging.info(f"sorted scores:{scores}")
 
         best_pose = poses[0] @ self.get_tf_to_centered_mesh()
         self.pose_last = poses[0]
@@ -271,14 +289,11 @@ class FoundationPose:
 
     def track_one(self, rgb, depth, K, iteration, extra={}):
         if self.pose_last is None:
-            logging.info("Please init pose by register first")
-            raise RuntimeError
-        logging.info("Welcome")
+            raise RuntimeError("Please init pose by register first")
 
         depth = torch.as_tensor(depth, device="cuda", dtype=torch.float)
         depth = erode_depth(depth, radius=2, device="cuda")
         depth = bilateral_filter_depth(depth, radius=2, device="cuda")
-        logging.info("depth processing done")
 
         xyz_map = depth2xyzmap_batch(
             depth[None], torch.as_tensor(K, dtype=torch.float, device="cuda")[None], zfar=np.inf
@@ -298,7 +313,6 @@ class FoundationPose:
             iteration=iteration,
             get_vis=self.debug >= 2,
         )
-        logging.info("pose done")
         if self.debug >= 2:
             extra["vis"] = vis
         self.pose_last = pose

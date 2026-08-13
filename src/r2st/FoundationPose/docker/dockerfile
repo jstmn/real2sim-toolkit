@@ -75,8 +75,10 @@ RUN conda activate my &&\
 # has no GPU access, so torch.cuda.is_available() is False and setup.py would
 # otherwise silently skip building CUDA kernels entirely -- FORCE_CUDA makes it
 # build them anyway, and TORCH_CUDA_ARCH_LIST replaces the (impossible) autodetect.
+# Cover Ampere (A100=8.0) through Blackwell (12.0); building only 12.0 causes
+# cudaErrorNoKernelImageForDevice (209) on older GPUs.
 ENV FORCE_CUDA=1
-ENV TORCH_CUDA_ARCH_LIST="12.0"
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0;10.0;12.0"
 ENV CUDA_HOME=/usr/local/cuda
 ENV PATH=$CUDA_HOME/bin:$PATH
 ENV LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
@@ -105,3 +107,7 @@ RUN conda activate my &&\
 
 ENV SHELL=/bin/bash
 RUN ln -sf /bin/bash /bin/sh
+
+# Keep late-added server deps at the end so rebuilds stay cache-friendly.
+RUN conda activate my &&\
+    pip install --no-cache-dir tyro

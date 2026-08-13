@@ -8,6 +8,8 @@ REALSENSE_D435_DEPTH_TO_COLOR_ROTATION = np.array(
     dtype=np.float64,
 )
 REALSENSE_D435_DEPTH_TO_COLOR_TRANSLATION = np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64)
+MIN_DEPTH_M = 0.01
+MAX_DEPTH_M = 2.0
 
 
 def scale_intrinsics(K: np.ndarray, orig_hw: tuple[int, int], new_hw: tuple[int, int]) -> np.ndarray:
@@ -123,7 +125,7 @@ def align_ros_depth_to_color(
         R_dc=REALSENSE_D435_DEPTH_TO_COLOR_ROTATION,
         t_dc=REALSENSE_D435_DEPTH_TO_COLOR_TRANSLATION,
     )
-    depth_aligned[(depth_aligned < 0.01) | (depth_aligned > 2.0)] = 0
+    depth_aligned[(depth_aligned < MIN_DEPTH_M) | (depth_aligned > MAX_DEPTH_M)] = 0
     return depth_aligned
 
 

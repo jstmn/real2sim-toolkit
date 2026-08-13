@@ -8,14 +8,12 @@ This repository is an API for creating and maintaining a digital twin of a physi
 # Download model weights
 wget --no-check-certificate https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -O src/r2st/models/sam_vit_h_4b8939.pth
 wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth -O src/r2st/models/groundingdino_swint_ogc.pth
+gcloud storage cp --recursive gs://r2st-public/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/
+gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/FoundationPose/weights/
 
 # Set your Meshy and OpenAI API keys (recommended to add to your ~/.bashrc)
 export MESHY_API_KEY=your_meshy_api_key
 export OPENAI_API_KEY=your_openai_api_key
-
-# Download FoundationPose scorer/refiner weights and put them under src/r2st/FoundationPose/weights/
-# (refiner: 2023-10-28-18-33-37, scorer: 2024-01-11-20-02-45)
-# https://drive.google.com/drive/folders/1DFezOAD0oD1BblsXVxqDsl8fj0qzB82i
 
 # Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
@@ -24,8 +22,8 @@ export OPENAI_API_KEY=your_openai_api_key
 cd src/r2st/FoundationPose/docker
 docker build --network host -t foundationpose -f dockerfile ..
 bash run_container.sh
-bash build_all.sh # <-- IN THE DOCKER CONTAINER (builds the mycpp extension; kaolin/pytorch3d/nvdiffrast are already baked into the image)
-
+# In the docker container:
+cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
 # Initialize uv
 uv sync
@@ -36,31 +34,44 @@ uv sync
 Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
 
 ```bash
-uv run python examples/generate_mesh.py --image data/red_T_block_1.png --visualize
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png --visualize
 ```
 
-Example 2: Generate a mesh for the "mustard bottle" seen in the first frame of a merged
-demonstration (see `examples/merge_camera_streams.py`):
+Example 2: Generate a mesh for the "mustard bottle" seen in the first frame of a
+demonstration, then track that object through the demonstration.
+Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
+Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv. 
+`r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
 
 ```bash
+# First download the saved demonstrations to data/0802
+mkdir -p data
+gcloud storage cp --recursive gs://r2st-public/0802 data/
+gcloud storage cp gs://r2st-public/raise_cube_0.h5 data/
+
+
+# Start the server (`cd src/r2st/FoundationPose/docker; bash run_container.sh`), then in the container:
+cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
+
 uv run python examples/track_object.py \
-    --h5-path data/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
-    --object-description "mustard bottle"
+    --realsense-id d435 \
+    --object-description "mustard bottle" \
+    --visualize
+
+
+uv run python examples/track_object.py \
+    --h5-path data/raise_cube_0_merged.h5 \
+    --camera camera_north \
+    --realsense-id d435 \
+    --object-description "blue cube" \
+    --visualize
 ```
 
 ## Pose tracking (gRPC)
 
-FoundationPose runs inside the Docker container (see Installation above), but the rest of the
-toolkit runs on the host in the `uv` venv. `r2st.pose_grpc` bridges the two: a server
-(`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s
-`register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used
-from host-side code (e.g. `examples/track_object.py`) to call it.
-
-Start the server (inside the container -- `docker exec -it foundationpose bash`, then):
-
 ```bash
-PYTHONPATH=/path/to/real2sim_toolkit/src python -m r2st.pose_grpc.server --port 50051
 ```
 
 Then, on the host:

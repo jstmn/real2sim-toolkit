@@ -13,7 +13,7 @@ startup and reused across every `Register` call, so switching to a new mesh/vide
 that cost again.
 
 Usage (inside the container, with this repo's `src/` on PYTHONPATH):
-    PYTHONPATH=src python -m r2st.pose_grpc.server --port 50051
+    PYTHONPATH=src python -m r2st.pose_grpc.server
 """
 
 from __future__ import annotations

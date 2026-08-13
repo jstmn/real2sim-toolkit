@@ -6,8 +6,6 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-
-import importlib
 import logging
 import os
 import pdb
@@ -24,6 +22,7 @@ import torch
 import torch.nn.functional as F
 import torchvision
 import trimesh
+import warp as wp
 from PIL import Image
 from scipy.interpolate import griddata
 from scipy.spatial import cKDTree
@@ -32,27 +31,7 @@ from transformations import *
 yaml = ruamel.yaml.YAML()
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(code_dir)
-try:
-    import kornia
-except Exception:
-    kornia = None
-try:
-    _mycpp_build = os.path.join(code_dir, "mycpp", "build")
-    if os.path.isdir(_mycpp_build):
-        sys.path.insert(0, _mycpp_build)
-    import mycpp
-except Exception:
-    mycpp = None
-try:
-    from bundlesdf.mycuda import common
-except:
-    common = None
-try:
-    import warp as wp
-
-    wp.init()
-except:
-    wp = None
+wp.init()
 enable_timer = 0
 
 
@@ -91,19 +70,36 @@ COLOR_MAP = np.array(
 )
 
 
-def set_logging_format(level=logging.INFO):
-    importlib.reload(logging)
+def set_logging_format(level=logging.WARNING):
     FORMAT = "[%(funcName)s()] %(message)s"
     logging.basicConfig(level=level, format=FORMAT)
 
 
-set_logging_format()
+def to_cuda_float(x):
+    """CUDA float32 tensor. Copies numpy so PyTorch never wraps a read-only buffer."""
+    if torch.is_tensor(x):
+        return x.to(device="cuda", dtype=torch.float)
+    return torch.tensor(np.array(x, copy=True), dtype=torch.float, device="cuda")
+
+
+def set_cuda_float_default():
+    torch.set_default_dtype(torch.float32)
+    torch.set_default_device("cuda")
+
+
+def _texture_image_from_material(material):
+    """Return a PIL RGB image from SimpleMaterial.image or PBRMaterial.baseColorTexture."""
+    image = getattr(material, "image", None)
+    if image is None:
+        image = getattr(material, "baseColorTexture", None)
+    assert image is not None, f"Texture material has no image: {type(material)}"
+    return image.convert("RGB")
 
 
 def make_mesh_tensors(mesh, device="cuda", max_tex_size=None):
     mesh_tensors = {}
     if isinstance(mesh.visual, trimesh.visual.texture.TextureVisuals):
-        img = np.array(mesh.visual.material.image.convert("RGB"))
+        img = np.array(_texture_image_from_material(mesh.visual.material))
         img = img[..., :3]
         if max_tex_size is not None:
             max_size = max(img.shape[0], img.shape[1])
@@ -329,125 +325,129 @@ def make_grid_image(imgs, nrow, padding=5, pad_value=255):
     return grid
 
 
-if wp is not None:
+def _depth_to_warp(depth, device):
+    if isinstance(depth, np.ndarray):
+        return wp.array(np.array(depth, copy=True, dtype=np.float32), dtype=float, device=device)
+    return wp.from_torch(torch.as_tensor(depth, dtype=torch.float, device=device).contiguous())
 
-    @wp.kernel(enable_backward=False)
-    def bilateral_filter_depth_kernel(
-        depth: wp.array(dtype=float, ndim=2),
-        out: wp.array(dtype=float, ndim=2),
-        radius: int,
-        zfar: float,
-        sigmaD: float,
-        sigmaR: float,
-    ):
-        h, w = wp.tid()
-        H = depth.shape[0]
-        W = depth.shape[1]
-        if w >= W or h >= H:
-            return
+
+@wp.kernel(enable_backward=False)
+def bilateral_filter_depth_kernel(
+    depth: wp.array(dtype=float, ndim=2),
+    out: wp.array(dtype=float, ndim=2),
+    radius: int,
+    zfar: float,
+    sigmaD: float,
+    sigmaR: float,
+):
+    h, w = wp.tid()
+    H = depth.shape[0]
+    W = depth.shape[1]
+    if w >= W or h >= H:
+        return
+    out[h, w] = 0.0
+    mean_depth = float(0.0)
+    num_valid = int(0)
+    for u in range(w - radius, w + radius + 1):
+        if u < 0 or u >= W:
+            continue
+        for v in range(h - radius, h + radius + 1):
+            if v < 0 or v >= H:
+                continue
+            cur_depth = depth[v, u]
+            if cur_depth >= 0.001 and cur_depth < zfar:
+                num_valid += 1
+                mean_depth += cur_depth
+    if num_valid == 0:
+        return
+    mean_depth /= float(num_valid)
+
+    depthCenter = depth[h, w]
+    sum_weight = float(0.0)
+    weighted_sum = float(0.0)
+    for u in range(w - radius, w + radius + 1):
+        if u < 0 or u >= W:
+            continue
+        for v in range(h - radius, h + radius + 1):
+            if v < 0 or v >= H:
+                continue
+            cur_depth = depth[v, u]
+            if cur_depth >= 0.001 and cur_depth < zfar and abs(cur_depth - mean_depth) < 0.01:
+                weight = wp.exp(
+                    -float((u - w) * (u - w) + (h - v) * (h - v)) / (2.0 * sigmaD * sigmaD)
+                    - (depthCenter - cur_depth) * (depthCenter - cur_depth) / (2.0 * sigmaR * sigmaR)
+                )
+                sum_weight += weight
+                weighted_sum += weight * cur_depth
+    if sum_weight > 0 and num_valid > 0:
+        out[h, w] = weighted_sum / sum_weight
+
+
+def bilateral_filter_depth(depth, radius=2, zfar=100, sigmaD=2, sigmaR=100000, device="cuda"):
+    depth_wp = _depth_to_warp(depth, device)
+    out_wp = wp.zeros(depth.shape, dtype=float, device=device)
+    wp.launch(
+        kernel=bilateral_filter_depth_kernel,
+        device=device,
+        dim=[depth.shape[0], depth.shape[1]],
+        inputs=[depth_wp, out_wp, radius, zfar, sigmaD, sigmaR],
+    )
+    depth_out = wp.to_torch(out_wp)
+
+    if isinstance(depth, np.ndarray):
+        depth_out = depth_out.data.cpu().numpy()
+    return depth_out
+
+
+@wp.kernel(enable_backward=False)
+def erode_depth_kernel(
+    depth: wp.array(dtype=float, ndim=2),
+    out: wp.array(dtype=float, ndim=2),
+    radius: int,
+    depth_diff_thres: float,
+    ratio_thres: float,
+    zfar: float,
+):
+    h, w = wp.tid()
+    H = depth.shape[0]
+    W = depth.shape[1]
+    if w >= W or h >= H:
+        return
+    d_ori = depth[h, w]
+    if d_ori < 0.001 or d_ori >= zfar:
         out[h, w] = 0.0
-        mean_depth = 0.0
-        num_valid = 0
-        for u in range(w - radius, w + radius + 1):
-            if u < 0 or u >= W:
+    bad_cnt = float(0.0)
+    total = float(0.0)
+    for u in range(w - radius, w + radius + 1):
+        if u < 0 or u >= W:
+            continue
+        for v in range(h - radius, h + radius + 1):
+            if v < 0 or v >= H:
                 continue
-            for v in range(h - radius, h + radius + 1):
-                if v < 0 or v >= H:
-                    continue
-                cur_depth = depth[v, u]
-                if cur_depth >= 0.001 and cur_depth < zfar:
-                    num_valid += 1
-                    mean_depth += cur_depth
-        if num_valid == 0:
-            return
-        mean_depth /= float(num_valid)
+            cur_depth = depth[v, u]
+            total += 1.0
+            if cur_depth < 0.001 or cur_depth >= zfar or abs(cur_depth - d_ori) > depth_diff_thres:
+                bad_cnt += 1.0
+    if bad_cnt / total > ratio_thres:
+        out[h, w] = 0.0
+    else:
+        out[h, w] = d_ori
 
-        depthCenter = depth[h, w]
-        sum_weight = 0.0
-        sum = 0.0
-        for u in range(w - radius, w + radius + 1):
-            if u < 0 or u >= W:
-                continue
-            for v in range(h - radius, h + radius + 1):
-                if v < 0 or v >= H:
-                    continue
-                cur_depth = depth[v, u]
-                if cur_depth >= 0.001 and cur_depth < zfar and abs(cur_depth - mean_depth) < 0.01:
-                    weight = wp.exp(
-                        -float((u - w) * (u - w) + (h - v) * (h - v)) / (2.0 * sigmaD * sigmaD)
-                        - (depthCenter - cur_depth) * (depthCenter - cur_depth) / (2.0 * sigmaR * sigmaR)
-                    )
-                    sum_weight += weight
-                    sum += weight * cur_depth
-        if sum_weight > 0 and num_valid > 0:
-            out[h, w] = sum / sum_weight
 
-    def bilateral_filter_depth(depth, radius=2, zfar=100, sigmaD=2, sigmaR=100000, device="cuda"):
-        if isinstance(depth, np.ndarray):
-            depth_wp = wp.array(depth, dtype=float, device=device)
-        else:
-            depth_wp = wp.from_torch(depth)
-        out_wp = wp.zeros(depth.shape, dtype=float, device=device)
-        wp.launch(
-            kernel=bilateral_filter_depth_kernel,
-            device=device,
-            dim=[depth.shape[0], depth.shape[1]],
-            inputs=[depth_wp, out_wp, radius, zfar, sigmaD, sigmaR],
-        )
-        depth_out = wp.to_torch(out_wp)
+def erode_depth(depth, radius=2, depth_diff_thres=0.001, ratio_thres=0.8, zfar=100, device="cuda"):
+    depth_wp = _depth_to_warp(depth, device)
+    out_wp = wp.zeros(depth.shape, dtype=float, device=device)
+    wp.launch(
+        kernel=erode_depth_kernel,
+        device=device,
+        dim=[depth.shape[0], depth.shape[1]],
+        inputs=[depth_wp, out_wp, radius, depth_diff_thres, ratio_thres, zfar],
+    )
+    depth_out = wp.to_torch(out_wp)
 
-        if isinstance(depth, np.ndarray):
-            depth_out = depth_out.data.cpu().numpy()
-        return depth_out
-
-    @wp.kernel(enable_backward=False)
-    def erode_depth_kernel(
-        depth: wp.array(dtype=float, ndim=2),
-        out: wp.array(dtype=float, ndim=2),
-        radius: int,
-        depth_diff_thres: float,
-        ratio_thres: float,
-        zfar: float,
-    ):
-        h, w = wp.tid()
-        H = depth.shape[0]
-        W = depth.shape[1]
-        if w >= W or h >= H:
-            return
-        d_ori = depth[h, w]
-        if d_ori < 0.001 or d_ori >= zfar:
-            out[h, w] = 0.0
-        bad_cnt = float(0)
-        total = float(0)
-        for u in range(w - radius, w + radius + 1):
-            if u < 0 or u >= W:
-                continue
-            for v in range(h - radius, h + radius + 1):
-                if v < 0 or v >= H:
-                    continue
-                cur_depth = depth[v, u]
-                total += 1.0
-                if cur_depth < 0.001 or cur_depth >= zfar or abs(cur_depth - d_ori) > depth_diff_thres:
-                    bad_cnt += 1.0
-        if bad_cnt / total > ratio_thres:
-            out[h, w] = 0.0
-        else:
-            out[h, w] = d_ori
-
-    def erode_depth(depth, radius=2, depth_diff_thres=0.001, ratio_thres=0.8, zfar=100, device="cuda"):
-        depth_wp = wp.from_torch(torch.as_tensor(depth, dtype=torch.float, device=device))
-        out_wp = wp.zeros(depth.shape, dtype=float, device=device)
-        wp.launch(
-            kernel=erode_depth_kernel,
-            device=device,
-            dim=[depth.shape[0], depth.shape[1]],
-            inputs=[depth_wp, out_wp, radius, depth_diff_thres, ratio_thres, zfar],
-        )
-        depth_out = wp.to_torch(out_wp)
-
-        if isinstance(depth, np.ndarray):
-            depth_out = depth_out.data.cpu().numpy()
-        return depth_out
+    if isinstance(depth, np.ndarray):
+        depth_out = depth_out.data.cpu().numpy()
+    return depth_out
 
 
 def depth2xyzmap(depth, K, uvs=None):
@@ -659,12 +659,12 @@ def compute_crop_window_tf_batch(
         return tf
 
     B = len(poses)
-    torch.set_default_tensor_type("torch.cuda.FloatTensor")
+    set_cuda_float_default()
     if method == "box_3d":
         radius = mesh_diameter * crop_ratio / 2
         offsets = torch.tensor([0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0]).reshape(-1, 3)
         pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
-        K = torch.as_tensor(K)
+        K = to_cuda_float(K)
         projected = (K @ pts.reshape(-1, 3).T).T
         uvs = projected[:, :2] / projected[:, 2:3]
         uvs = uvs.reshape(B, -1, 2)

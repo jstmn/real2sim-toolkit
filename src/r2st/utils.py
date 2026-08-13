@@ -71,6 +71,15 @@ class MeshUtils:
         return result_path
 
     @staticmethod
+    def _pose_mat_to_wxyz_position(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        from trimesh.transformations import quaternion_from_matrix
+
+        assert pose.shape == (4, 4), f"pose must be 4x4, got {pose.shape}"
+        wxyz = np.asarray(quaternion_from_matrix(pose), dtype=np.float64)
+        assert wxyz.shape == (4,), f"Expected wxyz quaternion, got {wxyz.shape}"
+        return wxyz, pose[:3, 3].astype(np.float64)
+
+    @staticmethod
     def visualize_glb(glb_path: str | Path) -> None:
         import viser
 
@@ -94,6 +103,106 @@ class MeshUtils:
         )
         server.scene.add_glb(name="/mesh", glb_data=glb_data)
         print(f"[info] Viser serving {glb_path} at http://{server.get_host()}:{server.get_port()}")
+        server.sleep_forever()
+
+    @staticmethod
+    def visualize_tracking(
+        glb_path: str | Path,
+        poses_cam: np.ndarray,
+        rgb_frames: np.ndarray,
+        K: np.ndarray,
+    ) -> None:
+        """Serve a viser scene of the tracked mesh in the camera frame.
+
+        `poses_cam[t]` is the 4x4 object-in-camera pose at timestep `t`. The capturing
+        camera sits at the origin (OpenCV: +Z forward, +Y down). A slider updates the
+        mesh pose and shows the RGB frame that produced that prediction.
+        """
+        import viser
+
+        glb_path = Path(glb_path)
+        assert glb_path.is_file(), f"GLB not found at {glb_path}"
+        glb_data = glb_path.read_bytes()
+        assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
+        poses_cam = np.asarray(poses_cam, dtype=np.float64)
+        assert poses_cam.ndim == 3 and poses_cam.shape[1:] == (4, 4), f"poses_cam must be Nx4x4, got {poses_cam.shape}"
+        num_frames = poses_cam.shape[0]
+        assert num_frames >= 1, "poses_cam is empty"
+        assert rgb_frames.ndim == 4 and rgb_frames.shape[-1] == 3, f"rgb_frames must be NxHxWx3, got {rgb_frames.shape}"
+        assert (
+            rgb_frames.shape[0] == num_frames
+        ), f"rgb_frames has {rgb_frames.shape[0]} frames, poses have {num_frames}"
+        assert rgb_frames.dtype == np.uint8, f"rgb_frames dtype must be uint8, got {rgb_frames.dtype}"
+        assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+        H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
+        fy = float(K[1, 1])
+        assert fy > 0, f"K[1,1] (fy) must be > 0, got {fy}"
+        fov = float(2.0 * np.arctan(H / (2.0 * fy)))
+        aspect = W / H
+
+        server = viser.ViserServer()
+        server.scene.set_up_direction("-y")
+        server.scene.world_axes.visible = True
+        server.scene.world_axes.scale = 0.15
+
+        wxyz0, pos0 = MeshUtils._pose_mat_to_wxyz_position(poses_cam[0])
+        mesh_handle = server.scene.add_glb(name="/object", glb_data=glb_data, wxyz=wxyz0, position=pos0)
+        axes_handle = server.scene.add_frame(
+            "/object_axes",
+            axes_length=0.06,
+            axes_radius=0.004,
+            origin_radius=0.008,
+            wxyz=wxyz0,
+            position=pos0,
+        )
+        frustum = server.scene.add_camera_frustum(
+            "/camera",
+            fov=fov,
+            aspect=aspect,
+            scale=0.12,
+            line_width=1.5,
+            image=rgb_frames[0],
+            format="jpeg",
+        )
+        if num_frames >= 2:
+            traj = poses_cam[:, :3, 3]
+            server.scene.add_line_segments(
+                "/trajectory",
+                points=np.stack([traj[:-1], traj[1:]], axis=1),
+                colors=(70, 140, 255),
+                line_width=2.0,
+            )
+
+        server.initial_camera.up = (0.0, -1.0, 0.0)
+        server.initial_camera.look_at = pos0
+        server.initial_camera.position = pos0 + np.array([-0.25, -0.2, -0.45], dtype=np.float64)
+
+        gui_image = server.gui.add_image(rgb_frames[0], label="RGB", format="jpeg")
+        pose_md = server.gui.add_markdown("")
+
+        def _apply_timestep(t: int) -> None:
+            assert 0 <= t < num_frames, f"timestep {t} out of range [0, {num_frames})"
+            wxyz, position = MeshUtils._pose_mat_to_wxyz_position(poses_cam[t])
+            mesh_handle.wxyz = wxyz
+            mesh_handle.position = position
+            axes_handle.wxyz = wxyz
+            axes_handle.position = position
+            frustum.image = rgb_frames[t]
+            gui_image.image = rgb_frames[t]
+            pose_md.content = (
+                f"**t = {t} / {num_frames - 1}**\n\n"
+                f"translation (cam): `[{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]`"
+            )
+
+        _apply_timestep(0)
+        if num_frames > 1:
+            slider = server.gui.add_slider("timestep", min=0, max=num_frames - 1, step=1, initial_value=0)
+
+            @slider.on_update
+            def _on_timestep(_) -> None:
+                _apply_timestep(int(slider.value))
+
+        print(f"[info] Viser tracking view at http://{server.get_host()}:{server.get_port()}")
         server.sleep_forever()
 
     @staticmethod

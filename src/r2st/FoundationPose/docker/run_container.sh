@@ -1,6 +1,13 @@
-docker rm -f foundationpose
+#!/usr/bin/env bash
+set -euo pipefail
 
-DIR=$(pwd)/../
+# Always resolve paths from this script's location so it works regardless of cwd.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# docker/ -> FoundationPose/ -> r2st/ -> src/ -> repo root
+REPO_ROOT=$(cd "$SCRIPT_DIR/../../../.." && pwd)
+CONTAINER_REPO=/real2sim-toolkit
+
+docker rm -f foundationpose
 
 docker run \
   --gpus all \
@@ -10,10 +17,8 @@ docker run \
   --name foundationpose \
   --cap-add=SYS_PTRACE \
   --security-opt seccomp=unconfined \
-  -v "$DIR:$DIR" \
-  -v /home:/home \
-  -v /mnt:/mnt \
-  -v /tmp:/tmp \
+  -v "$REPO_ROOT:$CONTAINER_REPO" \
+  -v "$REPO_ROOT:$REPO_ROOT" \
   --ipc=host \
   foundationpose:latest \
-  bash -c "cd $DIR && bash"
+  bash -c "cd $CONTAINER_REPO && bash"

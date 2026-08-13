@@ -6,11 +6,11 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-
 import os
 import sys
 
 import h5py
+import kornia
 
 code_dir = os.path.dirname(os.path.realpath(__file__))
 sys.path.append(f"{code_dir}/../../../../")
@@ -24,7 +24,6 @@ class PairH5Dataset(torch.utils.data.Dataset):
         self.h5_file = h5_file
         self.mode = mode
 
-        logging.info(f"self.h5_file:{self.h5_file}")
         self.n_perturb = None
         self.H_ori = None
         self.W_ori = None
@@ -38,7 +37,6 @@ class PairH5Dataset(torch.utils.data.Dataset):
             if os.path.exists(key_file):
                 with open(key_file, "rb") as ff:
                     self.object_keys = pickle.load(ff)
-                logging.info(f"object_keys loaded#:{len(self.object_keys)} from {key_file}")
                 if max_num_key is not None:
                     self.object_keys = self.object_keys[:max_num_key]
             else:
@@ -46,10 +44,7 @@ class PairH5Dataset(torch.utils.data.Dataset):
                     for k in hf:
                         self.object_keys.append(k)
                         if max_num_key is not None and len(self.object_keys) >= max_num_key:
-                            logging.info("break due to max_num_key")
                             break
-
-            logging.info(f"self.object_keys#:{len(self.object_keys)}, max_num_key:{max_num_key}")
 
             with h5py.File(h5_file, "r", libver="latest") as hf:
                 group = hf[self.object_keys[0]]
@@ -67,7 +62,6 @@ class PairH5Dataset(torch.utils.data.Dataset):
                             self.H_ori = 540
                             self.W_ori = 720
                 self.n_perturb = cnt
-                logging.info(f"self.n_perturb:{self.n_perturb}")
 
     def __len__(self):
         if self.mode == "test":
@@ -229,14 +223,10 @@ class PoseRefinePairH5Dataset(PairH5Dataset):
                     depthA = imageio.imread(group[key_perturb]["depthA"][()])
                     depthB = imageio.imread(group[key_perturb]["depthB"][()])
                     self.cfg["n_view"] = min(self.cfg["n_view"], depthA.shape[1] // depthB.shape[1])
-                    logging.info(f'n_view:{self.cfg["n_view"]}')
                     self.trans_normalizer = group[key_perturb]["trans_normalizer"][()]
                     if isinstance(self.trans_normalizer, np.ndarray):
                         self.trans_normalizer = self.trans_normalizer.tolist()
                     self.rot_normalizer = group[key_perturb]["rot_normalizer"][()] / 180.0 * np.pi
-                    logging.info(
-                        f"self.trans_normalizer:{self.trans_normalizer}, self.rot_normalizer:{self.rot_normalizer}"
-                    )
                     break
 
     def transform_batch(self, batch: BatchPoseData, H_ori, W_ori, bound=1):

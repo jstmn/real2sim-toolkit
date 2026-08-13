@@ -6,7 +6,6 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
-
 import os
 import sys
 
@@ -74,7 +73,6 @@ def make_crop_data_batch(
     dataset: TripletH5Dataset = None,
     cfg=None,
 ):
-    logging.info("Welcome make_crop_data_batch")
     H, W = depth.shape[:2]
 
     args = []
@@ -90,7 +88,6 @@ def make_crop_data_batch(
         method=method,
         mesh_diameter=mesh_diameter,
     )
-    logging.info("make tf_to_crops done")
 
     B = len(ob_in_cams)
     poseAs = torch.as_tensor(ob_in_cams, dtype=torch.float, device="cuda")
@@ -130,7 +127,6 @@ def make_crop_data_batch(
     rgb_rs = torch.cat(rgb_rs, dim=0).permute(0, 3, 1, 2) * 255
     depth_rs = torch.cat(depth_rs, dim=0).permute(0, 3, 1, 2)
     xyz_map_rs = torch.cat(xyz_map_rs, dim=0).permute(0, 3, 1, 2)  # (B,3,H,W)
-    logging.info("render done")
 
     rgbBs = kornia.geometry.transform.warp_perspective(
         torch.as_tensor(rgb, dtype=torch.float, device="cuda").permute(2, 0, 1)[None].expand(B, -1, -1, -1),
@@ -185,8 +181,6 @@ def make_crop_data_batch(
     )
     pose_data = dataset.transform_batch(pose_data, H_ori=H, W_ori=W, bound=1)
 
-    logging.info("pose batch data done")
-
     return pose_data
 
 
@@ -218,19 +212,15 @@ class ScorePredictor:
         if "crop_ratio" not in self.cfg or self.cfg["crop_ratio"] is None:
             self.cfg["crop_ratio"] = 1.2
 
-        logging.info(f"self.cfg: \n {OmegaConf.to_yaml(self.cfg)}")
-
         self.dataset = ScoreMultiPairH5Dataset(cfg=self.cfg, mode="test", h5_file=None, max_num_key=1)
         self.model = ScoreNetMultiPair(cfg=self.cfg, c_in=self.cfg["c_in"]).cuda()
 
-        logging.info(f"Using pretrained model from {ckpt_dir}")
         ckpt = torch.load(ckpt_dir)
         if "model" in ckpt:
             ckpt = ckpt["model"]
         self.model.load_state_dict(ckpt)
 
         self.model.cuda().eval()
-        logging.info("init done")
 
     @torch.inference_mode()
     def predict(
@@ -249,20 +239,16 @@ class ScorePredictor:
         """
         @rgb: np array (H,W,3)
         """
-        logging.info(f"ob_in_cams:{ob_in_cams.shape}")
         ob_in_cams = torch.as_tensor(ob_in_cams, dtype=torch.float, device="cuda")
 
-        logging.info(f"self.cfg.use_normal:{self.cfg.use_normal}")
         if not self.cfg.use_normal:
             normal_map = None
-
-        logging.info("making cropped data")
 
         if mesh_tensors is None:
             mesh_tensors = make_mesh_tensors(mesh)
 
-        rgb = torch.as_tensor(rgb, device="cuda", dtype=torch.float)
-        depth = torch.as_tensor(depth, device="cuda", dtype=torch.float)
+        rgb = to_cuda_float(rgb)
+        depth = to_cuda_float(depth)
 
         pose_data = make_crop_data_batch(
             self.cfg.input_resize,
@@ -280,7 +266,6 @@ class ScorePredictor:
         )
 
         def find_best_among_pairs(pose_data: BatchPoseData):
-            logging.info(f"pose_data.rgbAs.shape[0]: {pose_data.rgbAs.shape[0]}")
             ids = []
             scores = []
             bs = pose_data.rgbAs.shape[0]
@@ -294,7 +279,7 @@ class ScorePredictor:
                 if pose_data.normalAs is not None:
                     A = torch.cat([A, pose_data.normalAs.cuda().float()], dim=1)
                     B = torch.cat([B, pose_data.normalBs.cuda().float()], dim=1)
-                with torch.cuda.amp.autocast(enabled=self.amp):
+                with torch.amp.autocast("cuda", enabled=self.amp):
                     output = self.model(A, B, L=len(A))
                 scores_cur = output["score_logit"].float().reshape(-1)
                 ids.append(scores_cur.argmax() + b)
@@ -317,11 +302,9 @@ class ScorePredictor:
 
         scores = scores_global
 
-        logging.info("forward done")
         torch.cuda.empty_cache()
 
         if get_vis:
-            logging.info("get_vis...")
             canvas = []
             ids = scores.argsort(descending=True)
             canvas = vis_batch_data_scores(pose_data, ids=ids, scores=scores)
