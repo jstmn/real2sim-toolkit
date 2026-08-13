@@ -35,6 +35,7 @@ Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visual
 
 ```bash
 uv run python examples/generate_mesh.py --images data/red_T_block_1.png --visualize
+uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --visualize
 ```
 
 Example 2: Generate a mesh for the "mustard bottle" seen in the first frame of a
@@ -46,8 +47,7 @@ Note: FoundationPose runs inside the Docker container (see Installation above), 
 ```bash
 # First download the saved demonstrations to data/0802
 mkdir -p data
-gcloud storage cp --recursive gs://r2st-public/0802 data/
-gcloud storage cp gs://r2st-public/raise_cube_0.h5 data/
+gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 
 
 # Start the server (`cd src/r2st/FoundationPose/docker; bash run_container.sh`), then in the container:
@@ -62,7 +62,7 @@ uv run python examples/track_object.py \
 
 
 uv run python examples/track_object.py \
-    --h5-path data/raise_cube_0_merged.h5 \
+    --h5-path data/demonstrations/raise_cube_0_merged.h5 \
     --camera camera_north \
     --realsense-id d435 \
     --object-description "blue cube" \

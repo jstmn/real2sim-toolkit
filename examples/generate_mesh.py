@@ -3,7 +3,6 @@ import pathlib
 import shutil
 
 import cv2
-import numpy as np
 import tyro
 
 from r2st.core import GroundedSAMPredictor
@@ -65,29 +64,6 @@ def _load_camera_image(image_path: pathlib.Path, predictor: GroundedSAMPredictor
     return CameraImage(camera_name=image_path.stem, image=image_bgr, mask=mask), target
 
 
-def _save_masked_crop(camera_image: CameraImage, target_slug: str, asset_dir: pathlib.Path) -> pathlib.Path:
-    prefix = f"{target_slug}__{camera_image.camera_name}"
-    masked = camera_image.image.copy()
-    masked[np.logical_not(camera_image.mask)] = 0
-    masked_cropped = ImageUtils.crop_to_mask(masked, camera_image.mask)
-    demo = camera_image.image.copy().astype(np.float32)
-    demo[np.logical_not(camera_image.mask)] *= 0.25
-    demo = demo.astype(np.uint8)
-    masked_path = asset_dir / f"{prefix}__masked.png"
-    masked_cropped_path = asset_dir / f"{prefix}__masked_cropped.png"
-    demo_path = asset_dir / f"{prefix}__demo.png"
-    cv2.imwrite(str(masked_path), masked)
-    cv2.imwrite(str(masked_cropped_path), masked_cropped)
-    cv2.imwrite(str(demo_path), demo)
-    print(f"[info] Saved masked image to {masked_path}")
-    print(
-        f"[info] Saved masked cropped image to {masked_cropped_path} "
-        f"({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
-    )
-    print(f"[info] Saved demo overlay to {demo_path}")
-    return masked_cropped_path
-
-
 def main(args: Args) -> None:
     assert len(args.images) >= 1, "At least one --images path is required"
     assert len(args.images) <= 4, f"Meshy multi-image-to-3d accepts at most 4 images, got {len(args.images)}"
@@ -104,7 +80,10 @@ def main(args: Args) -> None:
     asset_dir = args.output_dir / target_slug
     asset_dir.mkdir(parents=True, exist_ok=True)
 
-    masked_cropped_paths = [_save_masked_crop(ci, target_slug, asset_dir) for ci in camera_images]
+    masked_cropped_paths = [
+        ImageUtils.save_masked_debug(ci.image, ci.mask, asset_dir, f"{target_slug}__{ci.camera_name}")
+        for ci in camera_images
+    ]
 
     glb_path = asset_dir / f"{target_slug}_glb.glb"
     meshy_result = MeshUtils.generate_with_meshy(masked_cropped_paths, asset_dir)

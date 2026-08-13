@@ -61,6 +61,9 @@ class Args:
     visualize: bool = False
     """If set, start a viser server with the mesh and a timestep slider over predicted poses."""
 
+    gif: bool = True
+    """If set, render a 360-degree orbit GIF of the generated GLB."""
+
 
 _EXPECTED_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
 
@@ -68,7 +71,9 @@ _EXPECTED_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
 def _validate_camera_group(f: h5py.File, h5_path: pathlib.Path, camera: str) -> None:
     """Check that `f` matches the merged sensor-data format from examples/merge_camera_streams.py:
     obs/sensor_data/{camera}/[rgb, depth, timestamp_ms, rgb_timestamp_ms]."""
-    assert "obs/sensor_data" in f, f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {f.keys()}"
+    assert (
+        "obs/sensor_data" in f
+    ), f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {f.keys()}"
     sensor_data = f["obs/sensor_data"]
     group_path = f"obs/sensor_data/{camera}"
     assert group_path in f, f"Camera '{camera}' not found in {h5_path}. Available: {sorted(sensor_data.keys())}"
@@ -187,15 +192,7 @@ def main(args: Args) -> None:
     object_slug = args.object_description.replace(" ", "_")
     asset_dir = args.output_dir / f"{args.camera}__{object_slug}"
     asset_dir.mkdir(parents=True, exist_ok=True)
-    masked = image_bgr0.copy()
-    masked[np.logical_not(mask)] = 0
-    masked_cropped = ImageUtils.crop_to_mask(masked, mask)
-    masked_cropped_path = asset_dir / f"{object_slug}__masked_cropped.png"
-    cv2.imwrite(str(masked_cropped_path), masked_cropped)
-    print(
-        f"[info] Saved masked cropped image to {masked_cropped_path} "
-        f"({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
-    )
+    masked_cropped_path = ImageUtils.save_masked_debug(image_bgr0, mask, asset_dir, object_slug)
 
     print("[info] Generating mesh with Meshy (reuses existing model_glb.glb if present) ...")
     glb_path = asset_dir / f"{object_slug}_glb.glb"
@@ -206,6 +203,10 @@ def main(args: Args) -> None:
     assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
     mesh_path_abs = str(glb_path.resolve())
     print(f"[info] Mesh: {mesh_path_abs} ({glb_path.stat().st_size} bytes)")
+    if args.gif:
+        gif_path = asset_dir / f"{object_slug}__orbit.gif"
+        gif_path = MeshUtils.save_orbit_gif(glb_path, gif_path)
+        print(f"[info] Saved orbit GIF to {gif_path}")
 
     print(f"[info] Connecting to FoundationPose server at {args.server_address} ...")
     client = FoundationPoseClient(args.server_address)
@@ -263,7 +264,7 @@ def main(args: Args) -> None:
     print(f"Poses: {poses_path}")
 
     if args.visualize:
-        MeshUtils.visualize_tracking(glb_path, poses, rgb_all, K)
+        MeshUtils.visualize_tracking(glb_path, poses, rgb_all, depth_m_all, K)
 
 
 if __name__ == "__main__":

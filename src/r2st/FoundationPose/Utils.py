@@ -175,6 +175,7 @@ def nvdiffrast_render(
     pos_idx = mesh_tensors["faces"]
     has_tex = "tex" in mesh_tensors
 
+    ob_in_cams = to_cuda_float(ob_in_cams)
     ob_in_glcams = torch.tensor(glcam_in_cvcam, device="cuda", dtype=torch.float)[None] @ ob_in_cams
     if projection_mat is None:
         projection_mat = projection_matrix_from_intrinsics(K, height=H, width=W, znear=0.001, zfar=100)
@@ -619,7 +620,7 @@ def compute_mesh_diameter(model_pts=None, mesh=None, n_sample=1000):
         pts = model_pts[ids]
     dists = np.linalg.norm(pts[None] - pts[:, None], axis=-1)
     diameter = dists.max()
-    return diameter
+    return float(diameter)
 
 
 def compute_crop_window_tf_batch(
@@ -649,10 +650,10 @@ def compute_crop_window_tf_batch(
         top = top.round()
         bottom = bottom.round()
 
-        tf = torch.eye(3)[None].expand(B, -1, -1).contiguous()
+        tf = torch.eye(3, dtype=torch.float, device="cuda")[None].expand(B, -1, -1).contiguous()
         tf[:, 0, 2] = -left
         tf[:, 1, 2] = -top
-        new_tf = torch.eye(3)[None].expand(B, -1, -1).contiguous()
+        new_tf = torch.eye(3, dtype=torch.float, device="cuda")[None].expand(B, -1, -1).contiguous()
         new_tf[:, 0, 0] = out_size[0] / (right - left)
         new_tf[:, 1, 1] = out_size[1] / (bottom - top)
         tf = new_tf @ tf
@@ -661,9 +662,13 @@ def compute_crop_window_tf_batch(
     B = len(poses)
     set_cuda_float_default()
     if method == "box_3d":
-        radius = mesh_diameter * crop_ratio / 2
-        offsets = torch.tensor([0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0]).reshape(-1, 3)
-        pts = poses[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
+        radius = float(mesh_diameter) * crop_ratio / 2
+        offsets = torch.tensor(
+            [0, 0, 0, radius, 0, 0, -radius, 0, 0, 0, radius, 0, 0, -radius, 0],
+            dtype=torch.float,
+            device="cuda",
+        ).reshape(-1, 3)
+        pts = to_cuda_float(poses)[:, :3, 3].reshape(-1, 1, 3) + offsets.reshape(1, -1, 3)
         K = to_cuda_float(K)
         projected = (K @ pts.reshape(-1, 3).T).T
         uvs = projected[:, :2] / projected[:, 2:3]

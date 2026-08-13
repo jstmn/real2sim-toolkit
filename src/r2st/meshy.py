@@ -43,7 +43,9 @@ class MeshyAPI:
         assert len(image_urls) == 1, "meshy seems to make better results with only one image"
         payload = {
             "image_urls": image_urls,
-            "image_enhancement": True,
+            "image_enhancement": False,
+            # "image_enhancement": True,
+            # ^ generates weird artifacts / surfaces designs
             "pose_mode": "",
             "enable_pbr": enable_pbr,
             "target_formats": ["glb"],

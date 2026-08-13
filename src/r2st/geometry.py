@@ -129,6 +129,47 @@ def align_ros_depth_to_color(
     return depth_aligned
 
 
+def depth_rgb_to_pointcloud(
+    depth_m: np.ndarray,
+    rgb: np.ndarray,
+    K: np.ndarray,
+    *,
+    min_depth_m: float = MIN_DEPTH_M,
+    max_depth_m: float = MAX_DEPTH_M,
+    stride: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unproject a metric depth map to camera-frame points colored by RGB.
+
+    Returns `(N, 3)` float32 XYZ and `(N, 3)` uint8 colors. Pixel coordinates use
+    OpenCV convention (+Z forward, +Y down), matching FoundationPose poses.
+    """
+    assert depth_m.ndim == 2, f"depth_m must be HxW, got {depth_m.shape}"
+    assert rgb.ndim == 3 and rgb.shape[2] == 3, f"rgb must be HxWx3, got {rgb.shape}"
+    assert rgb.shape[:2] == depth_m.shape, f"rgb {rgb.shape[:2]} != depth {depth_m.shape}"
+    assert rgb.dtype == np.uint8, f"rgb dtype must be uint8, got {rgb.dtype}"
+    assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+    assert stride >= 1, f"stride must be >= 1, got {stride}"
+    assert min_depth_m > 0, f"min_depth_m must be > 0, got {min_depth_m}"
+    assert max_depth_m > min_depth_m, f"max_depth_m must be > min_depth_m, got {max_depth_m} vs {min_depth_m}"
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    assert fx > 0 and fy > 0, f"fx/fy must be > 0, got fx={fx} fy={fy}"
+
+    H, W = depth_m.shape
+    us = np.arange(0, W, stride, dtype=np.float64)
+    vs = np.arange(0, H, stride, dtype=np.float64)
+    uu, vv = np.meshgrid(us, vs)
+    ui = uu.astype(np.int64)
+    vi = vv.astype(np.int64)
+    z = depth_m[vi, ui].astype(np.float64)
+    valid = np.isfinite(z) & (z >= min_depth_m) & (z <= max_depth_m)
+    assert valid.any(), "No valid depth pixels to unproject"
+    uu, vv, z = uu[valid], vv[valid], z[valid]
+    pts = np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], axis=-1).astype(np.float32)
+    colors = rgb[vi[valid], ui[valid]]
+    return pts, colors
+
+
 def project_axes_to_image(pose_cam: np.ndarray, K: np.ndarray, axis_len: float = 0.1):
     """Project 3D axes in camera frame to image plane."""
     assert pose_cam.shape == (4, 4)

@@ -28,6 +28,46 @@ class ImageUtils:
         return image_bgr[y0:y1, x0:x1]
 
     @staticmethod
+    def save_masked_debug(
+        image_bgr: np.ndarray,
+        mask: np.ndarray,
+        asset_dir: str | Path,
+        prefix: str,
+    ) -> Path:
+        """Write masked, masked-cropped, and demo overlay PNGs. Returns the cropped path."""
+        import cv2
+
+        assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
+        assert image_bgr.dtype == np.uint8, f"Image dtype must be uint8, got {image_bgr.dtype}"
+        assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
+        assert mask.shape == image_bgr.shape[:2], f"Mask shape {mask.shape} != image {image_bgr.shape[:2]}"
+        assert mask.any(), "Cannot save debug images for an empty mask"
+        assert len(prefix) > 0, "prefix must not be empty"
+        asset_dir = Path(asset_dir)
+        assert asset_dir.is_dir(), f"asset_dir is not a directory: {asset_dir}"
+
+        masked = image_bgr.copy()
+        masked[np.logical_not(mask)] = 0
+        masked_cropped = ImageUtils.crop_to_mask(masked, mask)
+        demo = image_bgr.copy().astype(np.float32)
+        demo[np.logical_not(mask)] *= 0.25
+        demo = demo.astype(np.uint8)
+
+        masked_path = asset_dir / f"{prefix}__masked.png"
+        masked_cropped_path = asset_dir / f"{prefix}__masked_cropped.png"
+        demo_path = asset_dir / f"{prefix}__demo.png"
+        assert cv2.imwrite(str(masked_path), masked), f"Failed to write {masked_path}"
+        assert cv2.imwrite(str(masked_cropped_path), masked_cropped), f"Failed to write {masked_cropped_path}"
+        assert cv2.imwrite(str(demo_path), demo), f"Failed to write {demo_path}"
+        print(f"[info] Saved masked image to {masked_path}")
+        print(
+            f"[info] Saved masked cropped image to {masked_cropped_path} "
+            f"({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
+        )
+        print(f"[info] Saved demo overlay to {demo_path}")
+        return masked_cropped_path
+
+    @staticmethod
     def get_sam_mask(predictor, image_bgr: np.ndarray, object_name: str) -> np.ndarray:
         """Run GroundedSAM and return a bool HxW mask for `object_name`."""
         import torch
@@ -110,15 +150,18 @@ class MeshUtils:
         glb_path: str | Path,
         poses_cam: np.ndarray,
         rgb_frames: np.ndarray,
+        depth_m_frames: np.ndarray,
         K: np.ndarray,
     ) -> None:
         """Serve a viser scene of the tracked mesh in the camera frame.
 
         `poses_cam[t]` is the 4x4 object-in-camera pose at timestep `t`. The capturing
         camera sits at the origin (OpenCV: +Z forward, +Y down). A slider updates the
-        mesh pose and shows the RGB frame that produced that prediction.
+        mesh pose, the RGB-D scene point cloud, and the RGB frame for that prediction.
         """
         import viser
+
+        from r2st.geometry import depth_rgb_to_pointcloud
 
         glb_path = Path(glb_path)
         assert glb_path.is_file(), f"GLB not found at {glb_path}"
@@ -133,6 +176,13 @@ class MeshUtils:
             rgb_frames.shape[0] == num_frames
         ), f"rgb_frames has {rgb_frames.shape[0]} frames, poses have {num_frames}"
         assert rgb_frames.dtype == np.uint8, f"rgb_frames dtype must be uint8, got {rgb_frames.dtype}"
+        assert depth_m_frames.ndim == 3, f"depth_m_frames must be NxHxW, got {depth_m_frames.shape}"
+        assert (
+            depth_m_frames.shape[0] == num_frames
+        ), f"depth_m_frames has {depth_m_frames.shape[0]} frames, poses have {num_frames}"
+        assert (
+            depth_m_frames.shape[1:] == rgb_frames.shape[1:3]
+        ), f"depth {depth_m_frames.shape[1:]} != rgb {rgb_frames.shape[1:3]}"
         assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
         H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
         fy = float(K[1, 1])
@@ -164,6 +214,14 @@ class MeshUtils:
             image=rgb_frames[0],
             format="jpeg",
         )
+        pts0, colors0 = depth_rgb_to_pointcloud(depth_m_frames[0], rgb_frames[0], K)
+        pcd_handle = server.scene.add_point_cloud(
+            "/scene_pcd",
+            points=pts0,
+            colors=colors0,
+            point_size=0.004,
+            point_shape="circle",
+        )
         if num_frames >= 2:
             traj = poses_cam[:, :3, 3]
             server.scene.add_line_segments(
@@ -189,6 +247,9 @@ class MeshUtils:
             axes_handle.position = position
             frustum.image = rgb_frames[t]
             gui_image.image = rgb_frames[t]
+            pts, colors = depth_rgb_to_pointcloud(depth_m_frames[t], rgb_frames[t], K)
+            pcd_handle.points = pts
+            pcd_handle.colors = colors
             pose_md.content = (
                 f"**t = {t} / {num_frames - 1}**\n\n"
                 f"translation (cam): `[{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]`"

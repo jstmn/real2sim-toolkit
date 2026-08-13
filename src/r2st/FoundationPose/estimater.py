@@ -229,7 +229,7 @@ class FoundationPose:
         center = self.guess_translation(depth=depth, mask=ob_mask, K=K)
 
         poses = torch.as_tensor(poses, device="cuda", dtype=torch.float)
-        poses[:, :3, 3] = torch.as_tensor(center.reshape(1, 3), device="cuda")
+        poses[:, :3, 3] = torch.as_tensor(center.reshape(1, 3), device="cuda", dtype=torch.float)
 
         add_errs = self.compute_add_err_to_gt_pose(poses)
 
