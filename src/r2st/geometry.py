@@ -170,6 +170,36 @@ def depth_rgb_to_pointcloud(
     return pts, colors
 
 
+def masked_depth_to_points(
+    depth_m: np.ndarray,
+    mask: np.ndarray,
+    K: np.ndarray,
+    *,
+    min_depth_m: float = MIN_DEPTH_M,
+    max_depth_m: float = MAX_DEPTH_M,
+) -> np.ndarray:
+    """Unproject masked metric depth to camera-frame XYZ (N, 3) float64."""
+    assert depth_m.ndim == 2, f"depth_m must be HxW, got {depth_m.shape}"
+    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
+    assert mask.shape == depth_m.shape, f"mask {mask.shape} != depth {depth_m.shape}"
+    assert mask.any(), "Cannot unproject an empty mask"
+    assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+    assert min_depth_m > 0, f"min_depth_m must be > 0, got {min_depth_m}"
+    assert max_depth_m > min_depth_m, f"max_depth_m must be > min_depth_m, got {max_depth_m} vs {min_depth_m}"
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    assert fx > 0 and fy > 0, f"fx/fy must be > 0, got fx={fx} fy={fy}"
+
+    vs, us = np.where(mask)
+    z = depth_m[vs, us].astype(np.float64)
+    valid = np.isfinite(z) & (z >= min_depth_m) & (z <= max_depth_m)
+    assert valid.any(), "No valid masked depth pixels to unproject"
+    us = us[valid].astype(np.float64)
+    vs = vs[valid].astype(np.float64)
+    z = z[valid]
+    return np.stack([(us - cx) * z / fx, (vs - cy) * z / fy, z], axis=-1)
+
+
 def project_axes_to_image(pose_cam: np.ndarray, K: np.ndarray, axis_len: float = 0.1):
     """Project 3D axes in camera frame to image plane."""
     assert pose_cam.shape == (4, 4)

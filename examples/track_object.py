@@ -10,10 +10,15 @@ import tyro
 from tqdm import tqdm
 
 from r2st.core import GroundedSAMPredictor
-from r2st.geometry import align_ros_depth_to_color, scale_intrinsics
+from r2st.geometry import (
+    align_ros_depth_to_color,
+    masked_depth_to_points,
+    scale_intrinsics,
+)
+from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
 from r2st.realsense_calibration import get_color_intrinsics, get_depth_intrinsics
-from r2st.utils import ImageUtils, MeshUtils
+from r2st.utils import ImageUtils, MeshUtils, TrackingVisualizer
 
 """
 # Example usage (FoundationPose gRPC server must already be running in the container):
@@ -201,12 +206,33 @@ def main(args: Args) -> None:
     if meshy_result.resolve() != glb_path.resolve():
         shutil.copy2(str(meshy_result), str(glb_path))
     assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
-    mesh_path_abs = str(glb_path.resolve())
-    print(f"[info] Mesh: {mesh_path_abs} ({glb_path.stat().st_size} bytes)")
+    print(f"[info] Mesh: {glb_path.resolve()} ({glb_path.stat().st_size} bytes)")
+
+    print("[info] Scaling mesh to masked RealSense point cloud (PCA) ...")
+    t0 = time.perf_counter()
+    object_pts = masked_depth_to_points(depth0, mask, K)
+    scaled_glb_path = asset_dir / f"{object_slug}_glb_scaled.glb"
+    scaled_glb_path, scale = scale_glb_to_pointcloud(glb_path, object_pts, scaled_glb_path)
+    mesh_path_abs = str(scaled_glb_path.resolve())
+    _log_elapsed(
+        f"PCA scale={scale:.6f}  object_pts={len(object_pts)}  scaled mesh: {mesh_path_abs} "
+        f"({scaled_glb_path.stat().st_size} bytes)",
+        t0,
+    )
     if args.gif:
         gif_path = asset_dir / f"{object_slug}__orbit.gif"
-        gif_path = MeshUtils.save_orbit_gif(glb_path, gif_path)
+        gif_path = MeshUtils.save_orbit_gif(scaled_glb_path, gif_path)
         print(f"[info] Saved orbit GIF to {gif_path}")
+
+    vis = None
+    if args.visualize:
+        vis = TrackingVisualizer(
+            scaled_glb_path,
+            rgb_all,
+            depth_m_all,
+            K,
+            mesh_position=object_pts.mean(axis=0),
+        )
 
     print(f"[info] Connecting to FoundationPose server at {args.server_address} ...")
     client = FoundationPoseClient(args.server_address)
@@ -260,11 +286,12 @@ def main(args: Args) -> None:
     print("Tracking complete!")
     print(f"Object: {args.object_description}")
     print(f"Frames: {num_frames}")
-    print(f"Mesh: {glb_path}")
+    print(f"Mesh: {scaled_glb_path}")
     print(f"Poses: {poses_path}")
 
-    if args.visualize:
-        MeshUtils.visualize_tracking(glb_path, poses, rgb_all, depth_m_all, K)
+    if vis is not None:
+        vis.set_poses(poses)
+        vis.wait()
 
 
 if __name__ == "__main__":

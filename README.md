@@ -54,12 +54,11 @@ gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
 uv run python examples/track_object.py \
-    --h5-path data/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --realsense-id d435 \
     --object-description "mustard bottle" \
     --visualize
-
 
 uv run python examples/track_object.py \
     --h5-path data/demonstrations/raise_cube_0_merged.h5 \

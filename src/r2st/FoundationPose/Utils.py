@@ -347,6 +347,7 @@ def bilateral_filter_depth_kernel(
     if w >= W or h >= H:
         return
     out[h, w] = 0.0
+    # Warp treats bare literals as constants; wrap so they can be mutated in the dynamic loop.
     mean_depth = float(0.0)
     num_valid = int(0)
     for u in range(w - radius, w + radius + 1):

@@ -6,12 +6,12 @@
 # distribution of this software and related documentation without an express
 # license agreement from NVIDIA CORPORATION is strictly prohibited.
 
+import uuid
+
 from datareader import *
 from learning.training.predict_pose_refine import *
 from learning.training.predict_score import *
 from Utils import *
-
-import uuid
 
 
 def _cluster_poses(

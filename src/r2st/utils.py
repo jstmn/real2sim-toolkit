@@ -120,16 +120,8 @@ class MeshUtils:
         return wxyz, pose[:3, 3].astype(np.float64)
 
     @staticmethod
-    def visualize_glb(glb_path: str | Path) -> None:
-        import viser
-
-        glb_path = Path(glb_path)
-        assert glb_path.is_file(), f"GLB not found at {glb_path}"
-        glb_data = glb_path.read_bytes()
-        assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
-        server = viser.ViserServer()
-        server.scene.world_axes.visible = True
-        server.scene.world_axes.scale = 0.25
+    def add_xy_grid(server) -> None:
+        """Add the same XY ground grid used by `visualize_glb`."""
         server.scene.add_grid(
             "/xy_grid",
             width=2.0,
@@ -141,6 +133,19 @@ class MeshUtils:
             section_color=(200, 200, 200),
             plane_opacity=0.05,
         )
+
+    @staticmethod
+    def visualize_glb(glb_path: str | Path) -> None:
+        import viser
+
+        glb_path = Path(glb_path)
+        assert glb_path.is_file(), f"GLB not found at {glb_path}"
+        glb_data = glb_path.read_bytes()
+        assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
+        server = viser.ViserServer()
+        server.scene.world_axes.visible = True
+        server.scene.world_axes.scale = 0.25
+        MeshUtils.add_xy_grid(server)
         server.scene.add_glb(name="/mesh", glb_data=glb_data)
         print(f"[info] Viser serving {glb_path} at http://{server.get_host()}:{server.get_port()}")
         server.sleep_forever()
@@ -153,118 +158,10 @@ class MeshUtils:
         depth_m_frames: np.ndarray,
         K: np.ndarray,
     ) -> None:
-        """Serve a viser scene of the tracked mesh in the camera frame.
-
-        `poses_cam[t]` is the 4x4 object-in-camera pose at timestep `t`. The capturing
-        camera sits at the origin (OpenCV: +Z forward, +Y down). A slider updates the
-        mesh pose, the RGB-D scene point cloud, and the RGB frame for that prediction.
-        """
-        import viser
-
-        from r2st.geometry import depth_rgb_to_pointcloud
-
-        glb_path = Path(glb_path)
-        assert glb_path.is_file(), f"GLB not found at {glb_path}"
-        glb_data = glb_path.read_bytes()
-        assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
-        poses_cam = np.asarray(poses_cam, dtype=np.float64)
-        assert poses_cam.ndim == 3 and poses_cam.shape[1:] == (4, 4), f"poses_cam must be Nx4x4, got {poses_cam.shape}"
-        num_frames = poses_cam.shape[0]
-        assert num_frames >= 1, "poses_cam is empty"
-        assert rgb_frames.ndim == 4 and rgb_frames.shape[-1] == 3, f"rgb_frames must be NxHxWx3, got {rgb_frames.shape}"
-        assert (
-            rgb_frames.shape[0] == num_frames
-        ), f"rgb_frames has {rgb_frames.shape[0]} frames, poses have {num_frames}"
-        assert rgb_frames.dtype == np.uint8, f"rgb_frames dtype must be uint8, got {rgb_frames.dtype}"
-        assert depth_m_frames.ndim == 3, f"depth_m_frames must be NxHxW, got {depth_m_frames.shape}"
-        assert (
-            depth_m_frames.shape[0] == num_frames
-        ), f"depth_m_frames has {depth_m_frames.shape[0]} frames, poses have {num_frames}"
-        assert (
-            depth_m_frames.shape[1:] == rgb_frames.shape[1:3]
-        ), f"depth {depth_m_frames.shape[1:]} != rgb {rgb_frames.shape[1:3]}"
-        assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
-        H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
-        fy = float(K[1, 1])
-        assert fy > 0, f"K[1,1] (fy) must be > 0, got {fy}"
-        fov = float(2.0 * np.arctan(H / (2.0 * fy)))
-        aspect = W / H
-
-        server = viser.ViserServer()
-        server.scene.set_up_direction("-y")
-        server.scene.world_axes.visible = True
-        server.scene.world_axes.scale = 0.15
-
-        wxyz0, pos0 = MeshUtils._pose_mat_to_wxyz_position(poses_cam[0])
-        mesh_handle = server.scene.add_glb(name="/object", glb_data=glb_data, wxyz=wxyz0, position=pos0)
-        axes_handle = server.scene.add_frame(
-            "/object_axes",
-            axes_length=0.06,
-            axes_radius=0.004,
-            origin_radius=0.008,
-            wxyz=wxyz0,
-            position=pos0,
-        )
-        frustum = server.scene.add_camera_frustum(
-            "/camera",
-            fov=fov,
-            aspect=aspect,
-            scale=0.12,
-            line_width=1.5,
-            image=rgb_frames[0],
-            format="jpeg",
-        )
-        pts0, colors0 = depth_rgb_to_pointcloud(depth_m_frames[0], rgb_frames[0], K)
-        pcd_handle = server.scene.add_point_cloud(
-            "/scene_pcd",
-            points=pts0,
-            colors=colors0,
-            point_size=0.004,
-            point_shape="circle",
-        )
-        if num_frames >= 2:
-            traj = poses_cam[:, :3, 3]
-            server.scene.add_line_segments(
-                "/trajectory",
-                points=np.stack([traj[:-1], traj[1:]], axis=1),
-                colors=(70, 140, 255),
-                line_width=2.0,
-            )
-
-        server.initial_camera.up = (0.0, -1.0, 0.0)
-        server.initial_camera.look_at = pos0
-        server.initial_camera.position = pos0 + np.array([-0.25, -0.2, -0.45], dtype=np.float64)
-
-        gui_image = server.gui.add_image(rgb_frames[0], label="RGB", format="jpeg")
-        pose_md = server.gui.add_markdown("")
-
-        def _apply_timestep(t: int) -> None:
-            assert 0 <= t < num_frames, f"timestep {t} out of range [0, {num_frames})"
-            wxyz, position = MeshUtils._pose_mat_to_wxyz_position(poses_cam[t])
-            mesh_handle.wxyz = wxyz
-            mesh_handle.position = position
-            axes_handle.wxyz = wxyz
-            axes_handle.position = position
-            frustum.image = rgb_frames[t]
-            gui_image.image = rgb_frames[t]
-            pts, colors = depth_rgb_to_pointcloud(depth_m_frames[t], rgb_frames[t], K)
-            pcd_handle.points = pts
-            pcd_handle.colors = colors
-            pose_md.content = (
-                f"**t = {t} / {num_frames - 1}**\n\n"
-                f"translation (cam): `[{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]`"
-            )
-
-        _apply_timestep(0)
-        if num_frames > 1:
-            slider = server.gui.add_slider("timestep", min=0, max=num_frames - 1, step=1, initial_value=0)
-
-            @slider.on_update
-            def _on_timestep(_) -> None:
-                _apply_timestep(int(slider.value))
-
-        print(f"[info] Viser tracking view at http://{server.get_host()}:{server.get_port()}")
-        server.sleep_forever()
+        """Serve a viser scene of the tracked mesh in the camera frame (blocks)."""
+        vis = TrackingVisualizer(glb_path, rgb_frames, depth_m_frames, K, mesh_position=np.asarray(poses_cam)[0, :3, 3])
+        vis.set_poses(poses_cam)
+        vis.wait()
 
     @staticmethod
     def _scene_to_triangle_mesh(glb_path: Path):
@@ -444,3 +341,139 @@ class MeshUtils:
         )
         assert output_path.is_file() and output_path.stat().st_size > 0, f"Failed to write GIF: {output_path}"
         return output_path
+
+
+class TrackingVisualizer:
+    """Viser scene for pose tracking. Construct as soon as the scaled mesh exists; call `set_poses` later."""
+
+    def __init__(
+        self,
+        glb_path: str | Path,
+        rgb_frames: np.ndarray,
+        depth_m_frames: np.ndarray,
+        K: np.ndarray,
+        mesh_position: np.ndarray,
+    ) -> None:
+        import viser
+
+        from r2st.geometry import depth_rgb_to_pointcloud
+
+        glb_path = Path(glb_path)
+        assert glb_path.is_file(), f"GLB not found at {glb_path}"
+        glb_data = glb_path.read_bytes()
+        assert len(glb_data) > 0, f"GLB file is empty: {glb_path}"
+        assert rgb_frames.ndim == 4 and rgb_frames.shape[-1] == 3, f"rgb_frames must be NxHxWx3, got {rgb_frames.shape}"
+        assert rgb_frames.dtype == np.uint8, f"rgb_frames dtype must be uint8, got {rgb_frames.dtype}"
+        self._num_frames = int(rgb_frames.shape[0])
+        assert self._num_frames >= 1, "rgb_frames is empty"
+        assert depth_m_frames.ndim == 3, f"depth_m_frames must be NxHxW, got {depth_m_frames.shape}"
+        assert (
+            depth_m_frames.shape[0] == self._num_frames
+        ), f"depth_m_frames has {depth_m_frames.shape[0]} frames, rgb has {self._num_frames}"
+        assert (
+            depth_m_frames.shape[1:] == rgb_frames.shape[1:3]
+        ), f"depth {depth_m_frames.shape[1:]} != rgb {rgb_frames.shape[1:3]}"
+        assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+        mesh_position = np.asarray(mesh_position, dtype=np.float64).reshape(3)
+
+        H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
+        fy = float(K[1, 1])
+        assert fy > 0, f"K[1,1] (fy) must be > 0, got {fy}"
+        fov = float(2.0 * np.arctan(H / (2.0 * fy)))
+        aspect = W / H
+        wxyz0 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+
+        self._rgb_frames = rgb_frames
+        self._depth_m_frames = depth_m_frames
+        self._K = K
+        self._poses_cam: np.ndarray | None = None
+
+        self._server = viser.ViserServer()
+        self._server.scene.set_up_direction("-y")
+        self._server.scene.world_axes.visible = True
+        self._server.scene.world_axes.scale = 0.15
+        MeshUtils.add_xy_grid(self._server)
+
+        self._mesh_handle = self._server.scene.add_glb(
+            name="/object", glb_data=glb_data, wxyz=wxyz0, position=mesh_position
+        )
+        self._axes_handle = self._server.scene.add_frame(
+            "/object_axes",
+            axes_length=0.06,
+            axes_radius=0.004,
+            origin_radius=0.008,
+            wxyz=wxyz0,
+            position=mesh_position,
+        )
+        self._frustum = self._server.scene.add_camera_frustum(
+            "/camera",
+            fov=fov,
+            aspect=aspect,
+            scale=0.12,
+            line_width=1.5,
+            image=rgb_frames[0],
+            format="jpeg",
+        )
+        pts0, colors0 = depth_rgb_to_pointcloud(depth_m_frames[0], rgb_frames[0], K)
+        self._pcd_handle = self._server.scene.add_point_cloud(
+            "/scene_pcd",
+            points=pts0,
+            colors=colors0,
+            point_size=0.002,
+            point_shape="circle",
+        )
+        self._server.initial_camera.up = (0.0, -1.0, 0.0)
+        self._server.initial_camera.look_at = mesh_position
+        self._server.initial_camera.position = mesh_position + np.array([-0.25, -0.2, -0.45], dtype=np.float64)
+        self._gui_image = self._server.gui.add_image(rgb_frames[0], label="RGB", format="jpeg")
+        self._pose_md = self._server.gui.add_markdown(
+            f"scaled mesh at `[{mesh_position[0]:.4f}, {mesh_position[1]:.4f}, {mesh_position[2]:.4f}]` (identity rot)"
+        )
+        print(f"[info] Viser tracking view at http://{self._server.get_host()}:{self._server.get_port()}")
+
+    def set_poses(self, poses_cam: np.ndarray) -> None:
+        assert self._poses_cam is None, "set_poses already called"
+        poses_cam = np.asarray(poses_cam, dtype=np.float64)
+        assert poses_cam.ndim == 3 and poses_cam.shape[1:] == (4, 4), f"poses_cam must be Nx4x4, got {poses_cam.shape}"
+        assert (
+            poses_cam.shape[0] == self._num_frames
+        ), f"poses have {poses_cam.shape[0]} frames, rgb has {self._num_frames}"
+        self._poses_cam = poses_cam
+        if self._num_frames >= 2:
+            traj = poses_cam[:, :3, 3]
+            self._server.scene.add_line_segments(
+                "/trajectory",
+                points=np.stack([traj[:-1], traj[1:]], axis=1),
+                colors=(70, 140, 255),
+                line_width=2.0,
+            )
+        self._apply_timestep(0)
+        if self._num_frames > 1:
+            slider = self._server.gui.add_slider("timestep", min=0, max=self._num_frames - 1, step=1, initial_value=0)
+
+            @slider.on_update
+            def _on_timestep(_) -> None:
+                self._apply_timestep(int(slider.value))
+
+    def _apply_timestep(self, t: int) -> None:
+        from r2st.geometry import depth_rgb_to_pointcloud
+
+        assert self._poses_cam is not None, "set_poses must be called before applying timesteps"
+        assert 0 <= t < self._num_frames, f"timestep {t} out of range [0, {self._num_frames})"
+        wxyz, position = MeshUtils._pose_mat_to_wxyz_position(self._poses_cam[t])
+        self._mesh_handle.wxyz = wxyz
+        self._mesh_handle.position = position
+        self._axes_handle.wxyz = wxyz
+        self._axes_handle.position = position
+        self._frustum.image = self._rgb_frames[t]
+        self._gui_image.image = self._rgb_frames[t]
+        pts, colors = depth_rgb_to_pointcloud(self._depth_m_frames[t], self._rgb_frames[t], self._K)
+        self._pcd_handle.points = pts
+        self._pcd_handle.colors = colors
+        self._pose_md.content = (
+            f"**t = {t} / {self._num_frames - 1}**\n\n"
+            f"translation (cam): `[{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]`"
+        )
+
+    def wait(self) -> None:
+        self._server.sleep_forever()

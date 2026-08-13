@@ -18,3 +18,5 @@ data/*/
 src/r2st/FoundationPose-plus-plus/
 temp.sh
 src/r2st/FoundationPose/weights/*
+
+*.code-workspace
