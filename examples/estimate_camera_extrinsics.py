@@ -19,9 +19,9 @@ Notes:
 2. If --visualize is set, a viser server is started. The server shows measured vs best-so-far
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
-3. if --visualize-robot-masks is set, ImageUtils.save_masked_debug writes debug PNGs next to the input h5 file.
-4. If --cache-robot-masks is set (default), masks are loaded from / saved to
-   `<h5_dir>/<h5_stem>/robot-mask__<camera>__idx=<frame>.npy`.
+3. if --visualize-robot-masks is set, debug PNGs are written for the SAM masks that enter the union.
+4. If --cache-robot-masks is set (default), the unioned mask is loaded from / saved to
+   `<h5_dir>/<h5_stem>/robot-mask__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
 
 
 
@@ -110,6 +110,12 @@ _EMPTY_PCD_COST = 1.0e3
 _SIM_CAMERA_NAME = "extrinsics_cam"
 _INIT_EYE = np.array([0.80, 0.00, 0.50], dtype=np.float64)
 _INIT_TARGET = np.array([0.00, 0.00, 0.20], dtype=np.float64)
+_BEST_AXES_LENGTH = 0.08
+_BEST_AXES_RADIUS = 0.004
+_BEST_ORIGIN_RADIUS = 0.008
+_POP_AXES_LENGTH = 0.045
+_POP_AXES_RADIUS = 0.0025
+_POP_ORIGIN_RADIUS = 0.005
 
 
 @dataclasses.dataclass
@@ -129,40 +135,116 @@ class Args:
     output_path: pathlib.Path
     """YAML path to write the estimated 4x4 camera extrinsics (robot-base T camera)."""
 
-    n_timesteps: int = 8
+    n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
 
     n_pcd_samples: int = 1024
     """Number of FPS points kept from each (real or sim) robot cloud before chamfer."""
 
-    cma_sigma: float = 0.05
-    """CMA-ES initial step size on the 6D pose vector (meters / radians)."""
+    cma_sigma_pos: float = 0.10
+    """CMA-ES initial std for camera translation (meters)."""
+
+    cma_sigma_rot: float = 1.0
+    """CMA-ES initial std for camera rotation-vector (radians)."""
 
     cma_maxiter: int = 100
     """Maximum CMA-ES generations."""
 
-    cma_popsize: int = 25
+    cma_popsize: int = 10
     """CMA-ES population size. If unset, the cma library default is used."""
 
     robot_description: str = "robot arm"
     """GroundedSAM text prompt used to mask the robot in each RGB frame."""
 
+    sam_kmax: int = 5
+    """Union at most this many highest-confidence SAM masks into the robot mask."""
+
+    sam_score_threshold: float = 0.3
+    """Keep a top-k SAM mask in the union only if its confidence is strictly above this."""
+
     cache_robot_masks: bool = True
-    """If set, load/save robot masks as <h5_stem>/robot-mask__<camera>__idx=<frame>.npy next to the h5 file."""
+    """If set, load/save the unioned robot mask as <h5_stem>/robot-mask__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
 
     visualize: bool = False
     """If set, start a viser server with robot-base pointclouds, camera frustum, and a cost plot."""
 
     visualize_robot_masks: bool = False
-    """If set, write ImageUtils.save_masked_debug PNGs next to the input h5 file."""
+    """If set, write debug PNGs for the SAM masks that enter the union (top --sam-kmax with score above --sam-score-threshold)."""
 
 
 def _log_elapsed(label: str, t0: float) -> None:
     print(f"[info] {label} ({time.perf_counter() - t0:.1f}s)")
 
 
-def _robot_mask_cache_path(h5_path: pathlib.Path, camera: str, frame_idx: int) -> pathlib.Path:
-    return h5_path.parent / h5_path.stem / f"robot-mask__{camera}__idx={int(frame_idx)}.npy"
+def _robot_mask_cache_path(
+    h5_path: pathlib.Path,
+    camera: str,
+    frame_idx: int,
+    kmax: int,
+    score_threshold: float,
+) -> pathlib.Path:
+    return (
+        h5_path.parent
+        / h5_path.stem
+        / f"robot-mask__{camera}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
+    )
+
+
+def _union_top_sam_masks(
+    masks: np.ndarray,
+    scores: np.ndarray,
+    kmax: int,
+    score_threshold: float,
+) -> np.ndarray:
+    """OR-union of the first `kmax` ranked masks whose score is strictly above `score_threshold`."""
+    assert masks.ndim == 3, f"masks must be (N, H, W), got {masks.shape}"
+    assert scores.shape == (masks.shape[0],), f"scores {scores.shape} != n_masks {masks.shape[0]}"
+    assert kmax >= 1, f"kmax must be >= 1, got {kmax}"
+    n = min(int(kmax), masks.shape[0])
+    keep = scores[:n] > score_threshold
+    n_keep = int(keep.sum())
+    assert n_keep >= 1, (
+        f"No SAM masks in top {n} with score > {score_threshold} "
+        f"(scores={scores[:n].tolist()})"
+    )
+    union = np.any(masks[:n][keep], axis=0)
+    print(
+        f"[info] Unioned {n_keep}/{n} masks with score > {score_threshold} "
+        f"(kept ranks={np.flatnonzero(keep).tolist()}, scores={scores[:n][keep].tolist()})"
+    )
+    return union
+
+
+def _dump_top_sam_masks(
+    image_bgr: np.ndarray,
+    masks: np.ndarray,
+    scores: np.ndarray,
+    phrases: list[str],
+    out_dir: pathlib.Path,
+    camera: str,
+    frame_idx: int,
+    kmax: int,
+    score_threshold: float,
+) -> None:
+    n = min(int(kmax), masks.shape[0])
+    keep = scores[:n] > score_threshold
+    ranks = np.flatnonzero(keep)
+    assert ranks.size >= 1, (
+        f"No SAM masks in top {n} with score > {score_threshold} for frame {frame_idx} "
+        f"(scores={scores[:n].tolist()})"
+    )
+    for rank in ranks:
+        rank = int(rank)
+        mask = masks[rank]
+        print(
+            f"[info] frame {frame_idx} rank={rank}/{n - 1} score={scores[rank]:.4f} "
+            f"phrase={phrases[rank]!r} pixels={int(mask.sum())}/{mask.size}"
+        )
+        if not mask.any():
+            print(f"[warning] frame {frame_idx} rank={rank} mask is empty, skipping PNG")
+            continue
+        prefix = f"{camera}__robot_mask__{int(frame_idx)}__rank={rank}__score={scores[rank]:.3f}"
+        ImageUtils.save_masked_debug(image_bgr, mask, out_dir, prefix)
 
 
 def _load_demo(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -341,6 +423,7 @@ class ExtrinsicsVisualizer:
         width: int,
         rgb_frames: np.ndarray,
         cma_maxiter: int,
+        fps_idx: np.ndarray,
     ) -> None:
         import viser
         import viser.uplot as uplot
@@ -352,11 +435,14 @@ class ExtrinsicsVisualizer:
             f"rgb_frames must be ({len(pcd_reals)}, H, W, 3), got {rgb_frames.shape}"
         )
         assert cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {cma_maxiter}"
+        fps_idx = np.asarray(fps_idx, dtype=np.int64).reshape(-1)
+        assert fps_idx.shape == (len(pcd_reals),), f"fps_idx {fps_idx.shape} != n clouds {len(pcd_reals)}"
         fy = float(K[1, 1])
         assert fy > 0, f"K[1,1] (fy) must be > 0, got {fy}"
 
         self._pcd_reals = pcd_reals
         self._rgb_frames = rgb_frames
+        self._fps_idx = fps_idx
         self._T = _look_at_opencv(_INIT_EYE, _INIT_TARGET)
         self._maxiter = cma_maxiter
         self._xs = np.arange(1, cma_maxiter + 1, dtype=np.float64)
@@ -364,10 +450,15 @@ class ExtrinsicsVisualizer:
         self._ys_pop = np.full(cma_maxiter, np.nan, dtype=np.float64)
         self._Ts: list[np.ndarray | None] = [None] * cma_maxiter
         self._pcd_sims_hist: list[list[np.ndarray] | None] = [None] * cma_maxiter
+        self._pop_Ts_hist: list[list[np.ndarray] | None] = [None] * cma_maxiter
         self._best_costs: list[float | None] = [None] * cma_maxiter
         self._n_recorded = 0
+        self._live_pcd_sims: list[np.ndarray] | None = None
+        self._live_pop_Ts: list[np.ndarray] | None = None
+        self._pop_axes: list = []
         self._timestep = 0
-        self._iteration = 1
+        self._iteration = 0
+        self._T_init = self._T.copy()
 
         self._server = viser.ViserServer()
         self._server.scene.world_axes.visible = True
@@ -396,7 +487,7 @@ class ExtrinsicsVisualizer:
             "/camera",
             fov=float(2.0 * np.arctan(height / (2.0 * fy))),
             aspect=width / height,
-            scale=0.15,
+            scale=0.04,
             line_width=1.5,
             color=(40, 120, 255),
             image=rgb_frames[0],
@@ -406,16 +497,16 @@ class ExtrinsicsVisualizer:
         )
         self._cam_axes = self._server.scene.add_frame(
             "/camera_axes",
-            axes_length=0.08,
-            axes_radius=0.004,
-            origin_radius=0.008,
+            axes_length=_BEST_AXES_LENGTH,
+            axes_radius=_BEST_AXES_RADIUS,
+            origin_radius=_BEST_ORIGIN_RADIUS,
             wxyz=wxyz0,
             position=pos0,
         )
         self._cost_md = self._server.gui.add_markdown("best cost: —")
         self._pose_md = self._server.gui.add_markdown("camera pose: —")
         timestep_slider = self._server.gui.add_slider(
-            "timestep", min=0, max=max(len(pcd_reals) - 1, 0), step=1, initial_value=0
+            "timestep (sampled)", min=0, max=max(len(pcd_reals) - 1, 0), step=1, initial_value=0
         )
 
         @timestep_slider.on_update
@@ -423,17 +514,16 @@ class ExtrinsicsVisualizer:
             self._timestep = int(timestep_slider.value)
             self._apply()
 
-        self._iter_slider = self._server.gui.add_slider(
-            "iteration", min=1, max=cma_maxiter, step=1, initial_value=1
-        )
+        self._iter_slider = self._server.gui.add_slider("iteration", min=0, max=0, step=1, initial_value=0)
 
         @self._iter_slider.on_update
         def _on_iteration(_) -> None:
             self._iteration = int(self._iter_slider.value)
             self._apply()
 
+        empty = np.array([], dtype=np.float64)
         self._cost_plot = self._server.gui.add_uplot(
-            data=(self._xs, self._ys_best, self._ys_pop),
+            data=(empty, empty, empty),
             series=(
                 uplot.Series(show=False),
                 uplot.Series(label="best found", stroke="#e67e22", width=2),
@@ -459,7 +549,18 @@ class ExtrinsicsVisualizer:
         assert T_world_cam.shape == (4, 4), f"T_world_cam must be 4x4, got {T_world_cam.shape}"
         if self._n_recorded > 0 and self._iteration != self._n_recorded:
             return
-        self._apply(T=T_world_cam.copy(), pcd_sims=pcd_sims, cost=float(cost))
+        self._live_pcd_sims = [p.copy() for p in pcd_sims]
+        self._apply(T=T_world_cam.copy(), pcd_sims=self._live_pcd_sims, cost=float(cost))
+
+    def set_population(self, pop_Ts: list[np.ndarray]) -> None:
+        """Live-update population axes if viewing the latest iteration."""
+        assert len(pop_Ts) >= 1, "population must contain at least one pose"
+        for i, T_pop in enumerate(pop_Ts):
+            assert T_pop.shape == (4, 4), f"pop_Ts[{i}] must be 4x4, got {T_pop.shape}"
+        if self._n_recorded > 0 and self._iteration != self._n_recorded:
+            return
+        self._live_pop_Ts = [T.copy() for T in pop_Ts]
+        self._set_pop_axes(self._live_pop_Ts, hide_extra=False)
 
     def record_generation(
         self,
@@ -468,28 +569,34 @@ class ExtrinsicsVisualizer:
         pop_min: float,
         T_world_cam: np.ndarray,
         pcd_sims: list[np.ndarray],
+        pop_Ts: list[np.ndarray],
     ) -> None:
         assert 1 <= generation <= self._maxiter, f"generation {generation} not in [1, {self._maxiter}]"
         assert T_world_cam.shape == (4, 4), f"T_world_cam must be 4x4, got {T_world_cam.shape}"
         assert len(pcd_sims) == len(
             self._pcd_reals
         ), f"sim clouds {len(pcd_sims)} != real clouds {len(self._pcd_reals)}"
+        assert len(pop_Ts) >= 1, "population must contain at least one pose"
+        for i, T_pop in enumerate(pop_Ts):
+            assert T_pop.shape == (4, 4), f"pop_Ts[{i}] must be 4x4, got {T_pop.shape}"
         i = generation - 1
         self._ys_best[i] = float(best_cost)
         self._ys_pop[i] = float(pop_min)
         self._Ts[i] = T_world_cam.copy()
-        self._pcd_sims_hist[i] = pcd_sims
+        self._pcd_sims_hist[i] = [p.copy() for p in pcd_sims]
+        self._pop_Ts_hist[i] = [T.copy() for T in pop_Ts]
         self._best_costs[i] = float(best_cost)
-        self._cost_plot.data = (self._xs, self._ys_best, self._ys_pop)
+        self._cost_plot.data = (self._xs[:generation], self._ys_best[:generation], self._ys_pop[:generation])
         follow = self._n_recorded == 0 or self._iteration == self._n_recorded
         self._n_recorded = generation
+        self._iter_slider.max = generation
         if follow:
             self._iteration = generation
             self._iter_slider.value = generation
             self._apply()
 
     def _snapshot_index(self) -> int | None:
-        if self._n_recorded == 0:
+        if self._n_recorded == 0 or self._iteration == 0:
             return None
         return min(int(self._iteration), self._n_recorded) - 1
 
@@ -501,28 +608,70 @@ class ExtrinsicsVisualizer:
     ) -> None:
         t = self._timestep
         snap_i = self._snapshot_index()
-        if T is None and snap_i is not None:
+        pop_Ts: list[np.ndarray] | None = None
+        if T is None and self._iteration == 0:
+            T = self._T_init
+            pcd_sims = None
+            cost = None
+            pop_Ts = []
+        elif T is None and snap_i is not None:
             T = self._Ts[snap_i]
             pcd_sims = self._pcd_sims_hist[snap_i]
             cost = self._best_costs[snap_i]
+            pop_Ts = self._pop_Ts_hist[snap_i]
             assert T is not None, f"Missing T snapshot at iteration {snap_i + 1}"
             assert pcd_sims is not None, f"Missing sim-cloud snapshot at iteration {snap_i + 1}"
             assert cost is not None, f"Missing cost snapshot at iteration {snap_i + 1}"
+            assert pop_Ts is not None, f"Missing population snapshot at iteration {snap_i + 1}"
+        elif T is None and pcd_sims is None:
+            pcd_sims = self._live_pcd_sims
+            pop_Ts = self._live_pop_Ts
         if T is not None:
             self._T = T
+        demo_frame = int(self._fps_idx[t])
+        cam_t = self._T[:3, 3]
         if cost is not None:
             self._cost_md.content = f"**iter {self._iteration} best cost:** `{cost:.6f}`"
-            cam_t = self._T[:3, 3]
-            self._pose_md.content = f"**camera t (robot base):** `[{cam_t[0]:.4f}, {cam_t[1]:.4f}, {cam_t[2]:.4f}]`"
-        self._real_handle.points = _transform_points(self._T, self._pcd_reals[t])
-        if pcd_sims is not None and pcd_sims[t].shape[0] > 0:
-            self._sim_handle.points = _transform_points(self._T, pcd_sims[t])
+        elif self._iteration == 0:
+            self._cost_md.content = "**iter 0 (init)**"
+        self._pose_md.content = (
+            f"**sampled t={t}  demo frame={demo_frame}**\n\n"
+            f"**camera t (robot base):** `[{cam_t[0]:.4f}, {cam_t[1]:.4f}, {cam_t[2]:.4f}]`"
+        )
+        self._real_handle.points = np.ascontiguousarray(_transform_points(self._T, self._pcd_reals[t]))
+        if pcd_sims is None or pcd_sims[t].shape[0] == 0:
+            sim_world = np.zeros((1, 3), dtype=np.float32)
+        else:
+            sim_world = _transform_points(self._T, pcd_sims[t])
+        self._sim_handle.points = np.ascontiguousarray(sim_world)
         wxyz, pos = MeshUtils._pose_mat_to_wxyz_position(self._T)
         self._frustum.wxyz = wxyz
         self._frustum.position = pos
         self._frustum.image = self._rgb_frames[t]
         self._cam_axes.wxyz = wxyz
         self._cam_axes.position = pos
+        if pop_Ts is not None:
+            self._set_pop_axes(pop_Ts, hide_extra=True)
+
+    def _set_pop_axes(self, pop_Ts: list[np.ndarray], *, hide_extra: bool) -> None:
+        while len(self._pop_axes) < len(pop_Ts):
+            i = len(self._pop_axes)
+            self._pop_axes.append(
+                self._server.scene.add_frame(
+                    f"/pop_axes/{i}",
+                    axes_length=_POP_AXES_LENGTH,
+                    axes_radius=_POP_AXES_RADIUS,
+                    origin_radius=_POP_ORIGIN_RADIUS,
+                )
+            )
+        for i, handle in enumerate(self._pop_axes):
+            if i < len(pop_Ts):
+                wxyz, pos = MeshUtils._pose_mat_to_wxyz_position(pop_Ts[i])
+                handle.wxyz = wxyz
+                handle.position = pos
+                handle.visible = True
+            elif hide_extra:
+                handle.visible = False
 
     def wait(self) -> None:
         self._server.sleep_forever()
@@ -535,10 +684,11 @@ def _pose_cost(
     pcd_reals: list[np.ndarray],
     n_pcd_samples: int,
     chamfer_device: str,
-) -> tuple[float, list[np.ndarray], float, float]:
+) -> tuple[float, list[np.ndarray], float, float, float]:
     total = 0.0
     pcd_sims: list[np.ndarray] = []
     t_render = 0.0
+    t_fps = 0.0
     t_chamfer = 0.0
     for t, q in enumerate(joint_angles):
         t0 = time.perf_counter()
@@ -548,12 +698,14 @@ def _pose_cost(
             pcd_sims.append(pcd_sim)
             total += _EMPTY_PCD_COST
             continue
+        t0 = time.perf_counter()
         pcd_sim = _subsample_pcd(pcd_sim, n_pcd_samples)
+        t_fps += time.perf_counter() - t0
         pcd_sims.append(pcd_sim)
         t0 = time.perf_counter()
         total += float(chamfer_distance(pcd_reals[t], pcd_sim, device=chamfer_device))
         t_chamfer += time.perf_counter() - t0
-    return total, pcd_sims, t_render, t_chamfer
+    return total, pcd_sims, t_render, t_fps, t_chamfer
 
 
 def _optimize_extrinsics(
@@ -562,7 +714,8 @@ def _optimize_extrinsics(
     pcd_reals: list[np.ndarray],
     n_pcd_samples: int,
     chamfer_device: str,
-    cma_sigma: float,
+    cma_sigma_pos: float,
+    cma_sigma_rot: float,
     cma_maxiter: int,
     cma_popsize: int | None,
     vis: ExtrinsicsVisualizer | None,
@@ -570,12 +723,18 @@ def _optimize_extrinsics(
     """CMA-ES over 6D camera pose. Returns (best 4x4 T_world_cam, cost)."""
     import cma
 
+    assert cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {cma_sigma_pos}"
+    assert cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {cma_sigma_rot}"
     x0 = _T_to_vec(_look_at_opencv(_INIT_EYE, _INIT_TARGET))
-    cma_opts: dict = {"maxiter": cma_maxiter, "verbose": -1, "CMA_stds": [1.0, 1.0, 1.0, 2.0, 2.0, 2.0]}
+    cma_stds = [cma_sigma_pos, cma_sigma_pos, cma_sigma_pos, cma_sigma_rot, cma_sigma_rot, cma_sigma_rot]
+    cma_opts: dict = {"maxiter": cma_maxiter, "verbose": -1, "CMA_stds": cma_stds}
     if cma_popsize is not None:
         cma_opts["popsize"] = cma_popsize
-    es = cma.CMAEvolutionStrategy(x0, cma_sigma, cma_opts)
-    print(f"[info] CMA-ES x0={x0} sigma={cma_sigma} popsize={es.popsize} maxiter={cma_maxiter}")
+    es = cma.CMAEvolutionStrategy(x0, 1.0, cma_opts)
+    print(
+        f"[info] CMA-ES x0={x0} sigma_pos={cma_sigma_pos} sigma_rot={cma_sigma_rot} "
+        f"popsize={es.popsize} maxiter={cma_maxiter}"
+    )
 
     best_cost = np.inf
     best_T: np.ndarray | None = None
@@ -585,38 +744,58 @@ def _optimize_extrinsics(
     while not es.stop():
         generation += 1
         t0_gen = time.perf_counter()
+        t0 = time.perf_counter()
         xs = es.ask()
+        t_cma = time.perf_counter() - t0
         costs = []
+        pop_Ts: list[np.ndarray] = []
         t_render = 0.0
+        t_fps = 0.0
         t_chamfer = 0.0
         t_vis = 0.0
         for x in tqdm(xs, desc=f"cma gen {generation}", leave=False):
             T = _vec_to_T(x)
-            cost, pcd_sims, dt_render, dt_chamfer = _pose_cost(
+            cost, pcd_sims, dt_render, dt_fps, dt_chamfer = _pose_cost(
                 T, renderer, joint_angles, pcd_reals, n_pcd_samples, chamfer_device
             )
             t_render += dt_render
+            t_fps += dt_fps
             t_chamfer += dt_chamfer
             costs.append(cost)
+            pop_Ts.append(T.copy())
+            if vis is not None:
+                t0 = time.perf_counter()
+                vis.set_population(pop_Ts)
+                t_vis += time.perf_counter() - t0
             if cost < best_cost:
                 best_cost = cost
                 best_T = T.copy()
                 best_pcd_sims = pcd_sims
                 if vis is not None:
-                    t0_vis = time.perf_counter()
+                    t0 = time.perf_counter()
                     vis.set_best(pcd_sims, best_cost, best_T)
-                    t_vis += time.perf_counter() - t0_vis
+                    t_vis += time.perf_counter() - t0
+        t0 = time.perf_counter()
         es.tell(xs, costs)
+        t_cma += time.perf_counter() - t0
         pop_min = float(min(costs))
-        assert best_T is not None and best_pcd_sims is not None, "CMA-ES generation produced no pose"
+        assert best_T is not None and best_pcd_sims is not None, "CMA-ES produced no pose"
         if vis is not None:
-            vis.record_generation(generation, best_cost, pop_min, best_T, best_pcd_sims)
+            t0 = time.perf_counter()
+            vis.record_generation(generation, best_cost, pop_min, best_T, best_pcd_sims, pop_Ts)
+            t_vis += time.perf_counter() - t0
         dt_gen = time.perf_counter() - t0_gen
+        t_other = dt_gen - (t_render + t_fps + t_chamfer + t_vis + t_cma)
         print(
             f"[info] gen {generation} ({dt_gen:.1f}s): best={best_cost:.6f}  gen_min={pop_min:.6f}  "
-            f"gen_mean={float(np.mean(costs)):.6f}  "
-            f"render={t_render:.1f}s chamfer={t_chamfer:.1f}s vis={t_vis:.1f}s"
+            f"gen_mean={float(np.mean(costs)):.6f}"
         )
+        print(f"[info]   time_render={t_render:.1f}s")
+        print(f"[info]   time_fps={t_fps:.1f}s")
+        print(f"[info]   time_chamfer={t_chamfer:.1f}s")
+        print(f"[info]   time_vis={t_vis:.1f}s")
+        print(f"[info]   time_cma={t_cma:.1f}s")
+        print(f"[info]   time_other={t_other:.1f}s")
 
     assert best_T is not None, "CMA-ES produced no pose"
     _log_elapsed(f"CMA-ES finished ({generation} gens)", t0_opt)
@@ -632,10 +811,15 @@ def main(args: Args) -> None:
     ), f"Unknown robot_id {args.robot_id!r}. Available: {sorted(NAME_TO_ROBOT)}"
     assert args.n_timesteps >= 1, f"n_timesteps must be >= 1, got {args.n_timesteps}"
     assert args.n_pcd_samples >= 1, f"n_pcd_samples must be >= 1, got {args.n_pcd_samples}"
-    assert args.cma_sigma > 0, f"cma_sigma must be > 0, got {args.cma_sigma}"
+    assert args.cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {args.cma_sigma_pos}"
+    assert args.cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {args.cma_sigma_rot}"
     assert args.cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {args.cma_maxiter}"
     assert args.cma_popsize is None or args.cma_popsize >= 2, f"cma_popsize must be >= 2, got {args.cma_popsize}"
     assert len(args.robot_description) > 0, "robot_description must not be empty"
+    assert args.sam_kmax >= 1, f"sam_kmax must be >= 1, got {args.sam_kmax}"
+    assert 0.0 <= args.sam_score_threshold < 1.0, (
+        f"sam_score_threshold must be in [0, 1), got {args.sam_score_threshold}"
+    )
     chamfer_device = "cuda" if torch.cuda.is_available() else "cpu"
 
     depth_intrinsics = get_depth_intrinsics(args.camera_model_id)
@@ -687,7 +871,9 @@ def main(args: Args) -> None:
     t0_masks = time.perf_counter()
     for i, frame_idx in enumerate(fps_idx):
         image_bgr = cv2.cvtColor(rgb_sel[i], cv2.COLOR_RGB2BGR)
-        cache_path = _robot_mask_cache_path(args.h5_path, args.camera, int(frame_idx))
+        cache_path = _robot_mask_cache_path(
+            args.h5_path, args.camera, int(frame_idx), args.sam_kmax, args.sam_score_threshold
+        )
         if args.cache_robot_masks and cache_path.is_file():
             mask = np.load(cache_path)
             assert isinstance(mask, np.ndarray), f"{cache_path}: expected ndarray, got {type(mask)}"
@@ -704,21 +890,40 @@ def main(args: Args) -> None:
                 _log_elapsed("GroundedSAM loaded", t0)
             print(f"[info] Segmenting '{args.robot_description}' on frame {int(frame_idx)} ...")
             t0 = time.perf_counter()
-            mask = ImageUtils.get_sam_mask(predictor, image_bgr, args.robot_description)
-            _log_elapsed(f"Segmented '{args.robot_description}' on frame {int(frame_idx)}", t0)
+            masks, scores, phrases = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, args.robot_description)
+            _log_elapsed(
+                f"Segmented '{args.robot_description}' on frame {int(frame_idx)} ({masks.shape[0]} masks)", t0
+            )
+            for rank in range(min(args.sam_kmax, masks.shape[0])):
+                print(
+                    f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
+                    f"pixels={int(masks[rank].sum())}"
+                )
+            mask = _union_top_sam_masks(masks, scores, args.sam_kmax, args.sam_score_threshold)
+            if args.visualize_robot_masks:
+                _dump_top_sam_masks(
+                    image_bgr,
+                    masks,
+                    scores,
+                    phrases,
+                    args.h5_path.parent,
+                    args.camera,
+                    int(frame_idx),
+                    args.sam_kmax,
+                    args.sam_score_threshold,
+                )
+                ImageUtils.save_masked_debug(
+                    image_bgr,
+                    mask,
+                    args.h5_path.parent,
+                    f"{args.camera}__robot_mask__{int(frame_idx)}__union__kmax={args.sam_kmax}__score_threshold={args.sam_score_threshold}",
+                )
             if args.cache_robot_masks:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 np.save(cache_path, mask)
                 print(f"[info] Saved robot mask to {cache_path}")
         assert mask.any(), f"Empty robot mask at frame {int(frame_idx)} for prompt {args.robot_description!r}"
         print(f"[info] Mask pixels: {int(mask.sum())} / {mask.size}")
-        if args.visualize_robot_masks:
-            ImageUtils.save_masked_debug(
-                image_bgr,
-                mask,
-                args.h5_path.parent,
-                f"{args.camera}__robot_mask__{int(frame_idx)}",
-            )
         pts = masked_depth_to_points(depth_m_sel[i], mask, K)
         pts = _subsample_pcd(pts, args.n_pcd_samples)
         assert pts.shape[0] >= 1, f"No robot points at frame {int(frame_idx)}"
@@ -739,7 +944,7 @@ def main(args: Args) -> None:
     _log_elapsed("Loaded robot + Sapien renderer", t0)
 
     vis = (
-        ExtrinsicsVisualizer(pcd_reals, K, H, W, rgb_sel, args.cma_maxiter) if args.visualize else None
+        ExtrinsicsVisualizer(pcd_reals, K, H, W, rgb_sel, args.cma_maxiter, fps_idx) if args.visualize else None
     )
     best_T, best_cost = _optimize_extrinsics(
         renderer,
@@ -747,7 +952,8 @@ def main(args: Args) -> None:
         pcd_reals,
         args.n_pcd_samples,
         chamfer_device,
-        args.cma_sigma,
+        args.cma_sigma_pos,
+        args.cma_sigma_rot,
         args.cma_maxiter,
         args.cma_popsize,
         vis,
