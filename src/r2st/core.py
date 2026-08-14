@@ -25,8 +25,7 @@ import torch
 from PIL import Image as PILImage
 
 from r2st.geometry import (
-    align_depth_to_color,
-    align_ros_depth_to_color,
+    reproject_depth_to_color_frame,
     camera_extrinsic_to_maniskill_pose,
     mat_to_sapien_pose_tuple,
     project_axes_to_image,
@@ -37,8 +36,7 @@ from r2st.geometry import (
 
 # Re-export geometry helpers so tests can import from core as in original
 __all__ = [
-    "align_depth_to_color",
-    "align_ros_depth_to_color",
+    "reproject_depth_to_color_frame",
     "camera_extrinsic_to_maniskill_pose",
     "mat_to_sapien_pose_tuple",
     "project_axes_to_image",

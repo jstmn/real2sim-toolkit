@@ -190,7 +190,7 @@ def parse_requirements(fname="requirements.txt", with_version=True):
 if __name__ == "__main__":
     print(f"Building wheel {package_name}-{version}")
 
-    with open("LICENSE", "r", encoding="utf-8") as f:
+    with open("src/r2st/GroundingDINO/LICENSE", "r", encoding="utf-8") as f:
         license = f.read()
 
     write_version_file()

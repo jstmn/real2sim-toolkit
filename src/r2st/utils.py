@@ -1,4 +1,4 @@
-"""Shared image, mesh, and sampling utilities."""
+"""Shared image, mesh, sampling, and merged-h5 utilities."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ import io
 from collections.abc import Sequence
 from pathlib import Path
 
+import h5py
 import numpy as np
-
 
 _DISTANCE_EUCLIDEAN = "euclidean"
 _DISTANCE_CIRCULAR = "circular"
@@ -74,6 +74,46 @@ def farthest_point_sample_naive(
     if unbatched:
         return centroids[0]
     return centroids
+
+
+MERGED_CAMERA_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
+
+
+def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
+    """Assert `f` matches the merged sensor-data layout from `examples/merge_camera_streams.py`:
+    `obs/sensor_data/{camera}/[rgb, depth, timestamp_ms, rgb_timestamp_ms]`."""
+    assert (
+        "obs/sensor_data" in f
+    ), f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {list(f.keys())}"
+    sensor_data = f["obs/sensor_data"]
+    group_path = f"obs/sensor_data/{camera}"
+    assert group_path in f, f"Camera '{camera}' not found in {h5_path}. Available: {sorted(sensor_data.keys())}"
+    group = f[group_path]
+    for name in MERGED_CAMERA_DATASETS:
+        assert name in group, f"{h5_path}:{group_path} missing dataset '{name}'"
+
+    rgb, depth, timestamp_ms, rgb_timestamp_ms = (group[name] for name in MERGED_CAMERA_DATASETS)
+    assert rgb.ndim == 4 and rgb.shape[3] == 3, f"{h5_path}:{group_path}/rgb must be NxHxWx3, got {rgb.shape}"
+    assert rgb.dtype == np.uint8, f"{h5_path}:{group_path}/rgb must be uint8, got {rgb.dtype}"
+    assert depth.ndim == 3, f"{h5_path}:{group_path}/depth must be NxHxW, got {depth.shape}"
+    assert timestamp_ms.ndim == 1, f"{h5_path}:{group_path}/timestamp_ms must be 1D, got {timestamp_ms.shape}"
+    assert (
+        rgb_timestamp_ms.ndim == 1
+    ), f"{h5_path}:{group_path}/rgb_timestamp_ms must be 1D, got {rgb_timestamp_ms.shape}"
+    num_frames = timestamp_ms.shape[0]
+    assert num_frames > 0, f"{h5_path}:{group_path} has no frames"
+    assert (
+        rgb.shape[0] == num_frames
+    ), f"{h5_path}:{group_path}: rgb has {rgb.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert (
+        depth.shape[0] == num_frames
+    ), f"{h5_path}:{group_path}: depth has {depth.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert (
+        rgb_timestamp_ms.shape[0] == num_frames
+    ), f"{h5_path}:{group_path}: rgb_timestamp_ms has {rgb_timestamp_ms.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert (
+        depth.shape[1:] == rgb.shape[1:3]
+    ), f"{h5_path}:{group_path}: depth resolution {depth.shape[1:]} != rgb resolution {rgb.shape[1:3]}"
 
 
 class ImageUtils:

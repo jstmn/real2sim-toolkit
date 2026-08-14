@@ -25,13 +25,21 @@ bash run_container.sh
 # In the docker container:
 cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
+# Clone ManiSkill and Jrl2
+git clone git@github.com:jstmn/ManiSkill.git thirdparty/ManiSkill
+git clone git@github.com:jstmn/Jrl2.git thirdparty/Jrl2
+
 # Initialize uv
 uv sync
+
+
+uv run python src/r2st/GroundingDINO/setup.py develop
+
 ```
 
 ## Examples
 
-Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
+**Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:**
 
 ```bash
 uv run python examples/generate_mesh.py --images data/red_T_block_1.png --visualize
@@ -39,14 +47,21 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 ```
 
 
-Example 2: Estimate camera extrinsics 
+**Example 2: Estimate camera extrinsics and save results to a yaml file.** This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
 ```bash
-uv run python examples/estimate_camera_extrinsics.py --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 --robot-id xarm7 --camera cam_1 --realsense-id d435 --output-path data/demonstrations/0802/extrinsics.yaml --visualize --visualize-robot-masks
+uv run python examples/estimate_camera_extrinsics.py \
+  --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --robot-id xarm7 \
+  --camera cam_1 \
+  --camera-model-id d435 \
+  --output-path data/demonstrations/0802/extrinsics.yaml \
+  --visualize \
+  --visualize-robot-masks
 ```
 
 
-Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
-demonstration, then track that object through the demonstration.
+**Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
+demonstration, then track that object through the demonstration:**
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv. 
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
@@ -63,17 +78,25 @@ cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 uv run python examples/track_object.py \
     --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
-    --realsense-id d435 \
+    --camera-model-id d435 \
     --object-description "mustard bottle" \
     --visualize
 
 uv run python examples/track_object.py \
     --h5-path data/demonstrations/raise_cube_0_merged.h5 \
     --camera camera_north \
-    --realsense-id d435 \
+    --camera-model-id d435 \
     --object-description "blue cube" \
     --visualize
 ```
+
+## Camera models
+
+`--camera-model-id` selects measured intrinsics (and depth-to-color extrinsics) from `r2st.constants`.
+
+| `--camera-model-id` | Device |
+| --- | --- |
+| `d435` | Intel RealSense D435 |
 
 ## Pose tracking (gRPC)
 

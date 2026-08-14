@@ -3,27 +3,34 @@ name = "real2sim-toolkit"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 dependencies = [
+    "cma>=4.4.4",
     "grpcio>=1.83.0",
     "h5py>=3.16.0",
+    "jrl2",
+    "mani_skill",
     "matplotlib>=3.11.1",
     "numpy",
     "onnx>=1.22.0",
     "onnxruntime>=1.28.0",
     "openai",
-    "opencv-python>=5.0.0.93",
+    "opencv-python>=4.0",
     "pillow",
     "pycocotools>=2.0.11",
+    "pyyaml>=6.0.3",
     "requests>=2.34.2",
+    "termcolor>=3.3.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
     "tqdm>=4.70.0",
     "transformers>=4.36.2",
+    "transforms3d>=0.4.2",
     "trimesh>=4.12.2",
     "tyro",
     "viser>=1.0.30",
     "warp-lang>=1.16.0",
+    "xacrodoc>=2.0.1",
 ]
 
 [build-system]
@@ -53,3 +60,7 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+
+[tool.uv.sources]
+jrl2 = { path = "thirdparty/Jrl2", editable = true }
+mani_skill = { path = "thirdparty/ManiSkill", editable = true }

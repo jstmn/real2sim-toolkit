@@ -9,23 +9,29 @@ import numpy as np
 import tyro
 from tqdm import tqdm
 
+from r2st.constants import get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics
 from r2st.core import GroundedSAMPredictor
 from r2st.geometry import (
-    align_ros_depth_to_color,
+    reproject_depth_to_color_frame,
+    depth_mm_to_meters,
     masked_depth_to_points,
     scale_intrinsics,
 )
 from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
-from r2st.realsense_calibration import get_color_intrinsics, get_depth_intrinsics
-from r2st.utils import ImageUtils, MeshUtils, TrackingVisualizer
+from r2st.utils import (
+    ImageUtils,
+    MeshUtils,
+    TrackingVisualizer,
+    validate_merged_camera_group,
+)
 
 """
 # Example usage (FoundationPose gRPC server must already be running in the container):
     uv run python examples/track_object.py \
         --h5-path data/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
         --camera cam_1 \
-        --realsense-id d435 \
+        --camera-model-id d435 \
         --object-description "mustard bottle" \
         --visualize
 """
@@ -39,8 +45,8 @@ class Args:
     camera: str
     """Camera name to read from within the h5 file, e.g. 'cam_1'."""
 
-    realsense_id: str
-    """RealSense device model for calibration lookup, e.g. 'd435'."""
+    camera_model_id: str
+    """Camera model id for calibration lookup, e.g. 'd435'. See the README camera-model table."""
 
     object_description: str
     """Language description of the object to segment and mesh, e.g. 'mustard bottle'."""
@@ -70,51 +76,9 @@ class Args:
     """If set, render a 360-degree orbit GIF of the generated GLB."""
 
 
-_EXPECTED_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
-
-
-def _validate_camera_group(f: h5py.File, h5_path: pathlib.Path, camera: str) -> None:
-    """Check that `f` matches the merged sensor-data format from examples/merge_camera_streams.py:
-    obs/sensor_data/{camera}/[rgb, depth, timestamp_ms, rgb_timestamp_ms]."""
-    assert (
-        "obs/sensor_data" in f
-    ), f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {f.keys()}"
-    sensor_data = f["obs/sensor_data"]
-    group_path = f"obs/sensor_data/{camera}"
-    assert group_path in f, f"Camera '{camera}' not found in {h5_path}. Available: {sorted(sensor_data.keys())}"
-    group = f[group_path]
-    for name in _EXPECTED_DATASETS:
-        assert name in group, f"{h5_path}:{group_path} missing dataset '{name}'"
-
-    rgb, depth, timestamp_ms, rgb_timestamp_ms = (group[name] for name in _EXPECTED_DATASETS)
-    assert rgb.ndim == 4 and rgb.shape[3] == 3, f"{h5_path}:{group_path}/rgb must be NxHxWx3, got {rgb.shape}"
-    assert rgb.dtype == np.uint8, f"{h5_path}:{group_path}/rgb must be uint8, got {rgb.dtype}"
-    assert depth.ndim == 3, f"{h5_path}:{group_path}/depth must be NxHxW, got {depth.shape}"
-    assert timestamp_ms.ndim == 1, f"{h5_path}:{group_path}/timestamp_ms must be 1D, got {timestamp_ms.shape}"
-    assert (
-        rgb_timestamp_ms.ndim == 1
-    ), f"{h5_path}:{group_path}/rgb_timestamp_ms must be 1D, got {rgb_timestamp_ms.shape}"
-
-    num_frames = timestamp_ms.shape[0]
-    assert num_frames > 0, f"{h5_path}:{group_path} has no frames"
-    assert (
-        rgb.shape[0] == num_frames
-    ), f"{h5_path}:{group_path}: rgb has {rgb.shape[0]} frames but timestamp_ms has {num_frames}"
-    assert (
-        depth.shape[0] == num_frames
-    ), f"{h5_path}:{group_path}: depth has {depth.shape[0]} frames but timestamp_ms has {num_frames}"
-    assert rgb_timestamp_ms.shape[0] == num_frames, (
-        f"{h5_path}:{group_path}: rgb_timestamp_ms has {rgb_timestamp_ms.shape[0]} frames but timestamp_ms has "
-        f"{num_frames}"
-    )
-    assert (
-        depth.shape[1:] == rgb.shape[1:3]
-    ), f"{h5_path}:{group_path}: depth resolution {depth.shape[1:]} != rgb resolution {rgb.shape[1:3]}"
-
-
 def _load_rgb_depth(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray]:
     with h5py.File(h5_path, "r") as f:
-        _validate_camera_group(f, h5_path, camera)
+        validate_merged_camera_group(f, h5_path, camera)
         group = f[f"obs/sensor_data/{camera}"]
         return group["rgb"][:], group["depth"][:]
 
@@ -145,8 +109,8 @@ def main(args: Args) -> None:
     assert args.track_refine_iter >= 1, f"track_refine_iter must be >= 1, got {args.track_refine_iter}"
     assert args.max_frames is None or args.max_frames >= 1, f"max_frames must be >= 1, got {args.max_frames}"
 
-    depth_intrinsics = get_depth_intrinsics(args.realsense_id)
-    color_intrinsics = get_color_intrinsics(args.realsense_id)
+    depth_intrinsics = get_depth_intrinsics(args.camera_model_id)
+    color_intrinsics = get_color_intrinsics(args.camera_model_id)
 
     print(f"[info] Loading RGB-D from {args.h5_path} ({args.camera}) ...")
     t0 = time.perf_counter()
@@ -165,19 +129,26 @@ def main(args: Args) -> None:
         (color_intrinsics.height, color_intrinsics.width),
         (H, W),
     ).astype(np.float64)
-    print(f"[info] Color K ({args.realsense_id}):\n{K}")
+    print(f"[info] Color K ({args.camera_model_id}):\n{K}")
 
-    print(f"[info] Aligning depth to color ({num_frames} frames) ...")
+    print(f"[info] Reprojecting depth into the color frame ({num_frames} frames) ...")
     t0 = time.perf_counter()
+    R_dc, t_dc = get_depth_to_color_extrinsics(args.camera_model_id)
     depth_m_all = np.stack(
         [
-            align_ros_depth_to_color(depth_raw_all[i], depth_intrinsics, color_intrinsics)
-            for i in tqdm(range(num_frames), desc="align depth")
+            reproject_depth_to_color_frame(
+                depth_mm_to_meters(depth_raw_all[i]),
+                depth_intrinsics,
+                color_intrinsics,
+                R_dc,
+                t_dc,
+            )
+            for i in tqdm(range(num_frames), desc="reproject depth")
         ],
         axis=0,
     )
     assert depth_m_all.shape == (num_frames, H, W), f"Bad aligned depth shape: {depth_m_all.shape}"
-    _log_elapsed("Aligned depth to color", t0)
+    _log_elapsed("Reprojected depth into the color frame", t0)
 
     rgb0 = rgb_all[0]
     depth0 = depth_m_all[0]

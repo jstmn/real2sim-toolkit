@@ -1,15 +1,7 @@
 import numpy as np
 
+from r2st.constants import MAX_DEPTH_M, MIN_DEPTH_M
 from r2st.types import CameraIntrinsics
-
-# Depth -> Color extrinsics for RealSense D435 only.
-REALSENSE_D435_DEPTH_TO_COLOR_ROTATION = np.array(
-    [[0.999749, 0.021574, 0.00599926], [-0.021599, 0.999758, 0.0041374], [-0.00590855, -0.00426594, 0.999973]],
-    dtype=np.float64,
-)
-REALSENSE_D435_DEPTH_TO_COLOR_TRANSLATION = np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64)
-MIN_DEPTH_M = 0.01
-MAX_DEPTH_M = 2.0
 
 
 def scale_intrinsics(K: np.ndarray, orig_hw: tuple[int, int], new_hw: tuple[int, int]) -> np.ndarray:
@@ -29,15 +21,15 @@ def scale_intrinsics(K: np.ndarray, orig_hw: tuple[int, int], new_hw: tuple[int,
     return K_scaled
 
 
-def align_depth_to_color(
+def reproject_depth_to_color_frame(
     depth_image: np.ndarray,
     depth_intrinsics: CameraIntrinsics,
     color_intrinsics: CameraIntrinsics,
-    R_dc: np.ndarray | None = None,
-    t_dc: np.ndarray | None = None,
+    R_dc: np.ndarray,
+    t_dc: np.ndarray,
     invalid_fill: float = 0.0,
 ) -> np.ndarray:
-    """Align depth to color using pinhole projection."""
+    """Unproject metric depth, apply depth-to-color extrinsics, and z-buffer into the color image."""
     assert isinstance(depth_intrinsics, CameraIntrinsics), f"must be CameraIntrinsics, got {type(depth_intrinsics)}"
     assert isinstance(color_intrinsics, CameraIntrinsics), f"must be CameraIntrinsics, got {type(color_intrinsics)}"
     assert depth_image.ndim == 2, f"depth_image must be 2D, got {depth_image.ndim}D"
@@ -45,13 +37,8 @@ def align_depth_to_color(
     fx_d, fy_d, cx_d, cy_d = depth_intrinsics.values
     Hc, Wc = color_intrinsics.height, color_intrinsics.width
     fx_c, fy_c, cx_c, cy_c = color_intrinsics.values
-
-    if R_dc is None:
-        R_dc = np.eye(3, dtype=np.float64)
-    if t_dc is None:
-        t_dc = np.zeros(3, dtype=np.float64)
-    assert R_dc.shape == (3, 3)
-    assert t_dc.shape == (3,)
+    assert R_dc.shape == (3, 3), f"R_dc must be 3x3, got {R_dc.shape}"
+    assert t_dc.shape == (3,), f"t_dc must be (3,), got {t_dc.shape}"
 
     u = np.arange(Wd, dtype=np.float64)
     v = np.arange(Hd, dtype=np.float64)
@@ -82,7 +69,14 @@ def align_depth_to_color(
     np.minimum.at(zbuf, flat_idx, zc)
     zbuf = zbuf.reshape(Hc, Wc)
     aligned[zbuf != np.inf] = zbuf[zbuf != np.inf].astype(np.float32)
+    aligned[(aligned < MIN_DEPTH_M) | (aligned > MAX_DEPTH_M)] = 0
     return aligned
+
+
+def depth_mm_to_meters(depth_raw: np.ndarray) -> np.ndarray:
+    """Convert uint16 depth in millimeters to float32 meters."""
+    assert depth_raw.dtype == np.uint16, f"depth must be uint16 millimeters, got {depth_raw.dtype}"
+    return depth_raw.astype(np.float32) / 1000.0
 
 
 def realsense_to_maniskill_basis_matrix() -> np.ndarray:
@@ -108,25 +102,6 @@ def camera_extrinsic_to_maniskill_pose(T_world_cam: np.ndarray) -> tuple[np.ndar
     F = realsense_to_maniskill_basis_matrix()
     R_wc_ms = R_wc_rs @ F.T
     return t_wc, R_wc_ms
-
-
-def align_ros_depth_to_color(
-    depth_raw: np.ndarray,
-    depth_intrinsics: CameraIntrinsics,
-    rgb_intrinsics: CameraIntrinsics,
-) -> np.ndarray:
-    """Align ROS depth (uint16 mm) to color frame for RealSense D435 only."""
-    assert depth_raw.ndim == 2
-    depth_m = depth_raw.astype(np.float32) / 1000.0
-    depth_aligned = align_depth_to_color(
-        depth_m,
-        depth_intrinsics=depth_intrinsics,
-        color_intrinsics=rgb_intrinsics,
-        R_dc=REALSENSE_D435_DEPTH_TO_COLOR_ROTATION,
-        t_dc=REALSENSE_D435_DEPTH_TO_COLOR_TRANSLATION,
-    )
-    depth_aligned[(depth_aligned < MIN_DEPTH_M) | (depth_aligned > MAX_DEPTH_M)] = 0
-    return depth_aligned
 
 
 def depth_rgb_to_pointcloud(
@@ -262,8 +237,7 @@ def _warp_chamfer_min_sqdist_kernel():
             dy = py - dst[b, j, 1]
             dz = pz - dst[b, j, 2]
             d = dx * dx + dy * dy + dz * dz
-            if d < min_d:
-                min_d = d
+            min_d = min(min_d, d)
         out[b, i] = min_d
 
     _WARP_CHAMFER = (wp, min_sqdist_kernel)
@@ -288,9 +262,9 @@ def _as_batched_pointclouds(points_a: np.ndarray, points_b: np.ndarray) -> tuple
         points_a = np.broadcast_to(points_a, (points_b.shape[0], points_a.shape[1], 3))
     elif points_b.shape[0] == 1 and points_a.shape[0] > 1:
         points_b = np.broadcast_to(points_b, (points_a.shape[0], points_b.shape[1], 3))
-    assert points_a.shape[0] == points_b.shape[0], (
-        f"Batch sizes must match (or one side broadcast from 1), got {points_a.shape[0]} vs {points_b.shape[0]}"
-    )
+    assert (
+        points_a.shape[0] == points_b.shape[0]
+    ), f"Batch sizes must match (or one side broadcast from 1), got {points_a.shape[0]} vs {points_b.shape[0]}"
     assert points_a.shape[1] >= 1, f"points_a must have at least 1 point, got {points_a.shape}"
     assert points_b.shape[1] >= 1, f"points_b must have at least 1 point, got {points_b.shape}"
     return (
