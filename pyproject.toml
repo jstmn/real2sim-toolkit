@@ -23,6 +23,7 @@ dependencies = [
     "trimesh>=4.12.2",
     "tyro",
     "viser>=1.0.30",
+    "warp-lang>=1.16.0",
 ]
 
 [build-system]

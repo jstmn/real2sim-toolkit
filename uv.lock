@@ -262,43 +262,43 @@ wheels = [
 
 [package.optional-dependencies]
 cublas = [
-    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cublas", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-cuda-nvrtc", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cudart = [
-    { name = "nvidia-cuda-runtime", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-runtime", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cufft = [
-    { name = "nvidia-cufft", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cufft", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cufile = [
-    { name = "nvidia-cufile", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')" },
+    { name = "nvidia-cufile", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cupti = [
-    { name = "nvidia-cuda-cupti", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-cupti", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 curand = [
-    { name = "nvidia-curand", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-curand", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cusolver = [
-    { name = "nvidia-cublas", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-cusolver", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cublas", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-cusolver", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-cusparse", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 cusparse = [
-    { name = "nvidia-cusparse", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cusparse", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvjitlink = [
-    { name = "nvidia-nvjitlink", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvjitlink", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvrtc = [
-    { name = "nvidia-cuda-nvrtc", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-cuda-nvrtc", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 nvtx = [
-    { name = "nvidia-nvtx", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine == 'AMD64' and sys_platform == 'win32')" },
+    { name = "nvidia-nvtx", marker = "platform_machine == 'aarch64' or platform_machine == 'x86_64'" },
 ]
 
 [[package]]
@@ -1727,6 +1727,7 @@ dependencies = [
     { name = "trimesh" },
     { name = "tyro" },
     { name = "viser" },
+    { name = "warp-lang" },
 ]
 
 [package.dev-dependencies]
@@ -1766,6 +1767,7 @@ requires-dist = [
     { name = "trimesh", specifier = ">=4.12.2" },
     { name = "tyro" },
     { name = "viser", specifier = ">=1.0.30" },
+    { name = "warp-lang", specifier = ">=1.16.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -2252,6 +2254,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/83/9a/85f9a82eac4e067fb1bc34cf4f7865b0d914a3ce91f5b0da47dcef549930/viser-1.0.30.tar.gz", hash = "sha256:6a849a9ef141c97d4ac7bd7d970b81265e6d0130ee8ef1c2e18c0b46aa6b6283", size = 4924612, upload-time = "2026-06-03T16:02:38.552Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/4a/c9/9a4ca25b505303d5557c98786ac0bf7081c76a7262e1b6c87b899bccc7b8/viser-1.0.30-py3-none-any.whl", hash = "sha256:43089f50acdd45c19b23101c9a2cf8edcc52d052bf7f53ed0b2b6a932c71b5d1", size = 5027789, upload-time = "2026-06-03T16:02:40.331Z" },
+]
+
+[[package]]
+name = "warp-lang"
+version = "1.16.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/73/8a/8be711f3b5431a6e0bdb97117d681b03cf2bb95d6fcf8869861900898d88/warp_lang-1.16.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:19a7590c4484e8250ab19165311d2a1774138663b361c41e8be2865c7515c4ae", size = 25221601, upload-time = "2026-08-03T02:26:38.389Z" },
+    { url = "https://files.pythonhosted.org/packages/1d/3d/47feef2eee4739437e19d6949ea231ca4181c9eacbaa39144761e6130d94/warp_lang-1.16.0-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:96449fc1e3b354185e2f09434fb794b5953ab2e8673b104d7e7f48d5d418bb35", size = 163074225, upload-time = "2026-08-03T02:27:03.632Z" },
+    { url = "https://files.pythonhosted.org/packages/db/96/0c2b070b3101c669955cafd36262548b2e8b00dfdeda3aeb7afbc0f9d65c/warp_lang-1.16.0-py3-none-manylinux_2_34_aarch64.whl", hash = "sha256:d4715171bd6821436b82293d774c9a082ace08215c189572b4348d1e48fb8ee8", size = 167563789, upload-time = "2026-08-03T02:27:37.512Z" },
+    { url = "https://files.pythonhosted.org/packages/7e/17/c98fab81156f0d25f17200f52f69210b94a9abba101066736df8cc493522/warp_lang-1.16.0-py3-none-win_amd64.whl", hash = "sha256:8690c9096e0a271985339d4aa4b37675e7d62852620ca861ac032dc85b124542", size = 146387135, upload-time = "2026-08-03T02:28:17.956Z" },
 ]
 
 [[package]]

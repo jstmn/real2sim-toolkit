@@ -38,7 +38,14 @@ uv run python examples/generate_mesh.py --images data/red_T_block_1.png --visual
 uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --visualize
 ```
 
-Example 2: Generate a mesh for the "mustard bottle" seen in the first frame of a
+
+Example 2: Estimate camera extrinsics 
+```bash
+uv run python examples/estimate_camera_extrinsics.py --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 --robot-id xarm7 --camera cam_1 --realsense-id d435 --output-path data/demonstrations/0802/extrinsics.yaml --visualize --visualize-robot-masks
+```
+
+
+Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
 demonstration, then track that object through the demonstration.
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv. 

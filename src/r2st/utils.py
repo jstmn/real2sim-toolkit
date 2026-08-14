@@ -1,4 +1,4 @@
-"""Shared image and mesh visualization utilities."""
+"""Shared image, mesh, and sampling utilities."""
 
 from __future__ import annotations
 
@@ -7,6 +7,73 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
+
+
+_DISTANCE_EUCLIDEAN = "euclidean"
+_DISTANCE_CIRCULAR = "circular"
+_DISTANCE_METRICS = (_DISTANCE_EUCLIDEAN, _DISTANCE_CIRCULAR)
+
+
+def _feature_distance_sq(points: np.ndarray, centroid: np.ndarray, distance: str) -> np.ndarray:
+    """Squared distances from each of `points` `(B, N, C)` to `centroid` `(B, C)` → `(B, N)`.
+
+    `euclidean` is ordinary L2. `circular` is the geodesic on the circle S¹ per coordinate
+    (shortest arc, identifying 0 with 2π), then L2 over coordinates — i.e. the geodesic on
+    the flat torus T^C. That is the usual wrap-aware joint-space metric.
+    """
+    delta = points - centroid[:, None, :]
+    if distance == _DISTANCE_EUCLIDEAN:
+        return np.sum(delta * delta, axis=-1)
+    wrapped = np.arctan2(np.sin(delta), np.cos(delta))
+    return np.sum(wrapped * wrapped, axis=-1)
+
+
+def farthest_point_sample_naive(
+    points: np.ndarray,
+    n_samples: int,
+    *,
+    start_index: int = 0,
+    distance: str = _DISTANCE_EUCLIDEAN,
+) -> np.ndarray:
+    """Greedy farthest-point sampling. Returns indices into the N dimension.
+
+    Naive O(`n_samples` * N) Python loop — not an optimized implementation.
+    `from pyg_lib.ops import fps` is substantially faster for large Euclidean point clouds.
+
+    `points` is `(N, C)` or batched `(B, N, C)` (any C, e.g. 3D points or 7-DoF joints).
+    Unbatched input returns `(n_samples,)` int64; batched returns `(B, n_samples)`.
+    Sampled values are `points[idx]` / `np.take_along_axis(points, idx[..., None], axis=1)`.
+
+    `distance` is `"euclidean"` (L2) or `"circular"` (geodesic on S¹ per coordinate; 0 ≡ 2π).
+    """
+    assert isinstance(points, np.ndarray), f"points must be ndarray, got {type(points)}"
+    assert points.ndim in (2, 3), f"points must be (N, C) or (B, N, C), got {points.shape}"
+    unbatched = points.ndim == 2
+    if unbatched:
+        points = points[None, ...]
+    B, N, C = points.shape
+    assert C >= 1, f"points must have at least 1 feature dim, got {points.shape}"
+    assert N >= 1, f"points must have at least 1 sample, got {points.shape}"
+    assert isinstance(n_samples, int), f"n_samples must be int, got {type(n_samples)}"
+    assert 1 <= n_samples <= N, f"n_samples must be in [1, {N}], got {n_samples}"
+    assert isinstance(start_index, int), f"start_index must be int, got {type(start_index)}"
+    assert 0 <= start_index < N, f"start_index must be in [0, {N}), got {start_index}"
+    assert distance in _DISTANCE_METRICS, f"distance must be one of {_DISTANCE_METRICS}, got {distance!r}"
+
+    pts = np.ascontiguousarray(points, dtype=np.float64)
+    centroids = np.zeros((B, n_samples), dtype=np.int64)
+    min_dist_sq = np.full((B, N), np.inf, dtype=np.float64)
+    farthest = np.full((B,), start_index, dtype=np.int64)
+    batch_idx = np.arange(B)
+    for i in range(n_samples):
+        centroids[:, i] = farthest
+        centroid = pts[batch_idx, farthest]
+        dist_sq = _feature_distance_sq(pts, centroid, distance)
+        np.minimum(min_dist_sq, dist_sq, out=min_dist_sq)
+        farthest = np.argmax(min_dist_sq, axis=-1)
+    if unbatched:
+        return centroids[0]
+    return centroids
 
 
 class ImageUtils:

@@ -229,3 +229,107 @@ def mat_to_sapien_pose_tuple(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     t = mat[:3, 3]
     q_wxyz = mat2quat(mat[:3, :3])
     return t, q_wxyz
+
+
+_WARP_CHAMFER = None
+
+
+def _warp_chamfer_min_sqdist_kernel():
+    """Lazy-load Warp and the brute-force min-squared-distance kernel."""
+    global _WARP_CHAMFER
+    if _WARP_CHAMFER is not None:
+        return _WARP_CHAMFER
+
+    import warp as wp
+
+    wp.init()
+
+    @wp.kernel(enable_backward=False)
+    def min_sqdist_kernel(
+        src: wp.array(dtype=float, ndim=3),
+        dst: wp.array(dtype=float, ndim=3),
+        out: wp.array(dtype=float, ndim=2),
+        n_dst: int,
+    ):
+        b, i = wp.tid()
+        px = src[b, i, 0]
+        py = src[b, i, 1]
+        pz = src[b, i, 2]
+        # Bare literals are Warp constants; wrap so min_d can update in the dynamic loop.
+        min_d = float(1.0e30)
+        for j in range(n_dst):
+            dx = px - dst[b, j, 0]
+            dy = py - dst[b, j, 1]
+            dz = pz - dst[b, j, 2]
+            d = dx * dx + dy * dy + dz * dz
+            if d < min_d:
+                min_d = d
+        out[b, i] = min_d
+
+    _WARP_CHAMFER = (wp, min_sqdist_kernel)
+    return _WARP_CHAMFER
+
+
+def _as_batched_pointclouds(points_a: np.ndarray, points_b: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Return `(B, N, 3)`, `(B, M, 3)`, and whether the inputs were unbatched `(N, 3)` vs `(M, 3)`."""
+    assert isinstance(points_a, np.ndarray), f"points_a must be ndarray, got {type(points_a)}"
+    assert isinstance(points_b, np.ndarray), f"points_b must be ndarray, got {type(points_b)}"
+    assert points_a.shape[-1] == 3, f"points_a last dim must be 3, got {points_a.shape}"
+    assert points_b.shape[-1] == 3, f"points_b last dim must be 3, got {points_b.shape}"
+    assert points_a.ndim in (2, 3), f"points_a must be (N, 3) or (B, N, 3), got {points_a.shape}"
+    assert points_b.ndim in (2, 3), f"points_b must be (M, 3) or (B, M, 3), got {points_b.shape}"
+
+    unbatched = points_a.ndim == 2 and points_b.ndim == 2
+    if points_a.ndim == 2:
+        points_a = points_a[None, ...]
+    if points_b.ndim == 2:
+        points_b = points_b[None, ...]
+    if points_a.shape[0] == 1 and points_b.shape[0] > 1:
+        points_a = np.broadcast_to(points_a, (points_b.shape[0], points_a.shape[1], 3))
+    elif points_b.shape[0] == 1 and points_a.shape[0] > 1:
+        points_b = np.broadcast_to(points_b, (points_a.shape[0], points_b.shape[1], 3))
+    assert points_a.shape[0] == points_b.shape[0], (
+        f"Batch sizes must match (or one side broadcast from 1), got {points_a.shape[0]} vs {points_b.shape[0]}"
+    )
+    assert points_a.shape[1] >= 1, f"points_a must have at least 1 point, got {points_a.shape}"
+    assert points_b.shape[1] >= 1, f"points_b must have at least 1 point, got {points_b.shape}"
+    return (
+        np.ascontiguousarray(points_a, dtype=np.float32),
+        np.ascontiguousarray(points_b, dtype=np.float32),
+        unbatched,
+    )
+
+
+def chamfer_distance(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    *,
+    device: str = "cuda",
+) -> np.ndarray | float:
+    """Symmetric squared Chamfer distance, brute-force nearest neighbors via Warp.
+
+    ``mean_i min_j ||a_i - b_j||^2 + mean_j min_i ||b_j - a_i||^2``.
+
+    Shapes:
+      - `(N, 3)` vs `(M, 3)` → Python `float`
+      - `(B, N, 3)` vs `(B, M, 3)` → `(B,)` float64
+      - `(B, N, 3)` vs `(M, 3)` or `(N, 3)` vs `(B, M, 3)` → broadcast the unbatched side
+    """
+    assert device in ("cpu", "cuda"), f"device must be 'cpu' or 'cuda', got {device!r}"
+    batched_a, batched_b, unbatched = _as_batched_pointclouds(points_a, points_b)
+    wp, min_sqdist_kernel = _warp_chamfer_min_sqdist_kernel()
+
+    B, N, _ = batched_a.shape
+    _, M, _ = batched_b.shape
+    a_wp = wp.array(batched_a, dtype=float, device=device)
+    b_wp = wp.array(batched_b, dtype=float, device=device)
+    d_ab = wp.zeros((B, N), dtype=float, device=device)
+    d_ba = wp.zeros((B, M), dtype=float, device=device)
+    wp.launch(min_sqdist_kernel, dim=[B, N], inputs=[a_wp, b_wp, d_ab, M], device=device)
+    wp.launch(min_sqdist_kernel, dim=[B, M], inputs=[b_wp, a_wp, d_ba, N], device=device)
+    dist = d_ab.numpy().mean(axis=1) + d_ba.numpy().mean(axis=1)
+    dist = np.asarray(dist, dtype=np.float64)
+    assert dist.shape == (B,), f"Expected ({B},) chamfer, got {dist.shape}"
+    if unbatched:
+        return float(dist[0])
+    return dist

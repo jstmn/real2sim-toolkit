@@ -145,3 +145,62 @@ class TestProjectAxes:
         K = np.eye(3)
         with pytest.raises(AssertionError):
             project_axes_to_image(np.eye(4), K, axis_len=-0.1)
+
+
+def _numpy_chamfer(points_a: np.ndarray, points_b: np.ndarray) -> float:
+    d_ab = ((points_a[:, None, :] - points_b[None, :, :]) ** 2).sum(axis=-1).min(axis=-1).mean()
+    d_ba = ((points_b[:, None, :] - points_a[None, :, :]) ** 2).sum(axis=-1).min(axis=-1).mean()
+    return float(d_ab + d_ba)
+
+
+class TestChamferDistance:
+    def test_identical_clouds_zero(self):
+        from r2st.geometry import chamfer_distance
+
+        rng = np.random.default_rng(0)
+        pts = rng.normal(size=(32, 3)).astype(np.float32)
+        d = chamfer_distance(pts, pts.copy(), device="cpu")
+        assert isinstance(d, float)
+        assert d == pytest.approx(0.0, abs=1e-6)
+
+    def test_translated_cloud(self):
+        from r2st.geometry import chamfer_distance
+
+        pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        shifted = pts + np.array([0.5, 0.0, 0.0], dtype=np.float32)
+        d = chamfer_distance(pts, shifted, device="cpu")
+        assert d == pytest.approx(2.0 * (0.5**2), abs=1e-5)
+
+    def test_matches_numpy_reference(self):
+        from r2st.geometry import chamfer_distance
+
+        rng = np.random.default_rng(1)
+        a = rng.normal(size=(17, 3)).astype(np.float32)
+        b = rng.normal(size=(23, 3)).astype(np.float32) + 0.4
+        d = chamfer_distance(a, b, device="cpu")
+        assert d == pytest.approx(_numpy_chamfer(a, b), rel=1e-5, abs=1e-5)
+
+    def test_batched_and_broadcast(self):
+        from r2st.geometry import chamfer_distance
+
+        rng = np.random.default_rng(2)
+        a = rng.normal(size=(4, 11, 3)).astype(np.float32)
+        b = rng.normal(size=(4, 9, 3)).astype(np.float32)
+        d = chamfer_distance(a, b, device="cpu")
+        assert d.shape == (4,)
+        for i in range(4):
+            assert d[i] == pytest.approx(_numpy_chamfer(a[i], b[i]), rel=1e-5, abs=1e-5)
+
+        b0 = rng.normal(size=(9, 3)).astype(np.float32)
+        d_bcast = chamfer_distance(a, b0, device="cpu")
+        assert d_bcast.shape == (4,)
+        for i in range(4):
+            assert d_bcast[i] == pytest.approx(_numpy_chamfer(a[i], b0), rel=1e-5, abs=1e-5)
+
+    def test_bad_shape_raises(self):
+        from r2st.geometry import chamfer_distance
+
+        with pytest.raises(AssertionError):
+            chamfer_distance(np.zeros((5, 2)), np.zeros((5, 3)), device="cpu")
+        with pytest.raises(AssertionError):
+            chamfer_distance(np.zeros((2, 5, 3)), np.zeros((3, 5, 3)), device="cpu")
