@@ -236,7 +236,7 @@ def _warp_chamfer_min_sqdist_kernel():
         py = src[b, i, 1]
         pz = src[b, i, 2]
         # Bare literals are Warp constants; wrap so min_d can update in the dynamic loop.
-        min_d = 1.0e30
+        min_d = float(1.0e30)  # noqa: UP018
         for j in range(n_dst):
             dx = px - dst[b, j, 0]
             dy = py - dst[b, j, 1]
