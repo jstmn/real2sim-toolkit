@@ -25,24 +25,22 @@ import torch
 from PIL import Image as PILImage
 
 from r2st.geometry import (
-    align_depth_to_color,
-    align_ros_depth_to_color,
     camera_extrinsic_to_maniskill_pose,
     mat_to_sapien_pose_tuple,
     project_axes_to_image,
     realsense_to_maniskill_basis_matrix,
+    reproject_depth_to_color_frame,
     scale_intrinsics,
     transform_pose_cam_to_world,
 )
 
 # Re-export geometry helpers so tests can import from core as in original
 __all__ = [
-    "align_depth_to_color",
-    "align_ros_depth_to_color",
     "camera_extrinsic_to_maniskill_pose",
     "mat_to_sapien_pose_tuple",
     "project_axes_to_image",
     "realsense_to_maniskill_basis_matrix",
+    "reproject_depth_to_color_frame",
     "scale_intrinsics",
     "transform_pose_cam_to_world",
 ]
@@ -244,16 +242,28 @@ class GroundedSAMPredictor:
                 pred_phrases.append(pred_phrase + f"({str(logit.max().item())[:4]})")
             else:
                 pred_phrases.append(pred_phrase)
-        return boxes_filt, pred_phrases
+        box_scores = logits_filt.max(dim=1)[0]
+        return boxes_filt, pred_phrases, box_scores
 
-    def get_sam_mask(self, image: np.ndarray, object_name: str) -> torch.Tensor:
+    def get_ranked_sam_masks(self, image: np.ndarray, object_name: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+        """Return all SAM masks for `object_name`, sorted by confidence descending.
+
+        GroundingDINO boxes each produce three SAM hypotheses (`multimask_output=True`).
+        Score is `box_logit * sam_iou`. Returns `(N, H, W)` bool, `(N,)` scores, phrases.
+        """
+        import torch
+
         assert self._sam_predictor is not None and self._bert_model is not None, "GroundedSAM not initialized"
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         assert isinstance(image_rgb, np.ndarray)
         self._sam_predictor.set_image(image_rgb)
-        boxes_filt, pred_phrases = self._get_grounding_output(
+        boxes_filt, pred_phrases, box_scores = self._get_grounding_output(
             self._bert_model, image_rgb, object_name, self._box_threshold, self._text_threshold, device=self._device
         )
+        assert boxes_filt.size(0) > 0, f"GroundingDINO found no boxes for {object_name!r}"
+        assert box_scores.shape == (
+            boxes_filt.size(0),
+        ), f"box_scores {box_scores.shape} != n_boxes {boxes_filt.size(0)}"
         img_size = image_rgb.shape[:2]
         W, H = img_size[1], img_size[0]
         assert H < W, f"Image height ({H}) should be less than width ({W})"
@@ -263,10 +273,26 @@ class GroundedSAMPredictor:
             boxes_filt[i][2:] += boxes_filt[i][:2]
         boxes_filt = boxes_filt.cpu()
         transformed_boxes = self._sam_predictor.transform.apply_boxes_torch(boxes_filt, img_size).to(self._device)
-        masks, _, _ = self._sam_predictor.predict_torch(
-            point_coords=None, point_labels=None, boxes=transformed_boxes.to(self._device), multimask_output=False
+        masks, iou_preds, _ = self._sam_predictor.predict_torch(
+            point_coords=None, point_labels=None, boxes=transformed_boxes.to(self._device), multimask_output=True
         )
+        assert masks.ndim == 4, f"Expected (n_boxes, n_hyp, H, W) masks, got {tuple(masks.shape)}"
+        n_boxes, n_hyp, mh, mw = masks.shape
+        assert (mh, mw) == (H, W), f"Mask size {(mh, mw)} != image {(H, W)}"
+        assert iou_preds.shape == (n_boxes, n_hyp), f"iou_preds {tuple(iou_preds.shape)} != {(n_boxes, n_hyp)}"
+        combined = box_scores.to(iou_preds.device)[:, None] * iou_preds
+        masks_flat = masks.reshape(n_boxes * n_hyp, H, W)
+        scores_flat = combined.reshape(n_boxes * n_hyp)
+        phrases_flat = [pred_phrases[b] for b in range(n_boxes) for _ in range(n_hyp)]
+        order = torch.argsort(scores_flat, descending=True)
+        masks_np = masks_flat[order].cpu().numpy().astype(bool)
+        scores_np = scores_flat[order].detach().cpu().numpy().astype(np.float64)
+        phrases_sorted = [phrases_flat[int(i)] for i in order.cpu().numpy()]
         if self._debug_output_dir is not None:
             print(f"Saving grounded SAM output to '{self._debug_output_dir}'")
             save_mask_image(image_rgb, self._debug_output_dir, masks, boxes_filt, pred_phrases)
-        return masks
+        return masks_np, scores_np, phrases_sorted
+
+    def get_sam_mask(self, image: np.ndarray, object_name: str) -> torch.Tensor:
+        masks_np, _, _ = self.get_ranked_sam_masks(image, object_name)
+        return torch.from_numpy(masks_np[:, None, ...])

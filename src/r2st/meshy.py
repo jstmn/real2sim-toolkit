@@ -2,6 +2,7 @@ import base64
 import mimetypes
 import os
 import time
+from collections.abc import Sequence
 from pathlib import Path
 
 import requests
@@ -11,6 +12,7 @@ MESHY_API_KEY = os.getenv("MESHY_API_KEY", "")
 _POLL_INTERVAL_S = 5.0
 _POLL_TIMEOUT_S = 600.0
 MESHY_MODEL_ID = "latest"
+
 
 def _image_path_to_data_uri(image_path: Path) -> str:
     mime, _ = mimetypes.guess_type(str(image_path))
@@ -33,19 +35,29 @@ class MeshyAPI:
 
     def _create_task(
         self,
-        image_url: str,
+        image_urls: list[str],
         *,
         enable_pbr: bool,
     ) -> str:
+        assert 1 <= len(image_urls) <= 4, f"multi-image-to-3d accepts 1-4 images, got {len(image_urls)}"
+        assert len(image_urls) == 1, "meshy seems to make better results with only one image"
         payload = {
-            "image_url": image_url,
-            "ai_model": MESHY_MODEL_ID,
-            "should_texture": True,
+            "image_urls": image_urls,
+            "image_enhancement": False,
+            # "image_enhancement": True,
+            # ^ generates weird artifacts / surfaces designs
+            "pose_mode": "",
             "enable_pbr": enable_pbr,
             "target_formats": ["glb"],
+            "ai_model": MESHY_MODEL_ID,
+            "texture_resolution": "4k",
+            # ^ 4k does better than 2k
+            "ultra_mode": False,
+            # ^ not sure if this is better true or false
+            "should_remesh": True,
         }
         response = requests.post(
-            f"{MESHY_API_BASE}/image-to-3d",
+            f"{MESHY_API_BASE}/multi-image-to-3d",
             headers=self._headers(),
             json=payload,
             timeout=60,
@@ -65,7 +77,7 @@ class MeshyAPI:
             last_progress = 0
             while True:
                 response = requests.get(
-                    f"{MESHY_API_BASE}/image-to-3d/{task_id}",
+                    f"{MESHY_API_BASE}/multi-image-to-3d/{task_id}",
                     headers=self._headers(),
                     timeout=60,
                 )
@@ -86,7 +98,7 @@ class MeshyAPI:
                     return task
                 if status == "FAILED":
                     error = task.get("task_error", {})
-                    raise RuntimeError(f"Meshy image-to-3d failed for {task_id}: {error}")
+                    raise RuntimeError(f"Meshy multi-image-to-3d failed for {task_id}: {error}")
                 assert time.monotonic() < deadline, f"Meshy task {task_id} timed out after {_POLL_TIMEOUT_S}s"
                 time.sleep(_POLL_INTERVAL_S)
 
@@ -116,16 +128,18 @@ class MeshyAPI:
 
     def image_to_3d(
         self,
-        image_path: str | Path,
+        image_paths: Sequence[str | Path],
         output_dir: str | Path,
         enable_pbr: bool = True,
     ) -> str:
-        image_path = Path(image_path)
+        image_paths = [Path(p) for p in image_paths]
+        assert len(image_paths) > 0, "image_paths must not be empty"
         output_dir = Path(output_dir)
-        assert image_path.is_file(), f"Image file '{image_path}' not found"
+        for image_path in image_paths:
+            assert image_path.is_file(), f"Image file '{image_path}' not found"
         output_dir.mkdir(parents=True, exist_ok=True)
-        image_url = _image_path_to_data_uri(image_path)
-        task_id = self._create_task(image_url, enable_pbr=enable_pbr)
+        image_urls = [_image_path_to_data_uri(image_path) for image_path in image_paths]
+        task_id = self._create_task(image_urls, enable_pbr=enable_pbr)
         print(f"[info] Created Meshy image-to-3d task: {task_id}")
         task = self._poll_task(task_id)
         model_urls = task.get("model_urls")

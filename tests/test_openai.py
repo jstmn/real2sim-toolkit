@@ -65,18 +65,18 @@ class TestQueryOpenaiScript:
 
         from PIL import Image
 
-        from scripts.query_openai import Args, main
+        from examples.query_openai import Args, main
 
         p = tmp_path / "img.png"
         Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(p)
         args = Args(image=Path(p))
-        with patch("scripts.query_openai.list_objects_in_image", return_value=["red cup"]):
+        with patch("examples.query_openai.list_objects_in_image", return_value=["red cup"]):
             main(args)  # should not raise, just print
 
     def test_missing_image_raises(self, tmp_path):
         from pathlib import Path
 
-        from scripts.query_openai import Args, main
+        from examples.query_openai import Args, main
 
         args = Args(image=Path(tmp_path) / "nonexistent.jpg")
         with pytest.raises(AssertionError):

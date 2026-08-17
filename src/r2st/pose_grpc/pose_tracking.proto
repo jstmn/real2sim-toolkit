@@ -1,0 +1,45 @@
+syntax = "proto3";
+
+package r2st;
+
+// Runs FoundationPose object pose estimation/tracking inside the FoundationPose Docker
+// container (see src/r2st/FoundationPose/docker). The server holds a single active tracked
+// object at a time: `Register` (re)initializes the tracked object from its first frame, and
+// subsequent `Track` calls refine that pose frame-to-frame until the next `Register` call
+// replaces it. Mirrors the r2st.pose_tracking.FoundationPoseTracker API.
+service PoseTracking {
+  rpc Register(RegisterRequest) returns (PoseResponse);
+  rpc Track(TrackRequest) returns (PoseResponse);
+}
+
+// Raw row-major image bytes; dtype is implied by the field it's used in (uint8 for color_rgb
+// and mask, float32 for depth_m).
+message Image {
+  bytes data = 1;
+  int32 height = 2;
+  int32 width = 3;
+  int32 channels = 4;
+}
+
+message RegisterRequest {
+  string mesh_path = 1;   // Filesystem path visible to the server (shared bind mount with the host).
+  Image color_rgb = 2;    // uint8, channels=3.
+  Image depth_m = 3;      // float32 meters, channels=1.
+  Image mask = 4;         // uint8 (0/1), channels=1.
+  repeated float k_matrix = 5;  // Row-major 3x3 camera intrinsics.
+  int32 iteration = 6;
+  bool use_2d_tracker = 7;
+  bool use_kalman_filter = 8;
+  float kalman_measurement_noise_scale = 9;
+}
+
+message TrackRequest {
+  Image color_rgb = 1;
+  Image depth_m = 2;
+  repeated float k_matrix = 3;  // Row-major 3x3 camera intrinsics.
+  int32 iteration = 4;
+}
+
+message PoseResponse {
+  repeated float pose_cam = 1;  // Row-major 4x4 object-in-camera pose.
+}

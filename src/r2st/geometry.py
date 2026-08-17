@@ -1,13 +1,7 @@
 import numpy as np
 
+from r2st.constants import MAX_DEPTH_M, MIN_DEPTH_M
 from r2st.types import CameraIntrinsics
-
-# Depth -> Color extrinsics for RealSense D435 only.
-REALSENSE_D435_DEPTH_TO_COLOR_ROTATION = np.array(
-    [[0.999749, 0.021574, 0.00599926], [-0.021599, 0.999758, 0.0041374], [-0.00590855, -0.00426594, 0.999973]],
-    dtype=np.float64,
-)
-REALSENSE_D435_DEPTH_TO_COLOR_TRANSLATION = np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64)
 
 
 def scale_intrinsics(K: np.ndarray, orig_hw: tuple[int, int], new_hw: tuple[int, int]) -> np.ndarray:
@@ -27,15 +21,20 @@ def scale_intrinsics(K: np.ndarray, orig_hw: tuple[int, int], new_hw: tuple[int,
     return K_scaled
 
 
-def align_depth_to_color(
+def reproject_depth_to_color_frame(
     depth_image: np.ndarray,
     depth_intrinsics: CameraIntrinsics,
     color_intrinsics: CameraIntrinsics,
-    R_dc: np.ndarray | None = None,
-    t_dc: np.ndarray | None = None,
+    R_dc: np.ndarray,
+    t_dc: np.ndarray,
     invalid_fill: float = 0.0,
 ) -> np.ndarray:
-    """Align depth to color using pinhole projection."""
+    """Unproject *native* (unaligned) metric depth, apply depth-to-color extrinsics, z-buffer into the color image.
+
+    Do not use this on merged sensor-data h5 depth: that depth is already in the color
+    pixel grid. Warping it again with depth-camera K (wider FOV) vs color K leaves a
+    sparse, misaligned depth map.
+    """
     assert isinstance(depth_intrinsics, CameraIntrinsics), f"must be CameraIntrinsics, got {type(depth_intrinsics)}"
     assert isinstance(color_intrinsics, CameraIntrinsics), f"must be CameraIntrinsics, got {type(color_intrinsics)}"
     assert depth_image.ndim == 2, f"depth_image must be 2D, got {depth_image.ndim}D"
@@ -43,13 +42,8 @@ def align_depth_to_color(
     fx_d, fy_d, cx_d, cy_d = depth_intrinsics.values
     Hc, Wc = color_intrinsics.height, color_intrinsics.width
     fx_c, fy_c, cx_c, cy_c = color_intrinsics.values
-
-    if R_dc is None:
-        R_dc = np.eye(3, dtype=np.float64)
-    if t_dc is None:
-        t_dc = np.zeros(3, dtype=np.float64)
-    assert R_dc.shape == (3, 3)
-    assert t_dc.shape == (3,)
+    assert R_dc.shape == (3, 3), f"R_dc must be 3x3, got {R_dc.shape}"
+    assert t_dc.shape == (3,), f"t_dc must be (3,), got {t_dc.shape}"
 
     u = np.arange(Wd, dtype=np.float64)
     v = np.arange(Hd, dtype=np.float64)
@@ -80,7 +74,14 @@ def align_depth_to_color(
     np.minimum.at(zbuf, flat_idx, zc)
     zbuf = zbuf.reshape(Hc, Wc)
     aligned[zbuf != np.inf] = zbuf[zbuf != np.inf].astype(np.float32)
+    aligned[(aligned < MIN_DEPTH_M) | (aligned > MAX_DEPTH_M)] = 0
     return aligned
+
+
+def depth_mm_to_meters(depth_raw: np.ndarray) -> np.ndarray:
+    """Convert uint16 depth in millimeters to float32 meters."""
+    assert depth_raw.dtype == np.uint16, f"depth must be uint16 millimeters, got {depth_raw.dtype}"
+    return depth_raw.astype(np.float32) / 1000.0
 
 
 def realsense_to_maniskill_basis_matrix() -> np.ndarray:
@@ -108,23 +109,75 @@ def camera_extrinsic_to_maniskill_pose(T_world_cam: np.ndarray) -> tuple[np.ndar
     return t_wc, R_wc_ms
 
 
-def align_ros_depth_to_color(
-    depth_raw: np.ndarray,
-    depth_intrinsics: CameraIntrinsics,
-    rgb_intrinsics: CameraIntrinsics,
+def depth_rgb_to_pointcloud(
+    depth_m: np.ndarray,
+    rgb: np.ndarray,
+    K: np.ndarray,
+    *,
+    min_depth_m: float = MIN_DEPTH_M,
+    max_depth_m: float = MAX_DEPTH_M,
+    stride: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Unproject a metric depth map to camera-frame points colored by RGB.
+
+    Returns `(N, 3)` float32 XYZ and `(N, 3)` uint8 colors. Pixel coordinates use
+    OpenCV convention (+Z forward, +Y down), matching FoundationPose poses.
+    """
+    assert depth_m.ndim == 2, f"depth_m must be HxW, got {depth_m.shape}"
+    assert rgb.ndim == 3 and rgb.shape[2] == 3, f"rgb must be HxWx3, got {rgb.shape}"
+    assert rgb.shape[:2] == depth_m.shape, f"rgb {rgb.shape[:2]} != depth {depth_m.shape}"
+    assert rgb.dtype == np.uint8, f"rgb dtype must be uint8, got {rgb.dtype}"
+    assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+    assert stride >= 1, f"stride must be >= 1, got {stride}"
+    assert min_depth_m > 0, f"min_depth_m must be > 0, got {min_depth_m}"
+    assert max_depth_m > min_depth_m, f"max_depth_m must be > min_depth_m, got {max_depth_m} vs {min_depth_m}"
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    assert fx > 0 and fy > 0, f"fx/fy must be > 0, got fx={fx} fy={fy}"
+
+    H, W = depth_m.shape
+    us = np.arange(0, W, stride, dtype=np.float64)
+    vs = np.arange(0, H, stride, dtype=np.float64)
+    uu, vv = np.meshgrid(us, vs)
+    ui = uu.astype(np.int64)
+    vi = vv.astype(np.int64)
+    z = depth_m[vi, ui].astype(np.float64)
+    valid = np.isfinite(z) & (z >= min_depth_m) & (z <= max_depth_m)
+    assert valid.any(), "No valid depth pixels to unproject"
+    uu, vv, z = uu[valid], vv[valid], z[valid]
+    pts = np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], axis=-1).astype(np.float32)
+    colors = rgb[vi[valid], ui[valid]]
+    return pts, colors
+
+
+def masked_depth_to_points(
+    depth_m: np.ndarray,
+    mask: np.ndarray,
+    K: np.ndarray,
+    *,
+    min_depth_m: float = MIN_DEPTH_M,
+    max_depth_m: float = MAX_DEPTH_M,
 ) -> np.ndarray:
-    """Align ROS depth (uint16 mm) to color frame for RealSense D435 only."""
-    assert depth_raw.ndim == 2
-    depth_m = depth_raw.astype(np.float32) / 1000.0
-    depth_aligned = align_depth_to_color(
-        depth_m,
-        depth_intrinsics=depth_intrinsics,
-        color_intrinsics=rgb_intrinsics,
-        R_dc=REALSENSE_D435_DEPTH_TO_COLOR_ROTATION,
-        t_dc=REALSENSE_D435_DEPTH_TO_COLOR_TRANSLATION,
-    )
-    depth_aligned[(depth_aligned < 0.01) | (depth_aligned > 2.0)] = 0
-    return depth_aligned
+    """Unproject masked metric depth to camera-frame XYZ (N, 3) float64."""
+    assert depth_m.ndim == 2, f"depth_m must be HxW, got {depth_m.shape}"
+    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
+    assert mask.shape == depth_m.shape, f"mask {mask.shape} != depth {depth_m.shape}"
+    assert mask.any(), "Cannot unproject an empty mask"
+    assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+    assert min_depth_m > 0, f"min_depth_m must be > 0, got {min_depth_m}"
+    assert max_depth_m > min_depth_m, f"max_depth_m must be > min_depth_m, got {max_depth_m} vs {min_depth_m}"
+    fx, fy = float(K[0, 0]), float(K[1, 1])
+    cx, cy = float(K[0, 2]), float(K[1, 2])
+    assert fx > 0 and fy > 0, f"fx/fy must be > 0, got fx={fx} fy={fy}"
+
+    vs, us = np.where(mask)
+    z = depth_m[vs, us].astype(np.float64)
+    valid = np.isfinite(z) & (z >= min_depth_m) & (z <= max_depth_m)
+    assert valid.any(), "No valid masked depth pixels to unproject"
+    us = us[valid].astype(np.float64)
+    vs = vs[valid].astype(np.float64)
+    z = z[valid]
+    return np.stack([(us - cx) * z / fx, (vs - cy) * z / fy, z], axis=-1)
 
 
 def project_axes_to_image(pose_cam: np.ndarray, K: np.ndarray, axis_len: float = 0.1):
@@ -156,3 +209,137 @@ def mat_to_sapien_pose_tuple(mat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     t = mat[:3, 3]
     q_wxyz = mat2quat(mat[:3, :3])
     return t, q_wxyz
+
+
+_WARP_CHAMFER = None
+
+
+def _warp_chamfer_min_sqdist_kernel():
+    """Lazy-load Warp and the brute-force min-squared-distance kernel."""
+    global _WARP_CHAMFER
+    if _WARP_CHAMFER is not None:
+        return _WARP_CHAMFER
+
+    import warp as wp
+
+    wp.init()
+
+    @wp.kernel(enable_backward=False)
+    def min_sqdist_kernel(
+        src: wp.array(dtype=float, ndim=3),
+        dst: wp.array(dtype=float, ndim=3),
+        out: wp.array(dtype=float, ndim=2),
+        n_dst: int,
+    ):
+        b, i = wp.tid()
+        px = src[b, i, 0]
+        py = src[b, i, 1]
+        pz = src[b, i, 2]
+        # Bare literals are Warp constants; wrap so min_d can update in the dynamic loop.
+        min_d = float(1.0e30)  # noqa: UP018
+        for j in range(n_dst):
+            dx = px - dst[b, j, 0]
+            dy = py - dst[b, j, 1]
+            dz = pz - dst[b, j, 2]
+            d = dx * dx + dy * dy + dz * dz
+            min_d = min(min_d, d)
+        out[b, i] = min_d
+
+    _WARP_CHAMFER = (wp, min_sqdist_kernel)
+    return _WARP_CHAMFER
+
+
+def _as_batched_pointclouds(points_a: np.ndarray, points_b: np.ndarray) -> tuple[np.ndarray, np.ndarray, bool]:
+    """Return `(B, N, 3)`, `(B, M, 3)`, and whether the inputs were unbatched `(N, 3)` vs `(M, 3)`."""
+    assert isinstance(points_a, np.ndarray), f"points_a must be ndarray, got {type(points_a)}"
+    assert isinstance(points_b, np.ndarray), f"points_b must be ndarray, got {type(points_b)}"
+    assert points_a.shape[-1] == 3, f"points_a last dim must be 3, got {points_a.shape}"
+    assert points_b.shape[-1] == 3, f"points_b last dim must be 3, got {points_b.shape}"
+    assert points_a.ndim in (2, 3), f"points_a must be (N, 3) or (B, N, 3), got {points_a.shape}"
+    assert points_b.ndim in (2, 3), f"points_b must be (M, 3) or (B, M, 3), got {points_b.shape}"
+
+    unbatched = points_a.ndim == 2 and points_b.ndim == 2
+    if points_a.ndim == 2:
+        points_a = points_a[None, ...]
+    if points_b.ndim == 2:
+        points_b = points_b[None, ...]
+    if points_a.shape[0] == 1 and points_b.shape[0] > 1:
+        points_a = np.broadcast_to(points_a, (points_b.shape[0], points_a.shape[1], 3))
+    elif points_b.shape[0] == 1 and points_a.shape[0] > 1:
+        points_b = np.broadcast_to(points_b, (points_a.shape[0], points_b.shape[1], 3))
+    assert (
+        points_a.shape[0] == points_b.shape[0]
+    ), f"Batch sizes must match (or one side broadcast from 1), got {points_a.shape[0]} vs {points_b.shape[0]}"
+    assert points_a.shape[1] >= 1, f"points_a must have at least 1 point, got {points_a.shape}"
+    assert points_b.shape[1] >= 1, f"points_b must have at least 1 point, got {points_b.shape}"
+    return (
+        np.ascontiguousarray(points_a, dtype=np.float32),
+        np.ascontiguousarray(points_b, dtype=np.float32),
+        unbatched,
+    )
+
+
+def _mean_min_squared_nn(
+    points_src: np.ndarray,
+    points_dst: np.ndarray,
+    *,
+    device: str,
+) -> np.ndarray:
+    """Batched `(B, N, 3)` vs `(B, M, 3)` → `(B,)` mean over src of min squared distance to dst."""
+    assert device in ("cpu", "cuda"), f"device must be 'cpu' or 'cuda', got {device!r}"
+    assert points_src.ndim == 3 and points_src.shape[-1] == 3, f"points_src must be (B, N, 3), got {points_src.shape}"
+    assert points_dst.ndim == 3 and points_dst.shape[-1] == 3, f"points_dst must be (B, M, 3), got {points_dst.shape}"
+    assert (
+        points_src.shape[0] == points_dst.shape[0]
+    ), f"Batch sizes must match, got {points_src.shape[0]} vs {points_dst.shape[0]}"
+    wp, min_sqdist_kernel = _warp_chamfer_min_sqdist_kernel()
+    B, n_src, _ = points_src.shape
+    n_dst = int(points_dst.shape[1])
+    src_wp = wp.array(points_src, dtype=float, device=device)
+    dst_wp = wp.array(points_dst, dtype=float, device=device)
+    d = wp.zeros((B, n_src), dtype=float, device=device)
+    wp.launch(min_sqdist_kernel, dim=[B, n_src], inputs=[src_wp, dst_wp, d, n_dst], device=device)
+    out = np.asarray(d.numpy().mean(axis=1), dtype=np.float64)
+    assert out.shape == (B,), f"Expected ({B},) distances, got {out.shape}"
+    return out
+
+
+def one_sided_squared_nn_distance(
+    points_src: np.ndarray,
+    points_dst: np.ndarray,
+    *,
+    device: str = "cuda",
+) -> np.ndarray | float:
+    """One-sided squared nearest-neighbor distance: ``mean_i min_j ||src_i - dst_j||^2``.
+
+    Extra points in ``points_dst`` do not increase the cost. Shapes match ``chamfer_distance``.
+    """
+    batched_src, batched_dst, unbatched = _as_batched_pointclouds(points_src, points_dst)
+    dist = _mean_min_squared_nn(batched_src, batched_dst, device=device)
+    if unbatched:
+        return float(dist[0])
+    return dist
+
+
+def chamfer_distance(
+    points_a: np.ndarray,
+    points_b: np.ndarray,
+    *,
+    device: str = "cuda",
+) -> np.ndarray | float:
+    """Symmetric squared Chamfer distance, brute-force nearest neighbors via Warp.
+
+    ``mean_i min_j ||a_i - b_j||^2 + mean_j min_i ||b_j - a_i||^2``.
+
+    Shapes:
+      - `(N, 3)` vs `(M, 3)` → Python `float`
+      - `(B, N, 3)` vs `(B, M, 3)` → `(B,)` float64
+      - `(B, N, 3)` vs `(M, 3)` or `(N, 3)` vs `(B, M, 3)` → broadcast the unbatched side
+    """
+    batched_a, batched_b, unbatched = _as_batched_pointclouds(points_a, points_b)
+    dist = _mean_min_squared_nn(batched_a, batched_b, device=device) + _mean_min_squared_nn(
+        batched_b, batched_a, device=device
+    )
+    if unbatched:
+        return float(dist[0])
+    return dist

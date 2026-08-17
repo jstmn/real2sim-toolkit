@@ -12,5 +12,12 @@ wheels/
 private
 src/r2st/models/sam_vit_h_4b8939.pth
 src/r2st/models/groundingdino_swint_ogc.pth
+src/r2st/Cutie/weights/
 data/
 data/*/
+src/r2st/FoundationPose-plus-plus/
+temp.sh
+src/r2st/FoundationPose/weights/*
+
+*.code-workspace
+thirdparty/*/
