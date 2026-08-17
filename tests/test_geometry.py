@@ -2,11 +2,11 @@ import numpy as np
 import pytest
 
 from r2st.geometry import (
-    reproject_depth_to_color_frame,
     camera_extrinsic_to_maniskill_pose,
     depth_mm_to_meters,
     project_axes_to_image,
     realsense_to_maniskill_basis_matrix,
+    reproject_depth_to_color_frame,
     scale_intrinsics,
     transform_pose_cam_to_world,
 )
@@ -154,10 +154,12 @@ class TestProjectAxes:
             project_axes_to_image(np.eye(4), K, axis_len=-0.1)
 
 
+def _numpy_one_sided(points_src: np.ndarray, points_dst: np.ndarray) -> float:
+    return float(((points_src[:, None, :] - points_dst[None, :, :]) ** 2).sum(axis=-1).min(axis=-1).mean())
+
+
 def _numpy_chamfer(points_a: np.ndarray, points_b: np.ndarray) -> float:
-    d_ab = ((points_a[:, None, :] - points_b[None, :, :]) ** 2).sum(axis=-1).min(axis=-1).mean()
-    d_ba = ((points_b[:, None, :] - points_a[None, :, :]) ** 2).sum(axis=-1).min(axis=-1).mean()
-    return float(d_ab + d_ba)
+    return _numpy_one_sided(points_a, points_b) + _numpy_one_sided(points_b, points_a)
 
 
 class TestChamferDistance:
@@ -211,3 +213,49 @@ class TestChamferDistance:
             chamfer_distance(np.zeros((5, 2)), np.zeros((5, 3)), device="cpu")
         with pytest.raises(AssertionError):
             chamfer_distance(np.zeros((2, 5, 3)), np.zeros((3, 5, 3)), device="cpu")
+
+
+class TestOneSidedSquaredNnDistance:
+    def test_identical_clouds_zero(self):
+        from r2st.geometry import one_sided_squared_nn_distance
+
+        rng = np.random.default_rng(0)
+        pts = rng.normal(size=(32, 3)).astype(np.float32)
+        d = one_sided_squared_nn_distance(pts, pts.copy(), device="cpu")
+        assert isinstance(d, float)
+        assert d == pytest.approx(0.0, abs=1e-6)
+
+    def test_src_subset_of_dst_is_zero(self):
+        from r2st.geometry import one_sided_squared_nn_distance
+
+        dst = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [2.0, 3.0, 4.0]], dtype=np.float32)
+        src = dst[:2].copy()
+        d = one_sided_squared_nn_distance(src, dst, device="cpu")
+        assert d == pytest.approx(0.0, abs=1e-6)
+
+    def test_extra_dst_points_do_not_increase_cost(self):
+        from r2st.geometry import one_sided_squared_nn_distance
+
+        src = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
+        dst = src.copy()
+        dst_extra = np.concatenate([dst, np.array([[100.0, 0.0, 0.0]], dtype=np.float32)], axis=0)
+        d = one_sided_squared_nn_distance(src, dst, device="cpu")
+        d_extra = one_sided_squared_nn_distance(src, dst_extra, device="cpu")
+        assert d_extra == pytest.approx(d, abs=1e-6)
+
+    def test_translated_cloud(self):
+        from r2st.geometry import one_sided_squared_nn_distance
+
+        pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32)
+        shifted = pts + np.array([0.5, 0.0, 0.0], dtype=np.float32)
+        d = one_sided_squared_nn_distance(pts, shifted, device="cpu")
+        assert d == pytest.approx(0.5**2, abs=1e-5)
+
+    def test_matches_numpy_reference(self):
+        from r2st.geometry import one_sided_squared_nn_distance
+
+        rng = np.random.default_rng(1)
+        src = rng.normal(size=(17, 3)).astype(np.float32)
+        dst = rng.normal(size=(23, 3)).astype(np.float32) + 0.4
+        d = one_sided_squared_nn_distance(src, dst, device="cpu")
+        assert d == pytest.approx(_numpy_one_sided(src, dst), rel=1e-5, abs=1e-5)

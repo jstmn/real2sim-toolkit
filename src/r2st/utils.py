@@ -38,7 +38,7 @@ def farthest_point_sample_naive(
     """Greedy farthest-point sampling. Returns indices into the N dimension.
 
     Naive O(`n_samples` * N) Python loop — not an optimized implementation.
-    `from pyg_lib.ops import fps` is substantially faster for large Euclidean point clouds.
+    Use `farthest_point_sample_pyg_lib` for large Euclidean point clouds.
 
     `points` is `(N, C)` or batched `(B, N, C)` (any C, e.g. 3D points or 7-DoF joints).
     Unbatched input returns `(n_samples,)` int64; batched returns `(B, n_samples)`.
@@ -76,12 +76,59 @@ def farthest_point_sample_naive(
     return centroids
 
 
+def farthest_point_sample_pyg_lib(
+    points: np.ndarray,
+    n_samples: int,
+    *,
+    device: str,
+    random_start: bool = False,
+) -> np.ndarray:
+    """Euclidean FPS via `pyg_lib.ops.fps`. Returns indices into the N dimension.
+
+    `points` is `(N, C)` or batched `(B, N, C)`. Unbatched returns `(n_samples,)` int64;
+    batched returns `(B, n_samples)`. `device` is a torch device string, e.g. `"cuda"` or `"cpu"`.
+    """
+    import torch
+    from pyg_lib.ops import fps
+
+    assert isinstance(points, np.ndarray), f"points must be ndarray, got {type(points)}"
+    assert points.ndim in (2, 3), f"points must be (N, C) or (B, N, C), got {points.shape}"
+    unbatched = points.ndim == 2
+    if unbatched:
+        points = points[None, ...]
+    B, N, C = points.shape
+    assert C >= 1, f"points must have at least 1 feature dim, got {points.shape}"
+    assert N >= 1, f"points must have at least 1 sample, got {points.shape}"
+    assert isinstance(n_samples, int), f"n_samples must be int, got {type(n_samples)}"
+    assert 1 <= n_samples <= N, f"n_samples must be in [1, {N}], got {n_samples}"
+    assert isinstance(device, str) and len(device) > 0, f"device must be a non-empty str, got {device!r}"
+    assert isinstance(random_start, bool), f"random_start must be bool, got {type(random_start)}"
+
+    src = torch.from_numpy(np.ascontiguousarray(points, dtype=np.float32)).reshape(B * N, C).to(device)
+    ptr = torch.arange(0, (B + 1) * N, N, device=src.device, dtype=torch.long)
+    ratio = n_samples / N
+    idx = fps(src, ptr, ratio=ratio, random_start=random_start)
+    expected = B * n_samples
+    assert idx.numel() == expected, (
+        f"pyg_lib.ops.fps returned {idx.numel()} indices, expected {expected} "
+        f"(B={B}, N={N}, n_samples={n_samples}, ratio={ratio})"
+    )
+    local = (idx.view(B, n_samples) % N).detach().cpu().numpy().astype(np.int64)
+    if unbatched:
+        return local[0]
+    return local
+
+
 MERGED_CAMERA_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
 
 
 def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
     """Assert `f` matches the merged sensor-data layout from `examples/merge_camera_streams.py`:
-    `obs/sensor_data/{camera}/[rgb, depth, timestamp_ms, rgb_timestamp_ms]`."""
+    `obs/sensor_data/{camera}/[rgb, depth, timestamp_ms, rgb_timestamp_ms]`.
+
+    `depth` is uint16 millimeters already aligned to `rgb` (same H×W, same rays).
+    Unproject it with color-camera K. Do not treat it as a native depth-camera image.
+    """
     assert (
         "obs/sensor_data" in f
     ), f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {list(f.keys())}"
@@ -96,6 +143,7 @@ def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str)
     assert rgb.ndim == 4 and rgb.shape[3] == 3, f"{h5_path}:{group_path}/rgb must be NxHxWx3, got {rgb.shape}"
     assert rgb.dtype == np.uint8, f"{h5_path}:{group_path}/rgb must be uint8, got {rgb.dtype}"
     assert depth.ndim == 3, f"{h5_path}:{group_path}/depth must be NxHxW, got {depth.shape}"
+    assert depth.dtype == np.uint16, f"{h5_path}:{group_path}/depth must be uint16 millimeters, got {depth.dtype}"
     assert timestamp_ms.ndim == 1, f"{h5_path}:{group_path}/timestamp_ms must be 1D, got {timestamp_ms.shape}"
     assert (
         rgb_timestamp_ms.ndim == 1
@@ -156,23 +204,46 @@ class ImageUtils:
         masked = image_bgr.copy()
         masked[np.logical_not(mask)] = 0
         masked_cropped = ImageUtils.crop_to_mask(masked, mask)
-        demo = image_bgr.copy().astype(np.float32)
-        demo[np.logical_not(mask)] *= 0.25
-        demo = demo.astype(np.uint8)
-
         masked_path = asset_dir / f"{prefix}__masked.png"
         masked_cropped_path = asset_dir / f"{prefix}__masked_cropped.png"
-        demo_path = asset_dir / f"{prefix}__demo.png"
         assert cv2.imwrite(str(masked_path), masked), f"Failed to write {masked_path}"
         assert cv2.imwrite(str(masked_cropped_path), masked_cropped), f"Failed to write {masked_cropped_path}"
-        assert cv2.imwrite(str(demo_path), demo), f"Failed to write {demo_path}"
         print(f"[info] Saved masked image to {masked_path}")
         print(
             f"[info] Saved masked cropped image to {masked_cropped_path} "
             f"({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
         )
-        print(f"[info] Saved demo overlay to {demo_path}")
+        ImageUtils.save_demo_overlay(image_bgr, mask, asset_dir / f"{prefix}__demo.png")
         return masked_cropped_path
+
+    @staticmethod
+    def demo_overlay(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Dim pixels outside `mask` to 0.25. `image` is HxWx3 uint8 (RGB or BGR)."""
+        assert image.ndim == 3 and image.shape[2] == 3, f"Image must be HxWx3, got {image.shape}"
+        assert image.dtype == np.uint8, f"Image dtype must be uint8, got {image.dtype}"
+        assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
+        assert mask.shape == image.shape[:2], f"Mask shape {mask.shape} != image {image.shape[:2]}"
+        assert mask.any(), "Cannot build demo overlay for an empty mask"
+        demo = image.copy().astype(np.float32)
+        demo[np.logical_not(mask)] *= 0.25
+        return demo.astype(np.uint8)
+
+    @staticmethod
+    def save_demo_overlay(
+        image_bgr: np.ndarray,
+        mask: np.ndarray,
+        out_path: str | Path,
+    ) -> Path:
+        """Write a demo overlay PNG (non-mask pixels dimmed). Returns the PNG path."""
+        import cv2
+
+        out_path = Path(out_path)
+        assert out_path.name.endswith(".demo.png"), f"demo overlay path must end with .demo.png, got {out_path}"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        demo = ImageUtils.demo_overlay(image_bgr, mask)
+        assert cv2.imwrite(str(out_path), demo), f"Failed to write {out_path}"
+        print(f"[info] Saved demo overlay to {out_path}")
+        return out_path
 
     @staticmethod
     def get_sam_masks_ranked(

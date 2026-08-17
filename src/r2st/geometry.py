@@ -29,7 +29,12 @@ def reproject_depth_to_color_frame(
     t_dc: np.ndarray,
     invalid_fill: float = 0.0,
 ) -> np.ndarray:
-    """Unproject metric depth, apply depth-to-color extrinsics, and z-buffer into the color image."""
+    """Unproject *native* (unaligned) metric depth, apply depth-to-color extrinsics, z-buffer into the color image.
+
+    Do not use this on merged sensor-data h5 depth: that depth is already in the color
+    pixel grid. Warping it again with depth-camera K (wider FOV) vs color K leaves a
+    sparse, misaligned depth map.
+    """
     assert isinstance(depth_intrinsics, CameraIntrinsics), f"must be CameraIntrinsics, got {type(depth_intrinsics)}"
     assert isinstance(color_intrinsics, CameraIntrinsics), f"must be CameraIntrinsics, got {type(color_intrinsics)}"
     assert depth_image.ndim == 2, f"depth_image must be 2D, got {depth_image.ndim}D"
@@ -231,7 +236,7 @@ def _warp_chamfer_min_sqdist_kernel():
         py = src[b, i, 1]
         pz = src[b, i, 2]
         # Bare literals are Warp constants; wrap so min_d can update in the dynamic loop.
-        min_d = float(1.0e30)
+        min_d = 1.0e30
         for j in range(n_dst):
             dx = px - dst[b, j, 0]
             dy = py - dst[b, j, 1]
@@ -274,6 +279,48 @@ def _as_batched_pointclouds(points_a: np.ndarray, points_b: np.ndarray) -> tuple
     )
 
 
+def _mean_min_squared_nn(
+    points_src: np.ndarray,
+    points_dst: np.ndarray,
+    *,
+    device: str,
+) -> np.ndarray:
+    """Batched `(B, N, 3)` vs `(B, M, 3)` → `(B,)` mean over src of min squared distance to dst."""
+    assert device in ("cpu", "cuda"), f"device must be 'cpu' or 'cuda', got {device!r}"
+    assert points_src.ndim == 3 and points_src.shape[-1] == 3, f"points_src must be (B, N, 3), got {points_src.shape}"
+    assert points_dst.ndim == 3 and points_dst.shape[-1] == 3, f"points_dst must be (B, M, 3), got {points_dst.shape}"
+    assert (
+        points_src.shape[0] == points_dst.shape[0]
+    ), f"Batch sizes must match, got {points_src.shape[0]} vs {points_dst.shape[0]}"
+    wp, min_sqdist_kernel = _warp_chamfer_min_sqdist_kernel()
+    B, n_src, _ = points_src.shape
+    n_dst = int(points_dst.shape[1])
+    src_wp = wp.array(points_src, dtype=float, device=device)
+    dst_wp = wp.array(points_dst, dtype=float, device=device)
+    d = wp.zeros((B, n_src), dtype=float, device=device)
+    wp.launch(min_sqdist_kernel, dim=[B, n_src], inputs=[src_wp, dst_wp, d, n_dst], device=device)
+    out = np.asarray(d.numpy().mean(axis=1), dtype=np.float64)
+    assert out.shape == (B,), f"Expected ({B},) distances, got {out.shape}"
+    return out
+
+
+def one_sided_squared_nn_distance(
+    points_src: np.ndarray,
+    points_dst: np.ndarray,
+    *,
+    device: str = "cuda",
+) -> np.ndarray | float:
+    """One-sided squared nearest-neighbor distance: ``mean_i min_j ||src_i - dst_j||^2``.
+
+    Extra points in ``points_dst`` do not increase the cost. Shapes match ``chamfer_distance``.
+    """
+    batched_src, batched_dst, unbatched = _as_batched_pointclouds(points_src, points_dst)
+    dist = _mean_min_squared_nn(batched_src, batched_dst, device=device)
+    if unbatched:
+        return float(dist[0])
+    return dist
+
+
 def chamfer_distance(
     points_a: np.ndarray,
     points_b: np.ndarray,
@@ -289,21 +336,10 @@ def chamfer_distance(
       - `(B, N, 3)` vs `(B, M, 3)` → `(B,)` float64
       - `(B, N, 3)` vs `(M, 3)` or `(N, 3)` vs `(B, M, 3)` → broadcast the unbatched side
     """
-    assert device in ("cpu", "cuda"), f"device must be 'cpu' or 'cuda', got {device!r}"
     batched_a, batched_b, unbatched = _as_batched_pointclouds(points_a, points_b)
-    wp, min_sqdist_kernel = _warp_chamfer_min_sqdist_kernel()
-
-    B, N, _ = batched_a.shape
-    _, M, _ = batched_b.shape
-    a_wp = wp.array(batched_a, dtype=float, device=device)
-    b_wp = wp.array(batched_b, dtype=float, device=device)
-    d_ab = wp.zeros((B, N), dtype=float, device=device)
-    d_ba = wp.zeros((B, M), dtype=float, device=device)
-    wp.launch(min_sqdist_kernel, dim=[B, N], inputs=[a_wp, b_wp, d_ab, M], device=device)
-    wp.launch(min_sqdist_kernel, dim=[B, M], inputs=[b_wp, a_wp, d_ba, N], device=device)
-    dist = d_ab.numpy().mean(axis=1) + d_ba.numpy().mean(axis=1)
-    dist = np.asarray(dist, dtype=np.float64)
-    assert dist.shape == (B,), f"Expected ({B},) chamfer, got {dist.shape}"
+    dist = _mean_min_squared_nn(batched_a, batched_b, device=device) + _mean_min_squared_nn(
+        batched_b, batched_a, device=device
+    )
     if unbatched:
         return float(dist[0])
     return dist

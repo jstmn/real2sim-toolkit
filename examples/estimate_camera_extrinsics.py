@@ -10,7 +10,8 @@ specified camera. There are two pointclouds that we care about: pcd_real and pcd
 pointcloud from the camera (found by projecting the depth points with the camera's intrinsic matrix). pcd_sim is a
 rendered pointcloud from ManiSkill. To get the rendering, a simulation is run. The robot is set to the measured joint
 angles. The camera is then moved to the specified camera pose, and lastly the pointcloud is rendered. The cost function
-is the chamfer distance between pcd_real and pcd_sim.
+is the one-sided squared nearest-neighbor distance from pcd_real to pcd_sim
+(sim is rendered with a wider FOV so it covers more of the robot than the real camera).
 
 Notes:
 1. A preproccessing step is performed on the measured pointclouds to remove points that aren't part of the robot. To
@@ -31,10 +32,10 @@ inputs:
 - rgbds: array of RGBD images
 - all_joint_angles: array of joint angles from the demonstration. Same length as rgbds; frame i of qpos is frame i of RGB-D.
 - N: the number of timesteps to sample from the demonstration for the cost function
-- rgb_to_pcd(rgbd): converts the RGBD image to a robot only pointcloud
+- rgb_to_pcd(rgbd): unprojects color-aligned depth with color K, then keeps SAM robot pixels
 - S: number of poses in the CMA-ES population
 - render_sim_pointcloud(pose, joint_angle): renders the pointcloud from the simulation at the given pose and joint angle
-- compute_chamfer_distance(pcd_real, pcd_sim): computes the chamfer distance between the two pointclouds
+- compute_chamfer_distance(pcd_real, pcd_sim): one-sided mean min squared distance from pcd_real to pcd_sim
 
 # Find the N joint angles that are the furthest apart from each other
 timesteps, joint_angles = furthest_point_sample(all_joint_angles, N, distance='circular')
@@ -62,6 +63,7 @@ from __future__ import annotations
 import dataclasses
 import pathlib
 import time
+from typing import Literal
 
 import cv2
 import h5py
@@ -83,17 +85,17 @@ from r2st.constants import (
 )
 from r2st.core import GroundedSAMPredictor
 from r2st.geometry import (
-    reproject_depth_to_color_frame,
     camera_extrinsic_to_maniskill_pose,
-    chamfer_distance,
     depth_mm_to_meters,
     masked_depth_to_points,
-    scale_intrinsics,
+    one_sided_squared_nn_distance,
+    reproject_depth_to_color_frame,
 )
 from r2st.utils import (
     ImageUtils,
     MeshUtils,
     farthest_point_sample_naive,
+    farthest_point_sample_pyg_lib,
     validate_merged_camera_group,
 )
 
@@ -102,14 +104,19 @@ from r2st.utils import (
 uv run python examples/estimate_camera_extrinsics.py \
     --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --robot-id xarm7 --camera cam_1 --camera-model-id d435 \
+    --depth-intrinsics-source rgb \
     --output-path data/demonstrations/0802/extrinsics.yaml \
     --visualize --visualize-robot-masks
 """
 
 _EMPTY_PCD_COST = 1.0e3
 _SIM_CAMERA_NAME = "extrinsics_cam"
-_INIT_EYE = np.array([0.80, 0.00, 0.50], dtype=np.float64)
-_INIT_TARGET = np.array([0.00, 0.00, 0.20], dtype=np.float64)
+_SEED_RADIUS_MIN_M = 1.0
+_SEED_RADIUS_MAX_M = 1.5
+_SEED_LOOKAT_TARGET = np.array([0.0, 0.0, 0.5], dtype=np.float64)
+_SEED_ORIGIN = np.zeros(3, dtype=np.float64)
+_SEED_MIN_LOOK_DIST_M = 0.05
+_SEED_UP = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 _BEST_AXES_LENGTH = 0.08
 _BEST_AXES_RADIUS = 0.004
 _BEST_ORIGIN_RADIUS = 0.008
@@ -132,14 +139,23 @@ class Args:
     camera_model_id: str
     """Camera model id for calibration lookup, e.g. 'd435'. See the README camera-model table."""
 
+    depth_intrinsics_source: Literal["rgb", "depth"]
+    """Which camera-model K the h5 depth channel uses. `rgb`: color-aligned depth, unproject with color K. `depth`: native depth image, reproject into the color frame first."""
+
     output_path: pathlib.Path
     """YAML path to write the estimated 4x4 camera extrinsics (robot-base T camera)."""
 
     n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
 
-    n_pcd_samples: int = 1024
-    """Number of FPS points kept from each (real or sim) robot cloud before chamfer."""
+    n_pcd_samples: int = 512
+    """Number of FPS points kept from each real robot cloud before nearest-neighbor matching."""
+
+    n_random_downsample_initial: int = 1024
+    """Maximum sim target points; also the random pre-FPS cap for each real cloud."""
+
+    sim_fov_scale: float = 4.0
+    """Widen the sim camera FOV by this factor (divide fx/fy, keep principal point). Must be >= 1."""
 
     cma_sigma_pos: float = 0.10
     """CMA-ES initial std for camera translation (meters)."""
@@ -149,6 +165,18 @@ class Args:
 
     cma_maxiter: int = 100
     """Maximum CMA-ES generations."""
+
+    n_seed_azimuth: int = 25
+    """Number of azimuth steps (about world +Z) for seed camera positions on each sphere."""
+
+    n_seed_polar: int = 25
+    """Number of polar-angle steps (from world +Z) for seed camera positions on each sphere."""
+
+    n_seed_radii: int = 3
+    """Number of sphere radii, linspace from 0.5 m to 1.5 m inclusive."""
+
+    n_seed_rolls: int = 10
+    """Number of evenly spaced rolls about the look-at axis (toward (0, 0, 0.5)) per seed position."""
 
     cma_popsize: int = 10
     """CMA-ES population size. If unset, the cma library default is used."""
@@ -164,6 +192,9 @@ class Args:
 
     cache_robot_masks: bool = True
     """If set, load/save the unioned robot mask as <h5_stem>/robot-mask__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
+
+    mask_erode_px: int = 7
+    """Erode the robot mask with an elliptical kernel of this size (pixels) before unprojecting. 0 skips erosion."""
 
     visualize: bool = False
     """If set, start a viser server with robot-base pointclouds, camera frustum, and a cost plot."""
@@ -203,16 +234,29 @@ def _union_top_sam_masks(
     n = min(int(kmax), masks.shape[0])
     keep = scores[:n] > score_threshold
     n_keep = int(keep.sum())
-    assert n_keep >= 1, (
-        f"No SAM masks in top {n} with score > {score_threshold} "
-        f"(scores={scores[:n].tolist()})"
-    )
+    assert n_keep >= 1, f"No SAM masks in top {n} with score > {score_threshold} " f"(scores={scores[:n].tolist()})"
     union = np.any(masks[:n][keep], axis=0)
     print(
         f"[info] Unioned {n_keep}/{n} masks with score > {score_threshold} "
         f"(kept ranks={np.flatnonzero(keep).tolist()}, scores={scores[:n][keep].tolist()})"
     )
     return union
+
+
+def _erode_mask(mask: np.ndarray, kernel_px: int) -> np.ndarray:
+    """Erode a bool mask with an elliptical kernel of size `kernel_px`. `kernel_px=0` is a no-op."""
+    assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
+    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
+    assert mask.any(), "Cannot erode an empty mask"
+    assert kernel_px == 0 or (
+        kernel_px >= 1 and kernel_px % 2 == 1
+    ), f"mask_erode_px must be 0 or a positive odd int, got {kernel_px}"
+    if kernel_px == 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
+    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    assert eroded.any(), f"Mask empty after erode with kernel_px={kernel_px} (had {int(mask.sum())} pixels)"
+    return eroded
 
 
 def _dump_top_sam_masks(
@@ -292,6 +336,72 @@ def _look_at_opencv(eye: np.ndarray, target: np.ndarray, up: np.ndarray | None =
     return T
 
 
+def _seed_eyes_on_sphere(n_azimuth: int, n_polar: int, n_radii: int) -> np.ndarray:
+    """Fixed upper-hemisphere grid with camera-position z > 0 about the robot base."""
+    assert n_azimuth >= 1, f"n_azimuth must be >= 1, got {n_azimuth}"
+    assert n_polar >= 1, f"n_polar must be >= 1, got {n_polar}"
+    assert n_radii >= 1, f"n_radii must be >= 1, got {n_radii}"
+    radii = np.linspace(_SEED_RADIUS_MIN_M, _SEED_RADIUS_MAX_M, n_radii, dtype=np.float64)
+    azimuths = (np.arange(n_azimuth, dtype=np.float64) / n_azimuth) * (2.0 * np.pi)
+    polars = ((np.arange(n_polar, dtype=np.float64) + 0.5) / n_polar) * np.pi
+    polars = polars[polars < np.pi / 2.0]
+    assert polars.size >= 1, f"n_polar={n_polar} produces no seed positions with camera z > 0; increase n_polar"
+    eyes = np.empty((n_radii * len(polars) * n_azimuth, 3), dtype=np.float64)
+    k = 0
+    for radius_m in radii:
+        for theta in polars:
+            st = float(np.sin(theta))
+            ct = float(np.cos(theta))
+            for phi in azimuths:
+                eyes[k] = _SEED_ORIGIN + float(radius_m) * np.array(
+                    [st * np.cos(phi), st * np.sin(phi), ct], dtype=np.float64
+                )
+                k += 1
+    assert k == eyes.shape[0]
+    assert np.all(eyes[:, 2] > 0.0), f"All seed camera positions must have z > 0, got min z={eyes[:, 2].min()}"
+    look = _SEED_LOOKAT_TARGET[None, :] - eyes
+    look_n = np.linalg.norm(look, axis=1)
+    assert np.all(
+        look_n >= _SEED_MIN_LOOK_DIST_M
+    ), f"Seed sphere grid has look-at distance < {_SEED_MIN_LOOK_DIST_M} m: min={float(look_n.min())}"
+    look_u = look / look_n[:, None]
+    up_n = _SEED_UP / np.linalg.norm(_SEED_UP)
+    parallel = np.abs(look_u @ up_n) > (1.0 - 1e-6)
+    assert not np.any(
+        parallel
+    ), f"Seed sphere grid has look-at parallel to up at indices {np.flatnonzero(parallel).tolist()}"
+    return eyes
+
+
+def _look_at_with_roll(eye: np.ndarray, target: np.ndarray, roll_rad: float, up: np.ndarray) -> np.ndarray:
+    """Look-at pose, then roll about the camera optical axis (+Z, the look-at direction)."""
+    T = _look_at_opencv(eye, target, up)
+    Rz = axangle2mat(np.array([0.0, 0.0, 1.0], dtype=np.float64), float(roll_rad))
+    T_roll = T.copy()
+    T_roll[:3, :3] = T[:3, :3] @ Rz
+    return T_roll
+
+
+def _generate_seed_poses(
+    n_azimuth: int,
+    n_polar: int,
+    n_rolls: int,
+    n_radii: int,
+) -> list[np.ndarray]:
+    """Camera poses above z=0 on concentric spheres, looking toward (0, 0, 0.5), with optical-axis rolls."""
+    assert n_azimuth >= 1, f"n_azimuth must be >= 1, got {n_azimuth}"
+    assert n_polar >= 1, f"n_polar must be >= 1, got {n_polar}"
+    assert n_rolls >= 1, f"n_rolls must be >= 1, got {n_rolls}"
+    assert n_radii >= 1, f"n_radii must be >= 1, got {n_radii}"
+    eyes = _seed_eyes_on_sphere(n_azimuth, n_polar, n_radii)
+    rolls = np.linspace(0.0, 2.0 * np.pi, n_rolls, endpoint=False)
+    poses = [_look_at_with_roll(eye, _SEED_LOOKAT_TARGET, float(roll), _SEED_UP) for eye in eyes for roll in rolls]
+    n_expected = len(eyes) * n_rolls
+    assert len(poses) == n_expected, f"expected {n_expected} seeds, got {len(poses)}"
+    assert all(T[2, 3] > 0.0 for T in poses), "All seed camera poses must have translation z > 0"
+    return poses
+
+
 def _T_to_vec(T: np.ndarray) -> np.ndarray:
     """SE(3) 4x4 → 6D [tx, ty, tz, rx, ry, rz] with rotation-vector orientation."""
     assert T.shape == (4, 4), f"T must be 4x4, got {T.shape}"
@@ -344,20 +454,70 @@ def _transform_points(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return (pts.astype(np.float64) @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
 
 
-def _subsample_pcd(points: np.ndarray, n_samples: int) -> np.ndarray:
+def _subsample_pcd(
+    points: np.ndarray,
+    n_samples: int,
+    n_random_downsample_initial: int,
+    device: str,
+    rng: np.random.Generator,
+    profile: dict[str, float] | None = None,
+) -> np.ndarray:
+    """Random subsample to `n_random_downsample_initial`, then FPS to `n_samples`."""
     assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
-    if points.shape[0] <= n_samples:
+    assert n_samples >= 1, f"n_samples must be >= 1, got {n_samples}"
+    assert (
+        n_random_downsample_initial >= n_samples
+    ), f"n_random_downsample_initial ({n_random_downsample_initial}) must be >= n_samples ({n_samples})"
+    n = int(points.shape[0])
+    if n <= n_samples:
         return points.astype(np.float32, copy=False)
-    idx = farthest_point_sample_naive(points.astype(np.float64), n_samples, distance="euclidean")
+    if n > n_random_downsample_initial:
+        idx_rand = rng.choice(n, size=n_random_downsample_initial, replace=False)
+        points = points[idx_rand]
+        n = int(points.shape[0])
+    if profile is not None:
+        profile["n_calls"] = profile.get("n_calls", 0.0) + 1.0
+        profile["n_points_sum"] = profile.get("n_points_sum", 0.0) + float(n)
+        profile["n_samples"] = float(n_samples)
+    idx = farthest_point_sample_pyg_lib(points, n_samples, device=device)
+    return points[idx].astype(np.float32, copy=False)
+
+
+def _random_downsample_pcd(
+    points: np.ndarray,
+    max_points: int,
+    rng: np.random.Generator,
+    profile: dict[str, float] | None = None,
+) -> np.ndarray:
+    """Randomly retain at most `max_points` from a nearest-neighbor target cloud."""
+    assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
+    assert max_points >= 1, f"max_points must be >= 1, got {max_points}"
+    n = int(points.shape[0])
+    if profile is not None:
+        profile["n_calls"] = profile.get("n_calls", 0.0) + 1.0
+        profile["n_points_sum"] = profile.get("n_points_sum", 0.0) + float(n)
+        profile["n_kept_sum"] = profile.get("n_kept_sum", 0.0) + float(min(n, max_points))
+    if n <= max_points:
+        return points.astype(np.float32, copy=False)
+    idx = rng.choice(n, size=max_points, replace=False)
     return points[idx].astype(np.float32, copy=False)
 
 
 class SimRobotRenderer:
     """Sapien scene with the Jrl2 URDF. Camera pose uses ManiSkill (Sapien) convention."""
 
-    def __init__(self, urdf_path: pathlib.Path, K: np.ndarray, height: int, width: int, joint_names: list[str]) -> None:
+    def __init__(
+        self,
+        urdf_path: pathlib.Path,
+        K: np.ndarray,
+        height: int,
+        width: int,
+        joint_names: list[str],
+        sim_fov_scale: float,
+    ) -> None:
         assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
         assert height > 0 and width > 0
+        assert sim_fov_scale >= 1.0, f"sim_fov_scale must be >= 1, got {sim_fov_scale}"
         sapien_urdf = _urdf_for_sapien(urdf_path)
         assert sapien_urdf.is_file(), f"Sapien URDF not found: {sapien_urdf}"
 
@@ -378,14 +538,19 @@ class SimRobotRenderer:
         self._dof = int(self._robot.dof)
         assert self._dof == len(joint_names), f"dof {self._dof} != n joints {len(joint_names)}"
 
-        fx, fy = float(K[0, 0]), float(K[1, 1])
+        fx, fy = float(K[0, 0]) / sim_fov_scale, float(K[1, 1]) / sim_fov_scale
         cx, cy = float(K[0, 2]), float(K[1, 2])
+        assert fx > 0 and fy > 0, f"scaled fx/fy must be > 0, got fx={fx} fy={fy}"
         fovy = 2.0 * np.arctan2(height * 0.5, fy)
         self._cam = self._scene.add_camera(
             _SIM_CAMERA_NAME, width, height, fovy=float(fovy), near=MIN_DEPTH_M, far=MAX_DEPTH_M
         )
         self._cam.set_focal_lengths(fx, fy)
         self._cam.set_principal_point(cx, cy)
+        print(
+            f"[info] Sim camera FOV scale={sim_fov_scale:g}: fx {K[0, 0]:.1f}->{fx:.1f} "
+            f"fy {K[1, 1]:.1f}->{fy:.1f} fovy={np.degrees(fovy):.1f} deg"
+        )
 
     def render_pointcloud(self, T_world_cam: np.ndarray, qpos: np.ndarray) -> np.ndarray:
         """Robot-only cloud in OpenCV camera frame, `(M, 3)` float32. Empty if nothing is visible."""
@@ -426,14 +591,14 @@ class ExtrinsicsVisualizer:
         fps_idx: np.ndarray,
     ) -> None:
         import viser
-        import viser.uplot as uplot
+        from viser import uplot
 
         assert len(pcd_reals) >= 1
         assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
         assert height > 0 and width > 0
-        assert rgb_frames.ndim == 4 and rgb_frames.shape[0] == len(pcd_reals), (
-            f"rgb_frames must be ({len(pcd_reals)}, H, W, 3), got {rgb_frames.shape}"
-        )
+        assert rgb_frames.ndim == 4 and rgb_frames.shape[0] == len(
+            pcd_reals
+        ), f"rgb_frames must be ({len(pcd_reals)}, H, W, 3), got {rgb_frames.shape}"
         assert cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {cma_maxiter}"
         fps_idx = np.asarray(fps_idx, dtype=np.int64).reshape(-1)
         assert fps_idx.shape == (len(pcd_reals),), f"fps_idx {fps_idx.shape} != n clouds {len(pcd_reals)}"
@@ -443,7 +608,7 @@ class ExtrinsicsVisualizer:
         self._pcd_reals = pcd_reals
         self._rgb_frames = rgb_frames
         self._fps_idx = fps_idx
-        self._T = _look_at_opencv(_INIT_EYE, _INIT_TARGET)
+        self._T = _look_at_opencv(np.array([0.80, 0.00, 0.50], dtype=np.float64), _SEED_LOOKAT_TARGET, _SEED_UP)
         self._maxiter = cma_maxiter
         self._xs = np.arange(1, cma_maxiter + 1, dtype=np.float64)
         self._ys_best = np.full(cma_maxiter, np.nan, dtype=np.float64)
@@ -522,6 +687,23 @@ class ExtrinsicsVisualizer:
             self._apply()
 
         empty = np.array([], dtype=np.float64)
+        self._seed_t: list[float] = []
+        self._seed_best: list[float] = []
+        self._seed_plot = self._server.gui.add_uplot(
+            data=(empty, empty),
+            series=(
+                uplot.Series(show=False),
+                uplot.Series(label="best found", stroke="#e67e22", width=2),
+            ),
+            title="Seed search: best vs time",
+            scales={"x": {"time": False}},
+            axes=(
+                uplot.Axis(label="time (s)"),
+                uplot.Axis(label="cost"),
+            ),
+            aspect=1.8,
+            height=220,
+        )
         self._cost_plot = self._server.gui.add_uplot(
             data=(empty, empty, empty),
             series=(
@@ -560,7 +742,17 @@ class ExtrinsicsVisualizer:
         if self._n_recorded > 0 and self._iteration != self._n_recorded:
             return
         self._live_pop_Ts = [T.copy() for T in pop_Ts]
-        self._set_pop_axes(self._live_pop_Ts, hide_extra=False)
+        self._set_pop_axes(self._live_pop_Ts, hide_extra=True)
+
+    def record_seed_best(self, elapsed_s: float, best_cost: float) -> None:
+        """Append one seed-search sample: wall time (s) vs best chamfer so far."""
+        assert elapsed_s >= 0.0, f"elapsed_s must be >= 0, got {elapsed_s}"
+        assert np.isfinite(best_cost), f"best_cost must be finite, got {best_cost}"
+        self._seed_t.append(float(elapsed_s))
+        self._seed_best.append(float(best_cost))
+        t = np.asarray(self._seed_t, dtype=np.float64)
+        y = np.asarray(self._seed_best, dtype=np.float64)
+        self._seed_plot.data = (t, y)
 
     def record_generation(
         self,
@@ -682,13 +874,15 @@ def _pose_cost(
     renderer: SimRobotRenderer,
     joint_angles: np.ndarray,
     pcd_reals: list[np.ndarray],
-    n_pcd_samples: int,
+    n_random_downsample_initial: int,
     chamfer_device: str,
+    rng: np.random.Generator,
+    sample_profile: dict[str, float],
 ) -> tuple[float, list[np.ndarray], float, float, float]:
     total = 0.0
     pcd_sims: list[np.ndarray] = []
     t_render = 0.0
-    t_fps = 0.0
+    t_sample = 0.0
     t_chamfer = 0.0
     for t, q in enumerate(joint_angles):
         t0 = time.perf_counter()
@@ -699,21 +893,75 @@ def _pose_cost(
             total += _EMPTY_PCD_COST
             continue
         t0 = time.perf_counter()
-        pcd_sim = _subsample_pcd(pcd_sim, n_pcd_samples)
-        t_fps += time.perf_counter() - t0
+        pcd_sim = _random_downsample_pcd(pcd_sim, n_random_downsample_initial, rng, profile=sample_profile)
+        t_sample += time.perf_counter() - t0
         pcd_sims.append(pcd_sim)
         t0 = time.perf_counter()
-        total += float(chamfer_distance(pcd_reals[t], pcd_sim, device=chamfer_device))
+        total += float(one_sided_squared_nn_distance(pcd_reals[t], pcd_sim, device=chamfer_device))
         t_chamfer += time.perf_counter() - t0
-    return total, pcd_sims, t_render, t_fps, t_chamfer
+    return total, pcd_sims, t_render, t_sample, t_chamfer
+
+
+def _select_seed_pose(
+    seed_Ts: list[np.ndarray],
+    renderer: SimRobotRenderer,
+    joint_angles: np.ndarray,
+    pcd_reals: list[np.ndarray],
+    n_random_downsample_initial: int,
+    chamfer_device: str,
+    rng: np.random.Generator,
+    vis: ExtrinsicsVisualizer | None,
+) -> tuple[np.ndarray, float, list[np.ndarray]]:
+    """Evaluate look-at seed poses and return the lowest-chamfer (T, cost, pcd_sims)."""
+    assert len(seed_Ts) >= 1, "seed_Ts must be non-empty"
+    best_cost = np.inf
+    best_T: np.ndarray | None = None
+    best_pcd_sims: list[np.ndarray] | None = None
+    sample_profile: dict[str, float] = {}
+    xyz_Ts: list[np.ndarray] = []
+    t0_seed = time.perf_counter()
+    pbar = tqdm(seed_Ts, desc="seed poses")
+    for T in pbar:
+        cost, pcd_sims, _, _, _ = _pose_cost(
+            T,
+            renderer,
+            joint_angles,
+            pcd_reals,
+            n_random_downsample_initial,
+            chamfer_device,
+            rng,
+            sample_profile,
+        )
+        xyz = T[:3, 3]
+        new_xyz = len(xyz_Ts) == 0 or not np.allclose(xyz_Ts[-1][:3, 3], xyz)
+        if new_xyz:
+            xyz_Ts.append(T.copy())
+            if vis is not None:
+                vis.set_population(xyz_Ts)
+        if cost < best_cost:
+            best_cost = cost
+            best_T = T.copy()
+            best_pcd_sims = pcd_sims
+            if vis is not None:
+                vis.set_best(pcd_sims, best_cost, best_T)
+        if vis is not None and np.isfinite(best_cost):
+            vis.record_seed_best(time.perf_counter() - t0_seed, best_cost)
+        pbar.set_postfix(best=f"{best_cost:.6f}")
+    assert best_T is not None and best_pcd_sims is not None, "Seed search produced no pose"
+    return best_T, best_cost, best_pcd_sims
 
 
 def _optimize_extrinsics(
     renderer: SimRobotRenderer,
     joint_angles: np.ndarray,
     pcd_reals: list[np.ndarray],
-    n_pcd_samples: int,
+    n_random_downsample_initial: int,
     chamfer_device: str,
+    rng: np.random.Generator,
+    n_seed_azimuth: int,
+    n_seed_polar: int,
+    n_seed_rolls: int,
+    n_seed_radii: int,
     cma_sigma_pos: float,
     cma_sigma_rot: float,
     cma_maxiter: int,
@@ -723,9 +971,34 @@ def _optimize_extrinsics(
     """CMA-ES over 6D camera pose. Returns (best 4x4 T_world_cam, cost)."""
     import cma
 
+    assert n_seed_azimuth >= 1, f"n_seed_azimuth must be >= 1, got {n_seed_azimuth}"
+    assert n_seed_polar >= 1, f"n_seed_polar must be >= 1, got {n_seed_polar}"
+    assert n_seed_rolls >= 1, f"n_seed_rolls must be >= 1, got {n_seed_rolls}"
+    assert n_seed_radii >= 1, f"n_seed_radii must be >= 1, got {n_seed_radii}"
     assert cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {cma_sigma_pos}"
     assert cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {cma_sigma_rot}"
-    x0 = _T_to_vec(_look_at_opencv(_INIT_EYE, _INIT_TARGET))
+
+    seed_Ts = _generate_seed_poses(n_seed_azimuth, n_seed_polar, n_seed_rolls, n_seed_radii)
+    radii = np.linspace(_SEED_RADIUS_MIN_M, _SEED_RADIUS_MAX_M, n_seed_radii, dtype=np.float64)
+    print(
+        f"[info] Seed search: n_azimuth={n_seed_azimuth} n_polar={n_seed_polar} n_rolls={n_seed_rolls} "
+        f"n_radii={n_seed_radii} radii_m={radii.tolist()} n_total={len(seed_Ts)} "
+        f"lookat={_SEED_LOOKAT_TARGET.tolist()}"
+    )
+    t0_seed = time.perf_counter()
+    best_T, best_cost, best_pcd_sims = _select_seed_pose(
+        seed_Ts,
+        renderer,
+        joint_angles,
+        pcd_reals,
+        n_random_downsample_initial,
+        chamfer_device,
+        rng,
+        vis,
+    )
+    _log_elapsed(f"Seed search finished, best={best_cost:.6f}", t0_seed)
+
+    x0 = _T_to_vec(best_T)
     cma_stds = [cma_sigma_pos, cma_sigma_pos, cma_sigma_pos, cma_sigma_rot, cma_sigma_rot, cma_sigma_rot]
     cma_opts: dict = {"maxiter": cma_maxiter, "verbose": -1, "CMA_stds": cma_stds}
     if cma_popsize is not None:
@@ -736,9 +1009,6 @@ def _optimize_extrinsics(
         f"popsize={es.popsize} maxiter={cma_maxiter}"
     )
 
-    best_cost = np.inf
-    best_T: np.ndarray | None = None
-    best_pcd_sims: list[np.ndarray] | None = None
     generation = 0
     t0_opt = time.perf_counter()
     while not es.stop():
@@ -750,16 +1020,25 @@ def _optimize_extrinsics(
         costs = []
         pop_Ts: list[np.ndarray] = []
         t_render = 0.0
-        t_fps = 0.0
+        t_sample = 0.0
         t_chamfer = 0.0
         t_vis = 0.0
-        for x in tqdm(xs, desc=f"cma gen {generation}", leave=False):
+        sample_profile: dict[str, float] = {}
+        pbar = tqdm(xs, desc=f"cma gen {generation}", leave=False)
+        for x in pbar:
             T = _vec_to_T(x)
-            cost, pcd_sims, dt_render, dt_fps, dt_chamfer = _pose_cost(
-                T, renderer, joint_angles, pcd_reals, n_pcd_samples, chamfer_device
+            cost, pcd_sims, dt_render, dt_sample, dt_chamfer = _pose_cost(
+                T,
+                renderer,
+                joint_angles,
+                pcd_reals,
+                n_random_downsample_initial,
+                chamfer_device,
+                rng,
+                sample_profile,
             )
             t_render += dt_render
-            t_fps += dt_fps
+            t_sample += dt_sample
             t_chamfer += dt_chamfer
             costs.append(cost)
             pop_Ts.append(T.copy())
@@ -775,6 +1054,7 @@ def _optimize_extrinsics(
                     t0 = time.perf_counter()
                     vis.set_best(pcd_sims, best_cost, best_T)
                     t_vis += time.perf_counter() - t0
+            pbar.set_postfix(best=f"{best_cost:.6f}")
         t0 = time.perf_counter()
         es.tell(xs, costs)
         t_cma += time.perf_counter() - t0
@@ -785,13 +1065,21 @@ def _optimize_extrinsics(
             vis.record_generation(generation, best_cost, pop_min, best_T, best_pcd_sims, pop_Ts)
             t_vis += time.perf_counter() - t0
         dt_gen = time.perf_counter() - t0_gen
-        t_other = dt_gen - (t_render + t_fps + t_chamfer + t_vis + t_cma)
+        t_other = dt_gen - (t_render + t_sample + t_chamfer + t_vis + t_cma)
         print(
             f"[info] gen {generation} ({dt_gen:.1f}s): best={best_cost:.6f}  gen_min={pop_min:.6f}  "
             f"gen_mean={float(np.mean(costs)):.6f}"
         )
         print(f"[info]   time_render={t_render:.1f}s")
-        print(f"[info]   time_fps={t_fps:.1f}s")
+        print(f"[info]   time_random_sample={t_sample:.1f}s")
+        n_sample_calls = int(sample_profile.get("n_calls", 0.0))
+        if n_sample_calls > 0:
+            mean_n = sample_profile["n_points_sum"] / n_sample_calls
+            mean_kept = sample_profile["n_kept_sum"] / n_sample_calls
+            print(
+                f"[info]     random sim downsample  calls={n_sample_calls}  "
+                f"mean_N={mean_n:.0f}  mean_kept={mean_kept:.0f}"
+            )
         print(f"[info]   time_chamfer={t_chamfer:.1f}s")
         print(f"[info]   time_vis={t_vis:.1f}s")
         print(f"[info]   time_cma={t_cma:.1f}s")
@@ -811,18 +1099,34 @@ def main(args: Args) -> None:
     ), f"Unknown robot_id {args.robot_id!r}. Available: {sorted(NAME_TO_ROBOT)}"
     assert args.n_timesteps >= 1, f"n_timesteps must be >= 1, got {args.n_timesteps}"
     assert args.n_pcd_samples >= 1, f"n_pcd_samples must be >= 1, got {args.n_pcd_samples}"
+    assert args.n_random_downsample_initial >= args.n_pcd_samples, (
+        f"n_random_downsample_initial ({args.n_random_downsample_initial}) must be >= "
+        f"n_pcd_samples ({args.n_pcd_samples})"
+    )
+    assert args.sim_fov_scale >= 1.0, f"sim_fov_scale must be >= 1, got {args.sim_fov_scale}"
     assert args.cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {args.cma_sigma_pos}"
     assert args.cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {args.cma_sigma_rot}"
     assert args.cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {args.cma_maxiter}"
     assert args.cma_popsize is None or args.cma_popsize >= 2, f"cma_popsize must be >= 2, got {args.cma_popsize}"
+    assert args.n_seed_azimuth >= 1, f"n_seed_azimuth must be >= 1, got {args.n_seed_azimuth}"
+    assert args.n_seed_polar >= 1, f"n_seed_polar must be >= 1, got {args.n_seed_polar}"
+    assert args.n_seed_rolls >= 1, f"n_seed_rolls must be >= 1, got {args.n_seed_rolls}"
+    assert args.n_seed_radii >= 1, f"n_seed_radii must be >= 1, got {args.n_seed_radii}"
     assert len(args.robot_description) > 0, "robot_description must not be empty"
     assert args.sam_kmax >= 1, f"sam_kmax must be >= 1, got {args.sam_kmax}"
-    assert 0.0 <= args.sam_score_threshold < 1.0, (
-        f"sam_score_threshold must be in [0, 1), got {args.sam_score_threshold}"
-    )
+    assert (
+        0.0 <= args.sam_score_threshold < 1.0
+    ), f"sam_score_threshold must be in [0, 1), got {args.sam_score_threshold}"
+    assert args.mask_erode_px == 0 or (
+        args.mask_erode_px >= 1 and args.mask_erode_px % 2 == 1
+    ), f"mask_erode_px must be 0 or a positive odd int, got {args.mask_erode_px}"
+    assert args.depth_intrinsics_source in (
+        "rgb",
+        "depth",
+    ), f"depth_intrinsics_source must be 'rgb' or 'depth', got {args.depth_intrinsics_source!r}"
     chamfer_device = "cuda" if torch.cuda.is_available() else "cpu"
+    rng = np.random.default_rng(0)
 
-    depth_intrinsics = get_depth_intrinsics(args.camera_model_id)
     color_intrinsics = get_color_intrinsics(args.camera_model_id)
 
     print(f"[info] Loading RGB-D + qpos from {args.h5_path} ({args.camera}) ...")
@@ -840,34 +1144,49 @@ def main(args: Args) -> None:
     depth_raw_sel = depth_raw_all[fps_idx]
     qpos_sel = qpos_all[fps_idx]
     H, W = int(rgb_sel.shape[1]), int(rgb_sel.shape[2])
-    K = scale_intrinsics(
-        color_intrinsics.intrinsic_matrix,
-        (color_intrinsics.height, color_intrinsics.width),
-        (H, W),
-    ).astype(np.float64)
-    print(f"[info] Color K ({args.camera_model_id}):\n{K}")
-
-    print(f"[info] Reprojecting depth into the color frame ({args.n_timesteps} sampled frames) ...")
-    t0 = time.perf_counter()
-    R_dc, t_dc = get_depth_to_color_extrinsics(args.camera_model_id)
-    depth_m_sel = np.stack(
-        [
-            reproject_depth_to_color_frame(
-                depth_mm_to_meters(depth_raw_sel[i]),
-                depth_intrinsics,
-                color_intrinsics,
-                R_dc,
-                t_dc,
-            )
-            for i in range(args.n_timesteps)
-        ],
-        axis=0,
+    assert (H, W) == (color_intrinsics.height, color_intrinsics.width), (
+        f"{args.camera} rgb is {H}x{W} but {args.camera_model_id} color intrinsics are "
+        f"{color_intrinsics.height}x{color_intrinsics.width}"
     )
-    _log_elapsed("Reprojected depth into the color frame", t0)
+    K = color_intrinsics.intrinsic_matrix.astype(np.float64)
+    print(f"[info] Color K ({args.camera_model_id}):\n{K}")
+    print(f"[info] Depth channel uses {args.depth_intrinsics_source} intrinsics")
+
+    depth_m_sel = depth_mm_to_meters(depth_raw_sel)
+    if args.depth_intrinsics_source == "depth":
+        depth_cam_intrinsics = get_depth_intrinsics(args.camera_model_id)
+        assert depth_raw_sel.shape[1:] == (depth_cam_intrinsics.height, depth_cam_intrinsics.width), (
+            f"{args.camera} depth is {depth_raw_sel.shape[1]}x{depth_raw_sel.shape[2]} but "
+            f"{args.camera_model_id} depth intrinsics are "
+            f"{depth_cam_intrinsics.height}x{depth_cam_intrinsics.width}"
+        )
+        print(f"[info] Reprojecting native depth into the color frame ({args.n_timesteps} sampled frames) ...")
+        t0 = time.perf_counter()
+        R_dc, t_dc = get_depth_to_color_extrinsics(args.camera_model_id)
+        depth_m_sel = np.stack(
+            [
+                reproject_depth_to_color_frame(
+                    depth_m_sel[i],
+                    depth_cam_intrinsics,
+                    color_intrinsics,
+                    R_dc,
+                    t_dc,
+                )
+                for i in range(args.n_timesteps)
+            ],
+            axis=0,
+        )
+        _log_elapsed("Reprojected depth into the color frame", t0)
+    assert depth_m_sel.shape == (
+        args.n_timesteps,
+        H,
+        W,
+    ), f"depth_m_sel shape {depth_m_sel.shape} != ({args.n_timesteps}, {H}, {W})"
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     predictor: GroundedSAMPredictor | None = None
     pcd_reals: list[np.ndarray] = []
+    demo_frames: list[np.ndarray] = []
     t0_masks = time.perf_counter()
     for i, frame_idx in enumerate(fps_idx):
         image_bgr = cv2.cvtColor(rgb_sel[i], cv2.COLOR_RGB2BGR)
@@ -877,9 +1196,9 @@ def main(args: Args) -> None:
         if args.cache_robot_masks and cache_path.is_file():
             mask = np.load(cache_path)
             assert isinstance(mask, np.ndarray), f"{cache_path}: expected ndarray, got {type(mask)}"
-            assert mask.shape == image_bgr.shape[:2], (
-                f"{cache_path}: mask shape {mask.shape} != image {image_bgr.shape[:2]}"
-            )
+            assert (
+                mask.shape == image_bgr.shape[:2]
+            ), f"{cache_path}: mask shape {mask.shape} != image {image_bgr.shape[:2]}"
             assert mask.dtype == bool, f"{cache_path}: mask dtype must be bool, got {mask.dtype}"
             print(f"[info] Loaded robot mask from {cache_path}")
         else:
@@ -891,9 +1210,7 @@ def main(args: Args) -> None:
             print(f"[info] Segmenting '{args.robot_description}' on frame {int(frame_idx)} ...")
             t0 = time.perf_counter()
             masks, scores, phrases = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, args.robot_description)
-            _log_elapsed(
-                f"Segmented '{args.robot_description}' on frame {int(frame_idx)} ({masks.shape[0]} masks)", t0
-            )
+            _log_elapsed(f"Segmented '{args.robot_description}' on frame {int(frame_idx)} ({masks.shape[0]} masks)", t0)
             for rank in range(min(args.sam_kmax, masks.shape[0])):
                 print(
                     f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
@@ -912,23 +1229,23 @@ def main(args: Args) -> None:
                     args.sam_kmax,
                     args.sam_score_threshold,
                 )
-                ImageUtils.save_masked_debug(
-                    image_bgr,
-                    mask,
-                    args.h5_path.parent,
-                    f"{args.camera}__robot_mask__{int(frame_idx)}__union__kmax={args.sam_kmax}__score_threshold={args.sam_score_threshold}",
-                )
             if args.cache_robot_masks:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 np.save(cache_path, mask)
                 print(f"[info] Saved robot mask to {cache_path}")
         assert mask.any(), f"Empty robot mask at frame {int(frame_idx)} for prompt {args.robot_description!r}"
-        print(f"[info] Mask pixels: {int(mask.sum())} / {mask.size}")
+        n_mask = int(mask.sum())
+        mask = _erode_mask(mask, args.mask_erode_px)
+        print(f"[info] Mask pixels: {n_mask} -> {int(mask.sum())} / {mask.size} (erode_px={args.mask_erode_px})")
+        demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
+        ImageUtils.save_demo_overlay(image_bgr, mask, cache_path.with_suffix(".demo.png"))
         pts = masked_depth_to_points(depth_m_sel[i], mask, K)
-        pts = _subsample_pcd(pts, args.n_pcd_samples)
+        pts = _subsample_pcd(pts, args.n_pcd_samples, args.n_random_downsample_initial, chamfer_device, rng)
         assert pts.shape[0] >= 1, f"No robot points at frame {int(frame_idx)}"
         pcd_reals.append(pts)
         print(f"[info] pcd_real[{i}] n={pts.shape[0]}")
+    assert len(demo_frames) == args.n_timesteps, f"demo_frames {len(demo_frames)} != n_timesteps {args.n_timesteps}"
+    demo_sel = np.stack(demo_frames, axis=0)
     _log_elapsed(f"Segmented {args.n_timesteps} frames on cpu", t0_masks)
 
     print(f"[info] Loading Jrl2 robot '{args.robot_id}' ...")
@@ -940,18 +1257,21 @@ def main(args: Args) -> None:
     )
     urdf_path = pathlib.Path(robot._urdf_filepath)
     print(f"[info] URDF: {urdf_path}")
-    renderer = SimRobotRenderer(urdf_path, K, H, W, robot.actuated_joint_names)
+    renderer = SimRobotRenderer(urdf_path, K, H, W, robot.actuated_joint_names, args.sim_fov_scale)
     _log_elapsed("Loaded robot + Sapien renderer", t0)
 
-    vis = (
-        ExtrinsicsVisualizer(pcd_reals, K, H, W, rgb_sel, args.cma_maxiter, fps_idx) if args.visualize else None
-    )
+    vis = ExtrinsicsVisualizer(pcd_reals, K, H, W, demo_sel, args.cma_maxiter, fps_idx) if args.visualize else None
     best_T, best_cost = _optimize_extrinsics(
         renderer,
         qpos_sel,
         pcd_reals,
-        args.n_pcd_samples,
+        args.n_random_downsample_initial,
         chamfer_device,
+        rng,
+        args.n_seed_azimuth,
+        args.n_seed_polar,
+        args.n_seed_rolls,
+        args.n_seed_radii,
         args.cma_sigma_pos,
         args.cma_sigma_rot,
         args.cma_maxiter,
@@ -962,6 +1282,8 @@ def main(args: Args) -> None:
     payload = {
         "camera": args.camera,
         "robot_id": args.robot_id,
+        "camera_model_id": args.camera_model_id,
+        "depth_intrinsics_source": args.depth_intrinsics_source,
         "parent_frame": "robot_base",
         "child_frame": f"{args.camera}_optical",
         "h5_path": str(args.h5_path),

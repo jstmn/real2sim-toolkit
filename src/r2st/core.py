@@ -25,22 +25,22 @@ import torch
 from PIL import Image as PILImage
 
 from r2st.geometry import (
-    reproject_depth_to_color_frame,
     camera_extrinsic_to_maniskill_pose,
     mat_to_sapien_pose_tuple,
     project_axes_to_image,
     realsense_to_maniskill_basis_matrix,
+    reproject_depth_to_color_frame,
     scale_intrinsics,
     transform_pose_cam_to_world,
 )
 
 # Re-export geometry helpers so tests can import from core as in original
 __all__ = [
-    "reproject_depth_to_color_frame",
     "camera_extrinsic_to_maniskill_pose",
     "mat_to_sapien_pose_tuple",
     "project_axes_to_image",
     "realsense_to_maniskill_basis_matrix",
+    "reproject_depth_to_color_frame",
     "scale_intrinsics",
     "transform_pose_cam_to_world",
 ]
@@ -261,7 +261,9 @@ class GroundedSAMPredictor:
             self._bert_model, image_rgb, object_name, self._box_threshold, self._text_threshold, device=self._device
         )
         assert boxes_filt.size(0) > 0, f"GroundingDINO found no boxes for {object_name!r}"
-        assert box_scores.shape == (boxes_filt.size(0),), f"box_scores {box_scores.shape} != n_boxes {boxes_filt.size(0)}"
+        assert box_scores.shape == (
+            boxes_filt.size(0),
+        ), f"box_scores {box_scores.shape} != n_boxes {boxes_filt.size(0)}"
         img_size = image_rgb.shape[:2]
         W, H = img_size[1], img_size[0]
         assert H < W, f"Image height ({H}) should be less than width ({W})"

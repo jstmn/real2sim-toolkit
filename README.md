@@ -54,6 +54,8 @@ uv run python examples/estimate_camera_extrinsics.py \
   --robot-id xarm7 \
   --camera cam_1 \
   --camera-model-id d435 \
+  --depth-intrinsics-source rgb \
+  --n_timesteps 2 \
   --output-path data/demonstrations/0802/extrinsics.yaml \
   --visualize \
   --visualize-robot-masks
@@ -93,6 +95,7 @@ uv run python examples/track_object.py \
 ## Camera models
 
 `--camera-model-id` selects measured intrinsics (and depth-to-color extrinsics) from `r2st.constants`.
+`--depth-intrinsics-source rgb|depth` is required and says which of those K's the h5 depth channel uses (`rgb` = already color-aligned).
 
 | `--camera-model-id` | Device |
 | --- | --- |

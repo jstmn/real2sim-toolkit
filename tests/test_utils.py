@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from r2st.utils import farthest_point_sample_naive
+from r2st.utils import farthest_point_sample_naive, farthest_point_sample_pyg_lib
 
 
 def _circular_dist_sq(points: np.ndarray, selected: np.ndarray) -> np.ndarray:
@@ -96,3 +96,52 @@ class TestFarthestPointSampleNaive:
             farthest_point_sample_naive(np.zeros((5,)), 2)
         with pytest.raises(AssertionError):
             farthest_point_sample_naive(pts, 2, distance="angular")
+
+
+def _torch_device() -> str:
+    import torch
+
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+class TestFarthestPointSamplePygLib:
+    def test_returns_unique_indices_of_requested_count(self):
+        rng = np.random.default_rng(0)
+        pts = rng.normal(size=(200, 3)).astype(np.float32)
+        idx = farthest_point_sample_pyg_lib(pts, 32, device=_torch_device(), random_start=False)
+        assert idx.shape == (32,)
+        assert idx.dtype == np.int64
+        assert idx.min() >= 0
+        assert idx.max() < 200
+        assert len(np.unique(idx)) == 32
+
+    def test_batched_returns_per_cloud_indices(self):
+        rng = np.random.default_rng(1)
+        pts = rng.normal(size=(3, 80, 3)).astype(np.float32)
+        idx = farthest_point_sample_pyg_lib(pts, 10, device=_torch_device(), random_start=False)
+        assert idx.shape == (3, 10)
+        assert idx.dtype == np.int64
+        assert idx.min() >= 0
+        assert idx.max() < 80
+        for b in range(3):
+            assert len(np.unique(idx[b])) == 10
+
+    def test_deterministic_when_random_start_false(self):
+        rng = np.random.default_rng(2)
+        pts = rng.normal(size=(100, 3)).astype(np.float32)
+        device = _torch_device()
+        idx0 = farthest_point_sample_pyg_lib(pts, 16, device=device, random_start=False)
+        idx1 = farthest_point_sample_pyg_lib(pts, 16, device=device, random_start=False)
+        np.testing.assert_array_equal(idx0, idx1)
+
+    def test_bad_args_raise(self):
+        pts = np.zeros((5, 3), dtype=np.float32)
+        device = _torch_device()
+        with pytest.raises(AssertionError):
+            farthest_point_sample_pyg_lib(pts, 0, device=device)
+        with pytest.raises(AssertionError):
+            farthest_point_sample_pyg_lib(pts, 6, device=device)
+        with pytest.raises(AssertionError):
+            farthest_point_sample_pyg_lib(np.zeros((5,), dtype=np.float32), 2, device=device)
+        with pytest.raises(AssertionError):
+            farthest_point_sample_pyg_lib(pts, 2, device="")

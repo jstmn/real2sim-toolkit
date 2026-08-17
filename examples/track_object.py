@@ -9,13 +9,11 @@ import numpy as np
 import tyro
 from tqdm import tqdm
 
-from r2st.constants import get_color_intrinsics, get_depth_intrinsics, get_depth_to_color_extrinsics
+from r2st.constants import get_color_intrinsics
 from r2st.core import GroundedSAMPredictor
 from r2st.geometry import (
-    reproject_depth_to_color_frame,
     depth_mm_to_meters,
     masked_depth_to_points,
-    scale_intrinsics,
 )
 from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
@@ -109,7 +107,6 @@ def main(args: Args) -> None:
     assert args.track_refine_iter >= 1, f"track_refine_iter must be >= 1, got {args.track_refine_iter}"
     assert args.max_frames is None or args.max_frames >= 1, f"max_frames must be >= 1, got {args.max_frames}"
 
-    depth_intrinsics = get_depth_intrinsics(args.camera_model_id)
     color_intrinsics = get_color_intrinsics(args.camera_model_id)
 
     print(f"[info] Loading RGB-D from {args.h5_path} ({args.camera}) ...")
@@ -124,31 +121,16 @@ def main(args: Args) -> None:
     _log_elapsed(f"Loaded {num_frames} frames, resolution {rgb_all.shape[1:3]}", t0)
 
     H, W = rgb_all.shape[1], rgb_all.shape[2]
-    K = scale_intrinsics(
-        color_intrinsics.intrinsic_matrix,
-        (color_intrinsics.height, color_intrinsics.width),
-        (H, W),
-    ).astype(np.float64)
+    assert (H, W) == (color_intrinsics.height, color_intrinsics.width), (
+        f"{args.camera} rgb is {H}x{W} but {args.camera_model_id} color intrinsics are "
+        f"{color_intrinsics.height}x{color_intrinsics.width}"
+    )
+    K = color_intrinsics.intrinsic_matrix.astype(np.float64)
     print(f"[info] Color K ({args.camera_model_id}):\n{K}")
 
-    print(f"[info] Reprojecting depth into the color frame ({num_frames} frames) ...")
-    t0 = time.perf_counter()
-    R_dc, t_dc = get_depth_to_color_extrinsics(args.camera_model_id)
-    depth_m_all = np.stack(
-        [
-            reproject_depth_to_color_frame(
-                depth_mm_to_meters(depth_raw_all[i]),
-                depth_intrinsics,
-                color_intrinsics,
-                R_dc,
-                t_dc,
-            )
-            for i in tqdm(range(num_frames), desc="reproject depth")
-        ],
-        axis=0,
-    )
-    assert depth_m_all.shape == (num_frames, H, W), f"Bad aligned depth shape: {depth_m_all.shape}"
-    _log_elapsed("Reprojected depth into the color frame", t0)
+    # Merged h5 depth is already in the color pixel grid. Unproject with color K.
+    depth_m_all = depth_mm_to_meters(depth_raw_all)
+    assert depth_m_all.shape == (num_frames, H, W), f"Bad depth shape: {depth_m_all.shape}"
 
     rgb0 = rgb_all[0]
     depth0 = depth_m_all[0]
