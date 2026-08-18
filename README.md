@@ -55,11 +55,20 @@ uv run python examples/estimate_camera_extrinsics.py \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
-  --n_timesteps 2 \
+  --n-timesteps 2 \
   --output-path data/demonstrations/0802/extrinsics.yaml \
+  --seed-from-gui \
   --visualize \
   --visualize-robot-masks
 ```
+
+Exactly one seed mode is required:
+
+- `--seed-automatically` evaluates the configured spherical grid before CMA-ES.
+- `--seed-from-gui` starts Viser and waits for a manual seed. Click the 3D view, then use
+  world-frame (robot-base) hotkeys: R/F X, T/G Y, Y/H Z, U/J roll about X, I/K pitch about Y,
+  O/L yaw about Z (top row +, bottom row -). Press Enter or click **Select seed and start CMA-ES**.
+  `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
 
 
 **Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a

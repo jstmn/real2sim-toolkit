@@ -62,8 +62,9 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
+import threading
 import time
-from typing import Literal
+from typing import Any, Literal
 
 import cv2
 import h5py
@@ -106,6 +107,7 @@ uv run python examples/estimate_camera_extrinsics.py \
     --robot-id xarm7 --camera cam_1 --camera-model-id d435 \
     --depth-intrinsics-source rgb \
     --output-path data/demonstrations/0802/extrinsics.yaml \
+    --seed-automatically \
     --visualize --visualize-robot-masks
 """
 
@@ -166,6 +168,18 @@ class Args:
     cma_maxiter: int = 100
     """Maximum CMA-ES generations."""
 
+    seed_automatically: bool = False
+    """If set, choose the CMA-ES seed with the spherical-grid search."""
+
+    seed_from_gui: bool = False
+    """If set, choose the CMA-ES seed interactively with Viser GUI controls."""
+
+    gui_translation_step_m: float = 0.02
+    """World-frame translation per GUI button press, in meters."""
+
+    gui_rotation_step_deg: float = 5.0
+    """World-frame rotation per GUI button press, in degrees."""
+
     n_seed_azimuth: int = 25
     """Number of azimuth steps (about world +Z) for seed camera positions on each sphere."""
 
@@ -173,7 +187,7 @@ class Args:
     """Number of polar-angle steps (from world +Z) for seed camera positions on each sphere."""
 
     n_seed_radii: int = 3
-    """Number of sphere radii, linspace from 0.5 m to 1.5 m inclusive."""
+    """Number of sphere radii, linspace from 1.0 m to 1.5 m inclusive."""
 
     n_seed_rolls: int = 10
     """Number of evenly spaced rolls about the look-at axis (toward (0, 0, 0.5)) per seed position."""
@@ -205,6 +219,10 @@ class Args:
 
 def _log_elapsed(label: str, t0: float) -> None:
     print(f"[info] {label} ({time.perf_counter() - t0:.1f}s)")
+
+
+def _validate_seed_mode(seed_automatically: bool, seed_from_gui: bool) -> None:
+    assert seed_automatically != seed_from_gui, "Exactly one of --seed-automatically or --seed-from-gui must be passed"
 
 
 def _robot_mask_cache_path(
@@ -380,6 +398,24 @@ def _look_at_with_roll(eye: np.ndarray, target: np.ndarray, roll_rad: float, up:
     T_roll = T.copy()
     T_roll[:3, :3] = T[:3, :3] @ Rz
     return T_roll
+
+
+def _step_pose_world(
+    T_world_cam: np.ndarray,
+    translation_world: np.ndarray,
+    rotation_world: np.ndarray,
+) -> np.ndarray:
+    """Apply world-frame translation and rotation-vector increments to `T_world_cam`."""
+    assert T_world_cam.shape == (4, 4), f"T_world_cam must be 4x4, got {T_world_cam.shape}"
+    translation_world = np.asarray(translation_world, dtype=np.float64).reshape(3)
+    rotation_world = np.asarray(rotation_world, dtype=np.float64).reshape(3)
+    T_next = T_world_cam.copy()
+    T_next[:3, 3] += translation_world
+    angle = float(np.linalg.norm(rotation_world))
+    if angle > 0.0:
+        T_next[:3, :3] = axangle2mat(rotation_world / angle, angle) @ T_world_cam[:3, :3]
+    assert np.allclose(T_next[3], [0.0, 0.0, 0.0, 1.0]), f"Bad homogeneous row: {T_next[3]}"
+    return T_next
 
 
 def _generate_seed_poses(
@@ -577,6 +613,27 @@ class SimRobotRenderer:
         return xyz_cv[valid].astype(np.float32)
 
 
+@dataclasses.dataclass
+class _ManualSeedSelection:
+    T_world_cam: np.ndarray
+    renderer: SimRobotRenderer
+    joint_angles: np.ndarray
+    pcd_reals: list[np.ndarray]
+    n_random_downsample_initial: int
+    chamfer_device: str
+    rng: np.random.Generator
+    translation_step_handle: Any
+    rotation_step_handle: Any
+    move_buttons: list[Any]
+    command_handles: list[Any]
+    selected_event: threading.Event = dataclasses.field(default_factory=threading.Event)
+    lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
+    cost: float | None = None
+    pcd_sims: list[np.ndarray] | None = None
+    best_cost: float = np.inf
+    t0: float = dataclasses.field(default_factory=time.perf_counter)
+
+
 class ExtrinsicsVisualizer:
     """Viser overlay in the robot-base frame: clouds, camera frustum, CMA-ES cost plot."""
 
@@ -621,6 +678,8 @@ class ExtrinsicsVisualizer:
         self._live_pcd_sims: list[np.ndarray] | None = None
         self._live_pop_Ts: list[np.ndarray] | None = None
         self._pop_axes: list = []
+        self._manual_seed: _ManualSeedSelection | None = None
+        self._manual_seed_status: Any | None = None
         self._timestep = 0
         self._iteration = 0
         self._T_init = self._T.copy()
@@ -722,6 +781,151 @@ class ExtrinsicsVisualizer:
         )
         self._apply()
         print(f"[info] Viser extrinsics view at http://{self._server.get_host()}:{self._server.get_port()}")
+
+    def select_seed_from_gui(
+        self,
+        renderer: SimRobotRenderer,
+        joint_angles: np.ndarray,
+        pcd_reals: list[np.ndarray],
+        n_random_downsample_initial: int,
+        chamfer_device: str,
+        rng: np.random.Generator,
+        translation_step_m: float,
+        rotation_step_deg: float,
+    ) -> tuple[np.ndarray, float, list[np.ndarray]]:
+        """Block until the user adjusts and selects a CMA-ES seed in the Viser GUI."""
+        assert self._manual_seed is None, "Manual seed selection has already been configured"
+        assert translation_step_m > 0.0, f"translation_step_m must be > 0, got {translation_step_m}"
+        assert rotation_step_deg > 0.0, f"rotation_step_deg must be > 0, got {rotation_step_deg}"
+        with self._server.gui.add_folder("Manual seed selection", expand_by_default=True):
+            self._manual_seed_status = self._server.gui.add_markdown("Initializing seed evaluation...")
+            translation_step_handle = self._server.gui.add_number(
+                "translation step (m)", translation_step_m, min=1.0e-4, step=0.005
+            )
+            rotation_step_handle = self._server.gui.add_number(
+                "rotation step (deg)", rotation_step_deg, min=0.1, step=1.0
+            )
+            self._server.gui.add_markdown(
+                "**Click the 3D view, then use keyboard hotkeys (world / robot-base).**  \n"
+                "**Translation:** R/F +X/-X, T/G +Y/-Y, Y/H +Z/-Z  \n"
+                "**Rotation:** U/J +roll/-roll, I/K +pitch/-pitch, O/L +yaw/-yaw  \n"
+                "**Enter:** select seed and start CMA-ES"
+            )
+            state = _ManualSeedSelection(
+                T_world_cam=self._T_init.copy(),
+                renderer=renderer,
+                joint_angles=joint_angles,
+                pcd_reals=pcd_reals,
+                n_random_downsample_initial=n_random_downsample_initial,
+                chamfer_device=chamfer_device,
+                rng=rng,
+                translation_step_handle=translation_step_handle,
+                rotation_step_handle=rotation_step_handle,
+                move_buttons=[],
+                command_handles=[],
+            )
+            self._manual_seed = state
+            button_specs = (
+                ("R", "R — +X", [1.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+                ("F", "F — -X", [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0]),
+                ("T", "T — +Y", [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]),
+                ("G", "G — -Y", [0.0, -1.0, 0.0], [0.0, 0.0, 0.0]),
+                ("Y", "Y — +Z", [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]),
+                ("H", "H — -Z", [0.0, 0.0, -1.0], [0.0, 0.0, 0.0]),
+                ("U", "U — +roll (about X)", [0.0, 0.0, 0.0], [1.0, 0.0, 0.0]),
+                ("J", "J — -roll (about X)", [0.0, 0.0, 0.0], [-1.0, 0.0, 0.0]),
+                ("I", "I — +pitch (about Y)", [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+                ("K", "K — -pitch (about Y)", [0.0, 0.0, 0.0], [0.0, -1.0, 0.0]),
+                ("O", "O — +yaw (about Z)", [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                ("L", "L — -yaw (about Z)", [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+            )
+            for hotkey, label, translation_direction, rotation_direction in button_specs:
+                translation = np.asarray(translation_direction, dtype=np.float64)
+                rotation = np.asarray(rotation_direction, dtype=np.float64)
+
+                def _on_move(_, translation=translation, rotation=rotation) -> None:
+                    self._move_manual_seed(translation, rotation)
+
+                button = self._server.gui.add_button(label)
+                button.on_click(_on_move)
+                state.move_buttons.append(button)
+                command = self._server.gui.add_command(label, hotkey=hotkey)
+                command.on_trigger(_on_move)
+                state.command_handles.append(command)
+            select_button = self._server.gui.add_button("Select seed and start CMA-ES", color="green")
+            select_button.on_click(lambda _: self._confirm_manual_seed())
+            state.move_buttons.append(select_button)
+            select_command = self._server.gui.add_command("Select seed and start CMA-ES", hotkey="enter")
+            select_command.on_trigger(lambda _: self._confirm_manual_seed())
+            state.command_handles.append(select_command)
+
+        with state.lock:
+            self._evaluate_manual_seed()
+        print("[info] Waiting for manual seed selection in Viser (click the 3D view, then RF/TG/YH/UJ/IK/OL/Enter)...")
+        state.selected_event.wait()
+        assert state.cost is not None and state.pcd_sims is not None, "Selected seed has not been evaluated"
+        return state.T_world_cam.copy(), float(state.cost), [pcd.copy() for pcd in state.pcd_sims]
+
+    def _move_manual_seed(self, translation_direction: np.ndarray, rotation_direction: np.ndarray) -> None:
+        state = self._manual_seed
+        assert state is not None, "Manual seed selection is not configured"
+        with state.lock:
+            if state.selected_event.is_set():
+                return
+            translation_step_m = float(state.translation_step_handle.value)
+            rotation_step_rad = float(np.deg2rad(state.rotation_step_handle.value))
+            assert translation_step_m > 0.0, f"translation step must be > 0, got {translation_step_m}"
+            assert rotation_step_rad > 0.0, f"rotation step must be > 0, got {rotation_step_rad}"
+            state.T_world_cam = _step_pose_world(
+                state.T_world_cam,
+                translation_direction * translation_step_m,
+                rotation_direction * rotation_step_rad,
+            )
+            self._evaluate_manual_seed()
+
+    def _evaluate_manual_seed(self) -> None:
+        state = self._manual_seed
+        assert state is not None, "Manual seed selection is not configured"
+        assert self._manual_seed_status is not None
+        self._manual_seed_status.content = "**Evaluating pose...**"
+        cost, pcd_sims, _, _, _ = _pose_cost(
+            state.T_world_cam,
+            state.renderer,
+            state.joint_angles,
+            state.pcd_reals,
+            state.n_random_downsample_initial,
+            state.chamfer_device,
+            state.rng,
+            {},
+        )
+        state.cost = float(cost)
+        state.pcd_sims = pcd_sims
+        state.best_cost = min(state.best_cost, state.cost)
+        assert np.isfinite(state.best_cost), f"best_cost must be finite, got {state.best_cost}"
+        self.record_seed_best(time.perf_counter() - state.t0, state.best_cost)
+        self.set_best(pcd_sims, state.cost, state.T_world_cam)
+        xyz = state.T_world_cam[:3, 3]
+        self._manual_seed_status.content = (
+            f"**Current cost:** `{state.cost:.6f}`  \n"
+            f"**Best cost:** `{state.best_cost:.6f}`  \n"
+            f"**Position:** `[{xyz[0]:.4f}, {xyz[1]:.4f}, {xyz[2]:.4f}]`"
+        )
+
+    def _confirm_manual_seed(self) -> None:
+        state = self._manual_seed
+        assert state is not None, "Manual seed selection is not configured"
+        with state.lock:
+            assert state.cost is not None and state.pcd_sims is not None, "Current seed has not been evaluated"
+            for handle in state.move_buttons:
+                handle.disabled = True
+            for handle in state.command_handles:
+                handle.remove()
+            state.command_handles.clear()
+            state.translation_step_handle.disabled = True
+            state.rotation_step_handle.disabled = True
+            assert self._manual_seed_status is not None
+            self._manual_seed_status.content = f"**Selected seed cost:** `{state.cost:.6f}`"
+            state.selected_event.set()
 
     def set_best(self, pcd_sims: list[np.ndarray], cost: float, T_world_cam: np.ndarray) -> None:
         """Live-update the scene when a new global best is found, if viewing the latest iteration."""
@@ -868,6 +1072,9 @@ class ExtrinsicsVisualizer:
     def wait(self) -> None:
         self._server.sleep_forever()
 
+    def close(self) -> None:
+        self._server.stop()
+
 
 def _pose_cost(
     T_world_cam: np.ndarray,
@@ -958,6 +1165,10 @@ def _optimize_extrinsics(
     n_random_downsample_initial: int,
     chamfer_device: str,
     rng: np.random.Generator,
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    gui_translation_step_m: float,
+    gui_rotation_step_deg: float,
     n_seed_azimuth: int,
     n_seed_polar: int,
     n_seed_rolls: int,
@@ -977,26 +1188,40 @@ def _optimize_extrinsics(
     assert n_seed_radii >= 1, f"n_seed_radii must be >= 1, got {n_seed_radii}"
     assert cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {cma_sigma_pos}"
     assert cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {cma_sigma_rot}"
-
-    seed_Ts = _generate_seed_poses(n_seed_azimuth, n_seed_polar, n_seed_rolls, n_seed_radii)
-    radii = np.linspace(_SEED_RADIUS_MIN_M, _SEED_RADIUS_MAX_M, n_seed_radii, dtype=np.float64)
-    print(
-        f"[info] Seed search: n_azimuth={n_seed_azimuth} n_polar={n_seed_polar} n_rolls={n_seed_rolls} "
-        f"n_radii={n_seed_radii} radii_m={radii.tolist()} n_total={len(seed_Ts)} "
-        f"lookat={_SEED_LOOKAT_TARGET.tolist()}"
-    )
-    t0_seed = time.perf_counter()
-    best_T, best_cost, best_pcd_sims = _select_seed_pose(
-        seed_Ts,
-        renderer,
-        joint_angles,
-        pcd_reals,
-        n_random_downsample_initial,
-        chamfer_device,
-        rng,
-        vis,
-    )
-    _log_elapsed(f"Seed search finished, best={best_cost:.6f}", t0_seed)
+    _validate_seed_mode(seed_automatically, seed_from_gui)
+    if seed_automatically:
+        seed_Ts = _generate_seed_poses(n_seed_azimuth, n_seed_polar, n_seed_rolls, n_seed_radii)
+        radii = np.linspace(_SEED_RADIUS_MIN_M, _SEED_RADIUS_MAX_M, n_seed_radii, dtype=np.float64)
+        print(
+            f"[info] Seed search: n_azimuth={n_seed_azimuth} n_polar={n_seed_polar} n_rolls={n_seed_rolls} "
+            f"n_radii={n_seed_radii} radii_m={radii.tolist()} n_total={len(seed_Ts)} "
+            f"lookat={_SEED_LOOKAT_TARGET.tolist()}"
+        )
+        t0_seed = time.perf_counter()
+        best_T, best_cost, best_pcd_sims = _select_seed_pose(
+            seed_Ts,
+            renderer,
+            joint_angles,
+            pcd_reals,
+            n_random_downsample_initial,
+            chamfer_device,
+            rng,
+            vis,
+        )
+        _log_elapsed(f"Seed search finished, best={best_cost:.6f}", t0_seed)
+    else:
+        assert vis is not None, "GUI seed selection requires an ExtrinsicsVisualizer"
+        best_T, best_cost, best_pcd_sims = vis.select_seed_from_gui(
+            renderer,
+            joint_angles,
+            pcd_reals,
+            n_random_downsample_initial,
+            chamfer_device,
+            rng,
+            gui_translation_step_m,
+            gui_rotation_step_deg,
+        )
+        print(f"[info] Manual seed selected: cost={best_cost:.6f} T_world_cam=\n{best_T}")
 
     x0 = _T_to_vec(best_T)
     cma_stds = [cma_sigma_pos, cma_sigma_pos, cma_sigma_pos, cma_sigma_rot, cma_sigma_rot, cma_sigma_rot]
@@ -1108,6 +1333,9 @@ def main(args: Args) -> None:
     assert args.cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {args.cma_sigma_rot}"
     assert args.cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {args.cma_maxiter}"
     assert args.cma_popsize is None or args.cma_popsize >= 2, f"cma_popsize must be >= 2, got {args.cma_popsize}"
+    _validate_seed_mode(args.seed_automatically, args.seed_from_gui)
+    assert args.gui_translation_step_m > 0.0, f"gui_translation_step_m must be > 0, got {args.gui_translation_step_m}"
+    assert args.gui_rotation_step_deg > 0.0, f"gui_rotation_step_deg must be > 0, got {args.gui_rotation_step_deg}"
     assert args.n_seed_azimuth >= 1, f"n_seed_azimuth must be >= 1, got {args.n_seed_azimuth}"
     assert args.n_seed_polar >= 1, f"n_seed_polar must be >= 1, got {args.n_seed_polar}"
     assert args.n_seed_rolls >= 1, f"n_seed_rolls must be >= 1, got {args.n_seed_rolls}"
@@ -1260,7 +1488,11 @@ def main(args: Args) -> None:
     renderer = SimRobotRenderer(urdf_path, K, H, W, robot.actuated_joint_names, args.sim_fov_scale)
     _log_elapsed("Loaded robot + Sapien renderer", t0)
 
-    vis = ExtrinsicsVisualizer(pcd_reals, K, H, W, demo_sel, args.cma_maxiter, fps_idx) if args.visualize else None
+    vis = (
+        ExtrinsicsVisualizer(pcd_reals, K, H, W, demo_sel, args.cma_maxiter, fps_idx)
+        if args.visualize or args.seed_from_gui
+        else None
+    )
     best_T, best_cost = _optimize_extrinsics(
         renderer,
         qpos_sel,
@@ -1268,6 +1500,10 @@ def main(args: Args) -> None:
         args.n_random_downsample_initial,
         chamfer_device,
         rng,
+        args.seed_automatically,
+        args.seed_from_gui,
+        args.gui_translation_step_m,
+        args.gui_rotation_step_deg,
         args.n_seed_azimuth,
         args.n_seed_polar,
         args.n_seed_rolls,
@@ -1300,8 +1536,11 @@ def main(args: Args) -> None:
     print(f"[info] translation={t}")
     print(f"[info] quaternion_wxyz={q_wxyz}")
 
-    if vis is not None:
+    if args.visualize:
+        assert vis is not None
         vis.wait()
+    elif vis is not None:
+        vis.close()
 
 
 if __name__ == "__main__":
