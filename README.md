@@ -51,7 +51,7 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 ```bash
 uv run python examples/estimate_camera_extrinsics.py \
   --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-  --robot-id xarm7 \
+  --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
@@ -70,6 +70,18 @@ Exactly one seed mode is required:
   O/L yaw about Z (top row +, bottom row -). Press Enter or click **Select seed and start CMA-ES**.
   `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
 
+`--robot-id` is a Jrl2 robot name. A bare name is the arm only. `{robot}__{eef}` is the same arm with that
+end effector (`__` delimits robot vs EEF; `_` stays inside each token):
+
+| `--robot-id` | End effector |
+| --- | --- |
+| `xarm7` | none (wrist flange only) |
+| `xarm7__gripper` | UFACTORY parallel-jaw gripper |
+| `xarm7__bio_gripper` | UFACTORY BIO gripper |
+| `xarm7__vacuum_gripper` | UFACTORY vacuum gripper |
+
+Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
+are pinned at 0 (closed gripper).
 
 **Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
 demonstration, then track that object through the demonstration:**

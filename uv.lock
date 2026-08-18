@@ -1274,7 +1274,7 @@ dependencies = [
     { name = "pin" },
     { name = "pytorch-kinematics" },
     { name = "pyyaml" },
-    { name = "sapien", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+    { name = "sapien", marker = "sys_platform == 'darwin' or sys_platform == 'linux' or sys_platform == 'win32'" },
     { name = "scipy" },
     { name = "tabulate" },
     { name = "termcolor" },
@@ -1282,6 +1282,7 @@ dependencies = [
     { name = "transforms3d" },
     { name = "trimesh" },
     { name = "tyro" },
+    { name = "viser" },
 ]
 
 [package.metadata]
@@ -1313,6 +1314,7 @@ requires-dist = [
     { name = "pytest-xdist", extras = ["psutil"], marker = "extra == 'dev'" },
     { name = "pytorch-kinematics", specifier = "==0.7.6" },
     { name = "pyyaml" },
+    { name = "sapien", marker = "sys_platform == 'darwin'", specifier = ">=3.0.2" },
     { name = "sapien", marker = "sys_platform == 'linux'", specifier = ">=3.0.0" },
     { name = "sapien", marker = "sys_platform == 'win32'", specifier = ">=3.0.0b1" },
     { name = "scipy" },
@@ -1334,6 +1336,7 @@ requires-dist = [
     { name = "trimesh" },
     { name = "twine", marker = "extra == 'dev'" },
     { name = "tyro", specifier = ">=0.8.5" },
+    { name = "viser", specifier = ">=0.1.0" },
 ]
 provides-extras = ["dev", "docs"]
 
@@ -2562,6 +2565,7 @@ dependencies = [
     { name = "transforms3d" },
 ]
 wheels = [
+    { url = "https://files.pythonhosted.org/packages/6d/d2/f931aa6745663cee4b93ae71d83db08eb24550301e0ffa0c064682e5ae91/sapien-3.0.3-cp312-cp312-macosx_12_0_universal2.whl", hash = "sha256:331a749cc1aa2d869e9257d43a2f35899006cc5df0833a8b84b676b6f5afa396", size = 35652901, upload-time = "2026-03-10T08:34:40.326Z" },
     { url = "https://files.pythonhosted.org/packages/75/37/9b1c6fd9696225600d42b9f9b6727450283e4d4bbd1e665195b563d8f64b/sapien-3.0.3-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:98200797b2ac41bda48ca21cf89c9ebeb6a20e84f584013378ba45c844425ca5", size = 51299041, upload-time = "2026-03-10T08:34:49.457Z" },
     { url = "https://files.pythonhosted.org/packages/f4/59/68ca835587aa0e63235d48dcd6ef71dc4dd9ac98e0cd70394998c1cff297/sapien-3.0.3-cp312-cp312-win_amd64.whl", hash = "sha256:b9af3676cd76788d468ed7114e6496f16280393f25bb1b87665f14798a98f7e6", size = 44605281, upload-time = "2026-03-10T08:35:02.865Z" },
 ]
