@@ -83,6 +83,10 @@ end effector (`__` delimits robot vs EEF; `_` stays inside each token):
 Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
 are pinned at 0 (closed gripper).
 
+Robot masks: GroundedSAM runs on **frame 0** (union of the top `--sam-kmax` masks). That union is
+propagated through the rest of the trajectory with SAM `mask_input` plus the previous mask's bbox,
+so contact with an object does not expand the robot mask.
+
 **Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
 demonstration, then track that object through the demonstration:**
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.

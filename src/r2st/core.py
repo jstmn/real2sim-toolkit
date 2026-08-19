@@ -50,6 +50,7 @@ GROUNDING_DINO_CONFIG = _R2ST_DIR / "GroundingDINO" / "groundingdino" / "config"
 GROUNDING_DINO_CHECKPOINT = _R2ST_DIR / "models" / "groundingdino_swint_ogc.pth"
 SAM_CHECKPOINT = _R2ST_DIR / "models" / "sam_vit_h_4b8939.pth"
 SAM_VERSION = "vit_h"
+SAM_MASK_INPUT_HW = 256
 MESHY_ASSET_DIR = Path("data/meshyai")
 
 assert GROUNDING_DINO_CONFIG.is_file(), f"GroundingDINO config not found: {GROUNDING_DINO_CONFIG}"
@@ -128,6 +129,38 @@ def get_camera_extrinsic(camera_name: str, extrinsics: dict) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Pointcloud helpers (thin wrappers that degrade gracefully without open3d)
 # ---------------------------------------------------------------------------
+
+
+def bbox_xyxy_from_mask(mask: np.ndarray) -> np.ndarray:
+    """Axis-aligned XYXY box around nonzero pixels. ``x1``/``y1`` are exclusive."""
+    assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
+    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
+    assert mask.any(), "Cannot compute a bbox from an empty mask"
+    ys, xs = np.nonzero(mask)
+    x0 = int(xs.min())
+    y0 = int(ys.min())
+    x1 = int(xs.max()) + 1
+    y1 = int(ys.max()) + 1
+    box = np.array([x0, y0, x1, y1], dtype=np.float64)
+    assert box[2] > box[0] and box[3] > box[1], f"Degenerate bbox {box.tolist()}"
+    return box
+
+
+def binary_mask_to_sam_mask_input(mask: np.ndarray) -> np.ndarray:
+    """Resize a full-res bool mask to SAM's dense prompt: ``(1, 256, 256)`` float32."""
+    assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
+    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
+    assert mask.any(), "Cannot convert an empty mask to SAM mask_input"
+    resized = cv2.resize(
+        mask.astype(np.float32),
+        (SAM_MASK_INPUT_HW, SAM_MASK_INPUT_HW),
+        interpolation=cv2.INTER_LINEAR,
+    )
+    assert resized.shape == (
+        SAM_MASK_INPUT_HW,
+        SAM_MASK_INPUT_HW,
+    ), f"resized mask_input {resized.shape} != ({SAM_MASK_INPUT_HW}, {SAM_MASK_INPUT_HW})"
+    return resized[None, :, :].astype(np.float32)
 
 
 class GroundedSAMPredictor:
@@ -292,6 +325,49 @@ class GroundedSAMPredictor:
             print(f"Saving grounded SAM output to '{self._debug_output_dir}'")
             save_mask_image(image_rgb, self._debug_output_dir, masks, boxes_filt, pred_phrases)
         return masks_np, scores_np, phrases_sorted
+
+    def propagate_from_mask(
+        self,
+        image_bgr: np.ndarray,
+        mask_input: np.ndarray,
+        box_xyxy: np.ndarray,
+    ) -> tuple[np.ndarray, float, np.ndarray]:
+        """SAM-decode one mask on ``image_bgr`` from a previous mask prompt.
+
+        ``mask_input`` is SAM's dense prompt ``(1, 256, 256)``. ``box_xyxy`` is the
+        previous binary mask's XYXY box in pixel coordinates. GroundingDINO is not used.
+        """
+        assert self._sam_predictor is not None, "GroundedSAM predictor not loaded"
+        assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"image_bgr must be HxWx3, got {image_bgr.shape}"
+        assert mask_input.shape == (
+            1,
+            SAM_MASK_INPUT_HW,
+            SAM_MASK_INPUT_HW,
+        ), f"mask_input must be (1, {SAM_MASK_INPUT_HW}, {SAM_MASK_INPUT_HW}), got {mask_input.shape}"
+        assert np.isfinite(mask_input).all(), "mask_input contains non-finite values"
+        box_xyxy = np.asarray(box_xyxy, dtype=np.float64).reshape(4)
+        assert np.isfinite(box_xyxy).all(), f"box_xyxy contains non-finite values: {box_xyxy}"
+        assert box_xyxy[2] > box_xyxy[0] and box_xyxy[3] > box_xyxy[1], f"Degenerate box {box_xyxy.tolist()}"
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        self._sam_predictor.set_image(image_rgb)
+        masks, ious, low_res = self._sam_predictor.predict(
+            point_coords=None,
+            point_labels=None,
+            box=box_xyxy.astype(np.float32),
+            mask_input=mask_input.astype(np.float32),
+            multimask_output=False,
+        )
+        assert masks.ndim == 3 and masks.shape[0] == 1, f"Expected (1, H, W) masks, got {masks.shape}"
+        assert masks.shape[1:] == image_bgr.shape[:2], f"Mask {masks.shape[1:]} != image {image_bgr.shape[:2]}"
+        assert ious.shape == (1,), f"Expected one IoU, got {ious.shape}"
+        assert low_res.shape == (
+            1,
+            SAM_MASK_INPUT_HW,
+            SAM_MASK_INPUT_HW,
+        ), f"low_res must be (1, {SAM_MASK_INPUT_HW}, {SAM_MASK_INPUT_HW}), got {low_res.shape}"
+        mask = masks[0].astype(bool)
+        assert mask.any(), "SAM propagation produced an empty mask"
+        return mask, float(ious[0]), low_res.astype(np.float32)
 
     def get_sam_mask(self, image: np.ndarray, object_name: str) -> torch.Tensor:
         masks_np, _, _ = self.get_ranked_sam_masks(image, object_name)

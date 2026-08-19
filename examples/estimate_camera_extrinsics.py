@@ -13,15 +13,17 @@ FPS-downsampled once per sampled joint configuration, then mapped into the candi
 is the one-sided squared nearest-neighbor distance from pcd_real to pcd_sim.
 
 Notes:
-1. A preproccessing step is performed on the measured pointclouds to remove points that aren't part of the robot. To
-    do so, the mask of the robot is generated at each timestep and used to mask the pointcloud. See
-    ImageUtils.get_sam_mask for details.
+1. A preprocessing step is performed on the measured pointclouds to remove points that aren't part of the robot.
+    Frame 0 is GroundedSAM (union of top --sam-kmax masks). That union is then propagated through every later
+    RGB frame with SAM ``mask_input`` + the previous mask's bbox (no GroundingDINO after frame 0).
 2. If --visualize is set, a viser server is started. The server shows measured vs best-so-far
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
-3. if --visualize-robot-masks is set, debug PNGs are written for the SAM masks that enter the union.
-4. If --cache-robot-masks is set (default), the unioned mask is loaded from / saved to
-   `<h5_dir>/<h5_stem>/robot-mask__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
+3. if --visualize-robot-masks is set, debug PNGs are written for the frame-0 SAM masks that enter the union.
+4. If --cache-robot-masks is set (default), propagated masks are loaded from / saved to
+   `<h5_dir>/<h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
+    Frame 0's GroundedSAM union may also be read from the older
+    `robot-mask__<camera>__idx=0__...npy` seed cache.
 
 
 
@@ -83,7 +85,11 @@ from r2st.constants import (
     get_depth_intrinsics,
     get_depth_to_color_extrinsics,
 )
-from r2st.core import GroundedSAMPredictor
+from r2st.core import (
+    GroundedSAMPredictor,
+    bbox_xyxy_from_mask,
+    binary_mask_to_sam_mask_input,
+)
 from r2st.geometry import (
     camera_extrinsic_to_maniskill_pose,
     depth_mm_to_meters,
@@ -208,16 +214,16 @@ class Args:
     """CMA-ES population size. If unset, the cma library default is used."""
 
     robot_description: str = "robot arm"
-    """GroundedSAM text prompt used to mask the robot in each RGB frame."""
+    """GroundedSAM text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
 
     sam_kmax: int = 5
-    """Union at most this many highest-confidence SAM masks into the robot mask."""
+    """Union at most this many highest-confidence SAM masks into the frame-0 robot mask."""
 
     sam_score_threshold: float = 0.3
-    """Keep a top-k SAM mask in the union only if its confidence is strictly above this."""
+    """Keep a top-k SAM mask in the frame-0 union only if its confidence is strictly above this."""
 
     cache_robot_masks: bool = True
-    """If set, load/save the unioned robot mask as <h5_stem>/robot-mask__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
+    """If set, load/save propagated robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
 
     mask_erode_px: int = 7
     """Erode the robot mask with an elliptical kernel of this size (pixels) before unprojecting. 0 skips erosion."""
@@ -226,7 +232,7 @@ class Args:
     """If set, start a viser server with robot-base pointclouds, camera frustum, and a cost plot."""
 
     visualize_robot_masks: bool = False
-    """If set, write debug PNGs for the SAM masks that enter the union (top --sam-kmax with score above --sam-score-threshold)."""
+    """If set, write debug PNGs for the frame-0 SAM masks that enter the union (top --sam-kmax with score above --sam-score-threshold)."""
 
 
 def _log_elapsed(label: str, t0: float) -> None:
@@ -249,6 +255,155 @@ def _robot_mask_cache_path(
         / h5_path.stem
         / f"robot-mask__{camera}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
     )
+
+
+def _propagated_robot_mask_cache_path(
+    h5_path: pathlib.Path,
+    camera: str,
+    frame_idx: int,
+    kmax: int,
+    score_threshold: float,
+) -> pathlib.Path:
+    return (
+        h5_path.parent
+        / h5_path.stem
+        / f"robot-mask-propagated__{camera}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
+    )
+
+
+def _load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int]) -> np.ndarray:
+    mask = np.load(path)
+    assert isinstance(mask, np.ndarray), f"{path}: expected ndarray, got {type(mask)}"
+    assert mask.shape == hw, f"{path}: mask shape {mask.shape} != {hw}"
+    assert mask.dtype == bool, f"{path}: mask dtype must be bool, got {mask.dtype}"
+    assert mask.any(), f"{path}: cached robot mask is empty"
+    return mask
+
+
+def _propagate_robot_masks(rgb: np.ndarray, predictor: GroundedSAMPredictor, seed_mask: np.ndarray) -> np.ndarray:
+    """Propagate ``seed_mask`` (frame 0) through ``rgb`` with SAM mask_input + bbox."""
+    assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
+    n_frames, height, width, _ = rgb.shape
+    assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
+    assert seed_mask.shape == (height, width), f"seed_mask {seed_mask.shape} != image {(height, width)}"
+    assert seed_mask.dtype == bool, f"seed_mask dtype must be bool, got {seed_mask.dtype}"
+    assert seed_mask.any(), "seed_mask is empty"
+    masks = np.zeros((n_frames, height, width), dtype=bool)
+    masks[0] = seed_mask
+    mask_input = binary_mask_to_sam_mask_input(seed_mask)
+    prev_mask = seed_mask
+    for t in tqdm(range(1, n_frames), desc="Propagate robot masks"):
+        image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
+        box = bbox_xyxy_from_mask(prev_mask)
+        mask, score, low_res = predictor.propagate_from_mask(image_bgr, mask_input, box)
+        assert mask.shape == (height, width), f"frame {t}: mask {mask.shape} != {(height, width)}"
+        print(f"[info] Propagated robot mask to frame {t} score={score:.4f} pixels={int(mask.sum())}/{mask.size}")
+        masks[t] = mask
+        mask_input = low_res
+        prev_mask = mask
+    return masks
+
+
+def _compute_propagated_robot_masks(
+    rgb: np.ndarray,
+    h5_path: pathlib.Path,
+    camera: str,
+    robot_description: str,
+    sam_kmax: int,
+    sam_score_threshold: float,
+    cache_robot_masks: bool,
+    visualize_robot_masks: bool,
+) -> np.ndarray:
+    """Return ``(T, H, W)`` robot masks. Frame 0 is GroundedSAM; later frames are SAM-propagated."""
+    assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
+    n_frames, height, width, _ = rgb.shape
+    assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
+    hw = (height, width)
+    propagated_paths = [
+        _propagated_robot_mask_cache_path(h5_path, camera, t, sam_kmax, sam_score_threshold) for t in range(n_frames)
+    ]
+    if cache_robot_masks and all(path.is_file() for path in propagated_paths):
+        masks = np.stack([_load_cached_bool_mask(path, hw) for path in propagated_paths], axis=0)
+        print(f"[info] Loaded {n_frames} propagated robot masks from cache")
+    else:
+        seed_path = _robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold)
+        predictor: GroundedSAMPredictor | None = None
+        if cache_robot_masks and seed_path.is_file():
+            seed_mask = _load_cached_bool_mask(seed_path, hw)
+            print(f"[info] Loaded frame-0 robot mask from {seed_path}")
+        else:
+            print("[info] Loading GroundedSAM on cpu ...")
+            t0 = time.perf_counter()
+            predictor = GroundedSAMPredictor(device="cpu")
+            _log_elapsed("GroundedSAM loaded", t0)
+            image_bgr0 = cv2.cvtColor(rgb[0], cv2.COLOR_RGB2BGR)
+            print(f"[info] Segmenting '{robot_description}' on frame 0 ...")
+            t0 = time.perf_counter()
+            ranked_masks, scores, phrases = ImageUtils.get_sam_masks_ranked(predictor, image_bgr0, robot_description)
+            _log_elapsed(f"Segmented '{robot_description}' on frame 0 ({ranked_masks.shape[0]} masks)", t0)
+            for rank in range(min(sam_kmax, ranked_masks.shape[0])):
+                print(
+                    f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
+                    f"pixels={int(ranked_masks[rank].sum())}"
+                )
+            seed_mask = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
+            if visualize_robot_masks:
+                _dump_top_sam_masks(
+                    image_bgr0,
+                    ranked_masks,
+                    scores,
+                    phrases,
+                    h5_path.parent,
+                    camera,
+                    0,
+                    sam_kmax,
+                    sam_score_threshold,
+                )
+            if cache_robot_masks:
+                seed_path.parent.mkdir(parents=True, exist_ok=True)
+                np.save(seed_path, seed_mask)
+                print(f"[info] Saved frame-0 robot mask to {seed_path}")
+
+        if n_frames == 1:
+            masks = seed_mask[None, ...]
+        else:
+            if predictor is None:
+                print("[info] Loading GroundedSAM on cpu ...")
+                t0 = time.perf_counter()
+                predictor = GroundedSAMPredictor(device="cpu")
+                _log_elapsed("GroundedSAM loaded", t0)
+            print(f"[info] Propagating frame-0 robot mask through {n_frames} frames ...")
+            t0 = time.perf_counter()
+            masks = _propagate_robot_masks(rgb, predictor, seed_mask)
+            _log_elapsed(f"Propagated robot mask through {n_frames} frames", t0)
+        assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
+        if cache_robot_masks:
+            propagated_paths[0].parent.mkdir(parents=True, exist_ok=True)
+            for t, path in enumerate(propagated_paths):
+                np.save(path, masks[t])
+            print(f"[info] Saved {n_frames} propagated robot masks")
+    _save_propagated_mask_demo_overlays(rgb, masks, h5_path, camera, sam_kmax, sam_score_threshold)
+    return masks
+
+
+def _save_propagated_mask_demo_overlays(
+    rgb: np.ndarray,
+    masks: np.ndarray,
+    h5_path: pathlib.Path,
+    camera: str,
+    kmax: int,
+    score_threshold: float,
+) -> None:
+    """Write a dimmed-mask demo PNG for every trajectory frame."""
+    assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
+    n_frames, height, width, _ = rgb.shape
+    assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
+    for t in range(n_frames):
+        image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
+        overlay_path = _propagated_robot_mask_cache_path(h5_path, camera, t, kmax, score_threshold).with_suffix(
+            ".demo.png"
+        )
+        ImageUtils.save_demo_overlay(image_bgr, masks[t], overlay_path)
 
 
 def _union_top_sam_masks(
@@ -1517,69 +1672,43 @@ def main(args: Args) -> None:
     ), f"depth_m_sel shape {depth_m_sel.shape} != ({args.n_timesteps}, {H}, {W})"
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    predictor: GroundedSAMPredictor | None = None
     pcd_reals: list[np.ndarray] = []
     demo_frames: list[np.ndarray] = []
     t0_masks = time.perf_counter()
+    masks_all = _compute_propagated_robot_masks(
+        rgb_all,
+        args.h5_path,
+        args.camera,
+        args.robot_description,
+        args.sam_kmax,
+        args.sam_score_threshold,
+        args.cache_robot_masks,
+        args.visualize_robot_masks,
+    )
+    assert masks_all.shape == (
+        n_frames,
+        H,
+        W,
+    ), f"masks_all {masks_all.shape} != ({n_frames}, {H}, {W})"
     for i, frame_idx in enumerate(fps_idx):
-        image_bgr = cv2.cvtColor(rgb_sel[i], cv2.COLOR_RGB2BGR)
-        cache_path = _robot_mask_cache_path(
-            args.h5_path, args.camera, int(frame_idx), args.sam_kmax, args.sam_score_threshold
-        )
-        if args.cache_robot_masks and cache_path.is_file():
-            mask = np.load(cache_path)
-            assert isinstance(mask, np.ndarray), f"{cache_path}: expected ndarray, got {type(mask)}"
-            assert (
-                mask.shape == image_bgr.shape[:2]
-            ), f"{cache_path}: mask shape {mask.shape} != image {image_bgr.shape[:2]}"
-            assert mask.dtype == bool, f"{cache_path}: mask dtype must be bool, got {mask.dtype}"
-            print(f"[info] Loaded robot mask from {cache_path}")
-        else:
-            if predictor is None:
-                print("[info] Loading GroundedSAM on cpu ...")
-                t0 = time.perf_counter()
-                predictor = GroundedSAMPredictor(device="cpu")
-                _log_elapsed("GroundedSAM loaded", t0)
-            print(f"[info] Segmenting '{args.robot_description}' on frame {int(frame_idx)} ...")
-            t0 = time.perf_counter()
-            masks, scores, phrases = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, args.robot_description)
-            _log_elapsed(f"Segmented '{args.robot_description}' on frame {int(frame_idx)} ({masks.shape[0]} masks)", t0)
-            for rank in range(min(args.sam_kmax, masks.shape[0])):
-                print(
-                    f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
-                    f"pixels={int(masks[rank].sum())}"
-                )
-            mask = _union_top_sam_masks(masks, scores, args.sam_kmax, args.sam_score_threshold)
-            if args.visualize_robot_masks:
-                _dump_top_sam_masks(
-                    image_bgr,
-                    masks,
-                    scores,
-                    phrases,
-                    args.h5_path.parent,
-                    args.camera,
-                    int(frame_idx),
-                    args.sam_kmax,
-                    args.sam_score_threshold,
-                )
-            if args.cache_robot_masks:
-                cache_path.parent.mkdir(parents=True, exist_ok=True)
-                np.save(cache_path, mask)
-                print(f"[info] Saved robot mask to {cache_path}")
-        assert mask.any(), f"Empty robot mask at frame {int(frame_idx)} for prompt {args.robot_description!r}"
+        frame_idx = int(frame_idx)
+        mask = masks_all[frame_idx]
+        assert mask.any(), f"Empty robot mask at frame {frame_idx} for prompt {args.robot_description!r}"
         n_mask = int(mask.sum())
         mask = _erode_mask(mask, args.mask_erode_px)
-        print(f"[info] Mask pixels: {n_mask} -> {int(mask.sum())} / {mask.size} (erode_px={args.mask_erode_px})")
+        print(
+            f"[info] Frame {frame_idx} mask pixels: {n_mask} -> {int(mask.sum())} / {mask.size} "
+            f"(erode_px={args.mask_erode_px})"
+        )
         demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
-        ImageUtils.save_demo_overlay(image_bgr, mask, cache_path.with_suffix(".demo.png"))
         pts = masked_depth_to_points(depth_m_sel[i], mask, K)
         pts = _subsample_pcd(pts, args.n_pcd_samples, args.n_random_downsample_initial, chamfer_device, rng)
-        assert pts.shape[0] >= 1, f"No robot points at frame {int(frame_idx)}"
+        assert pts.shape[0] >= 1, f"No robot points at frame {frame_idx}"
         pcd_reals.append(pts)
         print(f"[info] pcd_real[{i}] n={pts.shape[0]}")
     assert len(demo_frames) == args.n_timesteps, f"demo_frames {len(demo_frames)} != n_timesteps {args.n_timesteps}"
     demo_sel = np.stack(demo_frames, axis=0)
-    _log_elapsed(f"Segmented {args.n_timesteps} frames on cpu", t0_masks)
+    _log_elapsed(f"Built robot masks for {n_frames} frames; used {args.n_timesteps} sampled frames", t0_masks)
 
     print(f"[info] Loading Jrl2 robot '{args.robot_id}' ...")
     t0 = time.perf_counter()

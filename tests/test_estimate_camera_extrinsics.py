@@ -8,9 +8,12 @@ from examples.estimate_camera_extrinsics import (
     _SEED_LOOKAT_TARGET,
     _SEED_UP,
     _axis_aligned_capture_poses,
+    _compute_propagated_robot_masks,
     _expand_demo_qpos_to_joint_names,
     _look_at_opencv,
     _look_at_with_roll,
+    _propagate_robot_masks,
+    _propagated_robot_mask_cache_path,
     _step_pose_world,
     _transform_points,
     _validate_seed_mode,
@@ -180,3 +183,70 @@ def test_expand_demo_qpos_rejects_pin_outside_limits():
     )
     with pytest.raises(AssertionError, match="Cannot pin EEF joint"):
         _expand_demo_qpos_to_joint_names(np.zeros((1, 1)), robot, ["joint1", "finger"])
+
+
+class _FakePropagatePredictor:
+    def __init__(self):
+        self.calls: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+
+    def propagate_from_mask(self, image_bgr, mask_input, box_xyxy):
+        self.calls.append((np.asarray(image_bgr).copy(), np.asarray(mask_input).copy(), np.asarray(box_xyxy).copy()))
+        t = len(self.calls)
+        height, width = image_bgr.shape[:2]
+        mask = np.zeros((height, width), dtype=bool)
+        mask[2 : 2 + t, 3 : 5 + t] = True
+        low_res = np.full((1, 256, 256), float(t), dtype=np.float32)
+        return mask, 0.9, low_res
+
+
+def test_propagate_robot_masks_feeds_union_then_logits():
+    from r2st.core import bbox_xyxy_from_mask, binary_mask_to_sam_mask_input
+
+    rgb = np.zeros((3, 16, 20, 3), dtype=np.uint8)
+    rgb[1] = 1
+    rgb[2] = 2
+    seed = np.zeros((16, 20), dtype=bool)
+    seed[4:8, 6:11] = True
+    predictor = _FakePropagatePredictor()
+    out = _propagate_robot_masks(rgb, predictor, seed)
+    assert out.shape == (3, 16, 20)
+    assert np.array_equal(out[0], seed)
+    assert len(predictor.calls) == 2
+    _, mask_input0, box0 = predictor.calls[0]
+    assert np.allclose(mask_input0, binary_mask_to_sam_mask_input(seed))
+    assert np.allclose(box0, bbox_xyxy_from_mask(seed))
+    expected1 = np.zeros((16, 20), dtype=bool)
+    expected1[2:3, 3:6] = True
+    expected2 = np.zeros((16, 20), dtype=bool)
+    expected2[2:4, 3:7] = True
+    assert np.array_equal(out[1], expected1)
+    assert np.array_equal(out[2], expected2)
+    _, mask_input1, box1 = predictor.calls[1]
+    assert np.allclose(mask_input1, np.full((1, 256, 256), 1.0, dtype=np.float32))
+    assert np.allclose(box1, bbox_xyxy_from_mask(expected1))
+
+
+def test_propagate_robot_masks_rejects_empty_seed():
+    rgb = np.zeros((2, 8, 8, 3), dtype=np.uint8)
+    with pytest.raises(AssertionError, match="empty"):
+        _propagate_robot_masks(rgb, _FakePropagatePredictor(), np.zeros((8, 8), dtype=bool))
+
+
+def test_compute_propagated_robot_masks_loads_full_cache(tmp_path):
+    n_frames, height, width = 3, 8, 10
+    rgb = np.zeros((n_frames, height, width, 3), dtype=np.uint8)
+    h5_path = tmp_path / "merged_sensor_data.h5"
+    cache_dir = tmp_path / "merged_sensor_data"
+    cache_dir.mkdir()
+    expected = []
+    for t in range(n_frames):
+        mask = np.zeros((height, width), dtype=bool)
+        mask[1:3, 1 + t : 4 + t] = True
+        expected.append(mask)
+        path = _propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3)
+        np.save(path, mask)
+    out = _compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
+    assert np.array_equal(out, np.stack(expected, axis=0))
+    for t in range(n_frames):
+        overlay = _propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3).with_suffix(".demo.png")
+        assert overlay.is_file(), f"missing demo overlay {overlay}"
