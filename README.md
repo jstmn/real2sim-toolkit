@@ -7,7 +7,7 @@ This repository is an API for creating and maintaining a digital twin of a physi
 ```bash
 # Download model weights
 wget --no-check-certificate https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -O src/r2st/models/sam_vit_h_4b8939.pth
-wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth -O src/r2st/models/groundingdino_swint_ogc.pth
+wget --no-check-certificate https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth -O src/r2st/models/groundingdino_swint_ogc.pth
 gcloud storage cp --recursive gs://r2st-public/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/
 gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/FoundationPose/weights/
 
@@ -15,26 +15,24 @@ gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/Foun
 export MESHY_API_KEY=your_meshy_api_key
 export OPENAI_API_KEY=your_openai_api_key
 
-# Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-# The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
-# current-gen GPUs (e.g. RTX 50-series/Blackwell); pinning to your driver/GPU isn't needed b/c
-# CUDA 12.8 covers everything back through sm_70.
-cd src/r2st/FoundationPose/docker
-docker build --network host -t foundationpose -f dockerfile ..
-bash run_container.sh
-# In the docker container:
-cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
-
-# Clone ManiSkill and Jrl2
+# Clone ManiSkill and Jrl2 (required before `uv sync`)
 git clone git@github.com:jstmn/ManiSkill.git thirdparty/ManiSkill
 git clone git@github.com:jstmn/Jrl2.git thirdparty/Jrl2
 
 # Initialize uv
 uv sync
 
-
-uv run python src/r2st/GroundingDINO/setup.py develop
-
+# Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+# The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
+# current-gen GPUs (e.g. RTX 50-series/Blackwell). That covers GPU *architectures* back through
+# sm_70; the host NVIDIA *driver* still needs to be new enough for CUDA 12.8 (Linux driver >= 570).
+# Check with `nvidia-smi` (CUDA Version in the header). Driver 550 is CUDA 12.4 and will fail
+# inside the container with CUDA error 804.
+cd src/r2st/FoundationPose/docker
+docker build --network host -t foundationpose -f dockerfile ..
+bash run_container.sh
+# In the docker container:
+cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 ```
 
 ## Examples
@@ -128,7 +126,10 @@ uv run python examples/track_object.py \
 
 ## Pose tracking (gRPC)
 
+Start the server inside the FoundationPose container (`bash run_container.sh` from `src/r2st/FoundationPose/docker`):
+
 ```bash
+cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 ```
 
 Then, on the host:
@@ -174,3 +175,17 @@ docker info | grep -iA3 Runtimes   # confirm "nvidia" shows up
 ```
 
 Error building `kaolin`/`pytorch3d` inside the container: `nvcc fatal: Unsupported gpu architecture 'compute_XX'` or a PyTorch warning that your GPU's CUDA capability (e.g. `sm_120` for RTX 50-series/Blackwell) isn't supported by the current PyTorch install. This means the image's CUDA/PyTorch versions predate your GPU's architecture — rebuild the image from `src/r2st/FoundationPose/docker/dockerfile` (already pinned to CUDA 12.8 + PyTorch 2.8, which covers everything through Blackwell); don't `docker pull` an older prebuilt image.
+
+Error inside the container: `CUDA initialization: ... Error 804: forward compatibility was attempted on non supported HW`, or on the host: `The NVIDIA driver on your system is too old`. CUDA 12.8 userspace needs a driver that reports CUDA >= 12.8 (typically 570+). `nvidia-smi` showing CUDA 12.4 / driver 550 is too old; upgrading the driver is required — rebuilding the image will not help.
+
+`gcloud storage cp` fails with `Reauthentication failed`: run `gcloud auth login`. The `r2st-public` bucket is also readable without gcloud:
+
+```bash
+mkdir -p src/r2st/FoundationPose/weights/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/2023-10-28-18-33-37
+wget --no-check-certificate -O src/r2st/FoundationPose/weights/2024-01-11-20-02-45/config.yml https://storage.googleapis.com/r2st-public/2024-01-11-20-02-45/config.yml
+wget --no-check-certificate -O src/r2st/FoundationPose/weights/2024-01-11-20-02-45/model_best.pth https://storage.googleapis.com/r2st-public/2024-01-11-20-02-45/model_best.pth
+wget --no-check-certificate -O src/r2st/FoundationPose/weights/2023-10-28-18-33-37/config.yml https://storage.googleapis.com/r2st-public/2023-10-28-18-33-37/config.yml
+wget --no-check-certificate -O src/r2st/FoundationPose/weights/2023-10-28-18-33-37/model_best.pth https://storage.googleapis.com/r2st-public/2023-10-28-18-33-37/model_best.pth
+```
+
+`docker build` fails with `docker-credential-pass: executable file not found in $PATH`: `credsStore` in `~/.docker/config.json` is `pass`, but the helper is not on `PATH`. Put `$HOME/.local/bin` on `PATH` (a literal `~/.local/bin` in PATH is not expanded) and retry.
