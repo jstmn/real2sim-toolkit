@@ -23,15 +23,51 @@ import glob
 import os
 import subprocess
 
+cwd = os.path.dirname(os.path.abspath(__file__))
+
+
+def _pip_cuda_home() -> str:
+    """CUDA toolkit root shipped by `cuda-toolkit[nvcc]` (nvidia/cuXX/{bin,include,lib})."""
+    import nvidia
+
+    homes = []
+    for root in nvidia.__path__:
+        if not os.path.isdir(root):
+            continue
+        for name in sorted(os.listdir(root)):
+            candidate = os.path.join(root, name)
+            if os.path.isfile(os.path.join(candidate, "bin", "nvcc")):
+                homes.append(candidate)
+    assert homes, (
+        "nvcc not found under the nvidia pip packages. "
+        "Run `uv sync` (this project depends on cuda-toolkit[nvcc]) or set CUDA_HOME."
+    )
+    return homes[-1]
+
+
+def _ensure_cuda_home() -> str:
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    if cuda_home is None:
+        cuda_home = _pip_cuda_home()
+    nvcc = os.path.join(cuda_home, "bin", "nvcc")
+    assert os.path.isfile(nvcc), (
+        f"nvcc not found at {nvcc}. Install cuda-toolkit[nvcc] (`uv sync`) or set CUDA_HOME "
+        "to a CUDA toolkit that contains bin/nvcc."
+    )
+    os.environ["CUDA_HOME"] = cuda_home
+    os.environ["PATH"] = os.path.join(cuda_home, "bin") + os.pathsep + os.environ.get("PATH", "")
+    return cuda_home
+
+
+_ensure_cuda_home()
+
 import torch
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import CUDA_HOME, CppExtension, CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME, CUDAExtension
 
 # groundingdino version info
 version = "0.1.0"
 package_name = "groundingdino"
-cwd = os.path.dirname(os.path.abspath(__file__))
-
 
 sha = "Unknown"
 try:
@@ -44,69 +80,61 @@ def write_version_file():
     version_path = os.path.join(cwd, "groundingdino", "version.py")
     with open(version_path, "w") as f:
         f.write(f"__version__ = '{version}'\n")
-        # f.write(f"git_version = {repr(sha)}\n")
-
-
-requirements = ["torch", "torchvision"]
-
-torch_ver = [int(x) for x in torch.__version__.split(".")[:2]]
 
 
 def get_extensions():
-    this_dir = os.path.dirname(os.path.abspath(__file__))
-    extensions_dir = os.path.join(this_dir, "groundingdino", "models", "GroundingDINO", "csrc")
+    assert CUDA_HOME is not None, "CUDA_HOME is None after _ensure_cuda_home()"
+    extensions_dir = os.path.join(cwd, "groundingdino", "models", "GroundingDINO", "csrc")
+    assert os.path.isdir(extensions_dir), f"GroundingDINO csrc not found: {extensions_dir}"
 
-    main_source = os.path.join(extensions_dir, "vision.cpp")
-    sources = glob.glob(os.path.join(extensions_dir, "**", "*.cpp"))
-    source_cuda = glob.glob(os.path.join(extensions_dir, "**", "*.cu")) + glob.glob(
-        os.path.join(extensions_dir, "*.cu")
-    )
+    sources = sorted(set(glob.glob(os.path.join(extensions_dir, "**", "*.cpp"), recursive=True)))
+    source_cuda = sorted(set(glob.glob(os.path.join(extensions_dir, "**", "*.cu"), recursive=True)))
+    assert sources, f"No C++ sources under {extensions_dir}"
+    assert source_cuda, f"No CUDA sources under {extensions_dir}"
 
-    sources = [main_source] + sources
+    cuda_lib = os.path.join(CUDA_HOME, "lib64")
+    if not os.path.isdir(cuda_lib):
+        cuda_lib = os.path.join(CUDA_HOME, "lib")
+    assert os.path.isdir(cuda_lib), f"CUDA lib directory not found under {CUDA_HOME}"
 
-    # We need these variables to build with CUDA when we create the Docker image
-    # It solves https://github.com/IDEA-Research/Grounded-Segment-Anything/issues/53
-    # and https://github.com/IDEA-Research/Grounded-Segment-Anything/issues/84 when running
-    # inside a Docker container.
-    am_i_docker = os.environ.get("AM_I_DOCKER", "").casefold() in ["true", "1", "t"]
-    use_cuda = os.environ.get("BUILD_WITH_CUDA", "").casefold() in ["true", "1", "t"]
+    # pip cuda-toolkit ships libcudart.so.13 with no unversioned libcudart.so; the linker still
+    # looks for -lcudart. Point at a local stub dir with those names.
+    stub_dir = os.path.join(cwd, "build", "cuda_lib")
+    os.makedirs(stub_dir, exist_ok=True)
+    for name in os.listdir(cuda_lib):
+        if ".so." not in name:
+            continue
+        unversioned = name.split(".so.")[0] + ".so"
+        dest = os.path.join(stub_dir, unversioned)
+        src = os.path.join(cuda_lib, name)
+        if os.path.islink(dest) or os.path.isfile(dest):
+            continue
+        os.symlink(src, dest)
 
-    extension = CppExtension
-
-    extra_compile_args = {"cxx": []}
-    define_macros = []
-
-    if (torch.cuda.is_available() and CUDA_HOME is not None) or (am_i_docker and use_cuda):
-        print("Compiling with CUDA")
-        extension = CUDAExtension
-        sources += source_cuda
-        define_macros += [("WITH_CUDA", None)]
-        extra_compile_args["nvcc"] = [
+    print(f"Compiling GroundingDINO CUDA ops with CUDA_HOME={CUDA_HOME}")
+    extra_compile_args = {
+        "cxx": [],
+        "nvcc": [
             "-DCUDA_HAS_FP16=1",
             "-D__CUDA_NO_HALF_OPERATORS__",
             "-D__CUDA_NO_HALF_CONVERSIONS__",
             "-D__CUDA_NO_HALF2_OPERATORS__",
-        ]
-    else:
-        print("Compiling without CUDA")
-        define_macros += [("WITH_HIP", None)]
-        extra_compile_args["nvcc"] = []
-        return None
-
-    sources = [os.path.join(extensions_dir, s) for s in sources]
-    include_dirs = [extensions_dir]
-
-    ext_modules = [
-        extension(
+        ],
+    }
+    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    assert os.path.isdir(torch_lib), f"torch lib directory not found: {torch_lib}"
+    rpath_args = [f"-Wl,-rpath,{torch_lib}", f"-Wl,-rpath,{cuda_lib}"]
+    return [
+        CUDAExtension(
             "groundingdino._C",
-            sources,
-            include_dirs=include_dirs,
-            define_macros=define_macros,
+            sources + source_cuda,
+            include_dirs=[extensions_dir],
+            define_macros=[("WITH_CUDA", None)],
             extra_compile_args=extra_compile_args,
+            extra_link_args=rpath_args,
+            library_dirs=[stub_dir, cuda_lib, torch_lib],
         )
     ]
-
-    return ext_modules
 
 
 def parse_requirements(fname="requirements.txt", with_version=True):
@@ -189,9 +217,12 @@ def parse_requirements(fname="requirements.txt", with_version=True):
 
 if __name__ == "__main__":
     print(f"Building wheel {package_name}-{version}")
+    os.chdir(cwd)
 
-    with open("src/r2st/GroundingDINO/LICENSE", "r", encoding="utf-8") as f:
-        license = f.read()
+    license_path = os.path.join(cwd, "LICENSE")
+    assert os.path.isfile(license_path), f"LICENSE not found: {license_path}"
+    with open(license_path, "r", encoding="utf-8") as f:
+        license_text = f.read()
 
     write_version_file()
 
@@ -201,8 +232,8 @@ if __name__ == "__main__":
         author="International Digital Economy Academy, Shilong Liu",
         url="https://github.com/IDEA-Research/GroundingDINO",
         description="open-set object detector",
-        license=license,
-        install_requires=parse_requirements("requirements.txt"),
+        license=license_text,
+        install_requires=parse_requirements(os.path.join(cwd, "requirements.txt")),
         packages=find_packages(
             exclude=(
                 "configs",

@@ -11,7 +11,7 @@ wget --no-check-certificate https://github.com/IDEA-Research/GroundingDINO/relea
 gcloud storage cp --recursive gs://r2st-public/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/
 gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/FoundationPose/weights/
 
-# Set your Meshy and OpenAI API keys (recommended to add to your ~/.bashrc)
+# Set your Meshy and OpenAI API keys (recommend adding to ~/.bashrc)
 export MESHY_API_KEY=your_meshy_api_key
 export OPENAI_API_KEY=your_openai_api_key
 
@@ -21,6 +21,9 @@ git clone git@github.com:jstmn/Jrl2.git thirdparty/Jrl2
 
 # Initialize uv
 uv sync
+
+# Optional: build GroundingDINO CUDA ops (faster GPU GroundedSAM; PyTorch fallback is used if skipped)
+uv run python src/r2st/GroundingDINO/setup.py build_ext --inplace
 
 # Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support

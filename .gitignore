@@ -18,6 +18,7 @@ data/*/
 src/r2st/FoundationPose-plus-plus/
 temp.sh
 src/r2st/FoundationPose/weights/*
+src/r2st/GroundingDINO/groundingdino/*.so
 
 *.code-workspace
 thirdparty/*/
