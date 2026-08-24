@@ -12,8 +12,10 @@ from examples.estimate_camera_extrinsics import (
     _expand_demo_qpos_to_joint_names,
     _look_at_opencv,
     _look_at_with_roll,
+    _n_consecutive_cached_masks,
     _propagate_robot_masks,
     _propagated_robot_mask_cache_path,
+    _propagated_robot_mask_video_path,
     _step_pose_world,
     _transform_points,
     _validate_seed_mode,
@@ -232,6 +234,26 @@ def test_propagate_robot_masks_rejects_empty_seed():
         _propagate_robot_masks(rgb, _FakePropagatePredictor(), np.zeros((8, 8), dtype=bool))
 
 
+def test_propagate_robot_masks_writes_cache_each_frame(tmp_path):
+    rgb = np.zeros((3, 16, 20, 3), dtype=np.uint8)
+    seed = np.zeros((16, 20), dtype=bool)
+    seed[4:8, 6:11] = True
+    cache_paths = [tmp_path / f"mask_{t}.npy" for t in range(3)]
+    out = _propagate_robot_masks(rgb, _FakePropagatePredictor(), seed, cache_paths=cache_paths)
+    for t, path in enumerate(cache_paths):
+        assert path.is_file(), f"missing cache {path}"
+        assert np.array_equal(np.load(path), out[t])
+
+
+def test_n_consecutive_cached_masks_stops_at_first_gap(tmp_path):
+    paths = [tmp_path / f"mask_{t}.npy" for t in range(4)]
+    for t in (0, 1, 3):
+        (tmp_path / f"mask_{t}.npy").write_bytes(b"x")
+    assert _n_consecutive_cached_masks(paths) == 2
+    assert _n_consecutive_cached_masks([]) == 0
+    assert _n_consecutive_cached_masks([tmp_path / "missing.npy"]) == 0
+
+
 def test_compute_propagated_robot_masks_loads_full_cache(tmp_path):
     n_frames, height, width = 3, 8, 10
     rgb = np.zeros((n_frames, height, width, 3), dtype=np.uint8)
@@ -250,3 +272,34 @@ def test_compute_propagated_robot_masks_loads_full_cache(tmp_path):
     for t in range(n_frames):
         overlay = _propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3).with_suffix(".demo.png")
         assert overlay.is_file(), f"missing demo overlay {overlay}"
+    video_path = _propagated_robot_mask_video_path(h5_path, "cam_1", 5, 0.3)
+    assert video_path.is_file(), f"missing robot-mask video {video_path}"
+    assert video_path.stat().st_size > 0, f"empty robot-mask video {video_path}"
+
+
+def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, monkeypatch):
+    import examples.estimate_camera_extrinsics as ece
+
+    n_frames, height, width = 3, 8, 10
+    rgb = np.zeros((n_frames, height, width, 3), dtype=np.uint8)
+    h5_path = tmp_path / "merged_sensor_data.h5"
+    (tmp_path / "merged_sensor_data").mkdir()
+    cached = []
+    for t in range(2):
+        mask = np.zeros((height, width), dtype=bool)
+        mask[1:3, 1 + t : 4 + t] = True
+        cached.append(mask)
+        np.save(_propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3), mask)
+
+    fake = _FakePropagatePredictor()
+    monkeypatch.setattr(ece, "_load_grounded_sam", lambda: fake)
+    out = ece._compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
+    assert np.array_equal(out[0], cached[0])
+    assert np.array_equal(out[1], cached[1])
+    assert len(fake.calls) == 1
+    expected2 = np.zeros((height, width), dtype=bool)
+    expected2[2:3, 3:6] = True
+    assert np.array_equal(out[2], expected2)
+    path2 = _propagated_robot_mask_cache_path(h5_path, "cam_1", 2, 5, 0.3)
+    assert path2.is_file()
+    assert np.array_equal(np.load(path2), expected2)

@@ -19,6 +19,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from termcolor import colored
 from torch import nn
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
@@ -28,6 +29,11 @@ try:
     from ... import _C
 except ImportError:
     _C = None
+
+if _C is None:
+    print(colored("[info] GroundingDINO _C CUDA ops are not built; using PyTorch fallback", "blue"))
+else:
+    print(colored("[info] GroundingDINO _C CUDA ops are built", "green"))
 
 
 # helpers

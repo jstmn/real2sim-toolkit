@@ -181,7 +181,10 @@ class GroundedSAMPredictor:
             sam_model_registry,
         )
 
-        self._device = device or "cpu"
+        if device is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+        assert device in ("cpu", "cuda"), f"device must be 'cpu' or 'cuda', got {device!r}"
+        self._device = device
         self._box_threshold = box_threshold
         self._text_threshold = text_threshold
         self._bert_model = self._load_bert_model(
@@ -192,6 +195,14 @@ class GroundedSAMPredictor:
         )
         assert self._bert_model is not None, "GroundedSAM bert model not loaded"
         assert self._sam_predictor is not None, "GroundedSAM predictor not loaded"
+        from termcolor import colored
+
+        sam_dev = self._sam_predictor.model.device
+        if sam_dev.type == "cuda":
+            sam_where = f"GPU ({sam_dev})"
+        else:
+            sam_where = "CPU"
+        print(colored(f"[info] SAM is using {sam_where}", "yellow"))
 
     @staticmethod
     def _load_bert_model(model_config_path: str, model_checkpoint_path: str, bert_base_uncased_path, device: str):

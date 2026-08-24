@@ -36,6 +36,12 @@ docker build --network host -t foundationpose -f dockerfile ..
 bash run_container.sh
 # In the docker container:
 cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
+
+
+### OPTIONAL
+# Download saved demonstrations (used by Examples 2 and 3). You need to be logged into Google Cloud Platform to do this. Run `gcloud auth login` to do so.
+mkdir -p data
+gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 ```
 
 ## Examples
@@ -95,11 +101,6 @@ Note: FoundationPose runs inside the Docker container (see Installation above), 
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
 
 ```bash
-# First download the saved demonstrations to data/0802
-mkdir -p data
-gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
-
-
 # Start the server (`cd src/r2st/FoundationPose/docker; bash run_container.sh`), then in the container:
 cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
@@ -181,14 +182,6 @@ Error building `kaolin`/`pytorch3d` inside the container: `nvcc fatal: Unsupport
 
 Error inside the container: `CUDA initialization: ... Error 804: forward compatibility was attempted on non supported HW`, or on the host: `The NVIDIA driver on your system is too old`. CUDA 12.8 userspace needs a driver that reports CUDA >= 12.8 (typically 570+). `nvidia-smi` showing CUDA 12.4 / driver 550 is too old; upgrading the driver is required — rebuilding the image will not help.
 
-`gcloud storage cp` fails with `Reauthentication failed`: run `gcloud auth login`. The `r2st-public` bucket is also readable without gcloud:
-
-```bash
-mkdir -p src/r2st/FoundationPose/weights/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/2023-10-28-18-33-37
-wget --no-check-certificate -O src/r2st/FoundationPose/weights/2024-01-11-20-02-45/config.yml https://storage.googleapis.com/r2st-public/2024-01-11-20-02-45/config.yml
-wget --no-check-certificate -O src/r2st/FoundationPose/weights/2024-01-11-20-02-45/model_best.pth https://storage.googleapis.com/r2st-public/2024-01-11-20-02-45/model_best.pth
-wget --no-check-certificate -O src/r2st/FoundationPose/weights/2023-10-28-18-33-37/config.yml https://storage.googleapis.com/r2st-public/2023-10-28-18-33-37/config.yml
-wget --no-check-certificate -O src/r2st/FoundationPose/weights/2023-10-28-18-33-37/model_best.pth https://storage.googleapis.com/r2st-public/2023-10-28-18-33-37/model_best.pth
-```
+`gcloud storage cp` fails with `Reauthentication failed`: run `gcloud auth login`.
 
 `docker build` fails with `docker-credential-pass: executable file not found in $PATH`: `credsStore` in `~/.docker/config.json` is `pass`, but the helper is not on `PATH`. Put `$HOME/.local/bin` on `PATH` (a literal `~/.local/bin` in PATH is not expanded) and retry.

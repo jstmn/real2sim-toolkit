@@ -20,10 +20,12 @@ Notes:
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
 3. if --visualize-robot-masks is set, debug PNGs are written for the frame-0 SAM masks that enter the union.
-4. If --cache-robot-masks is set (default), propagated masks are loaded from / saved to
+4. If --cache-robot-masks is set (default), each propagated mask is written as soon as it is computed to
    `<h5_dir>/<h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
+    A later run loads a consecutive prefix of those files and resumes SAM from the last cached frame.
     Frame 0's GroundedSAM union may also be read from the older
-    `robot-mask__<camera>__idx=0__...npy` seed cache.
+    `robot-mask__<camera>__idx=0__...npy` seed cache. After the last frame, a dimmed-mask video is written to
+    `robot-mask-propagated__<camera>__kmax=<k>__score_threshold=<t>.mp4`.
 
 
 
@@ -140,6 +142,7 @@ _CAPTURE_HEIGHT = 480
 _CAPTURE_FAR_M = 5.0
 _CAPTURE_CAMERA_NAME = "multiview_cam"
 _CAPTURE_UP_WHEN_PARALLEL = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+_MASK_VIDEO_FPS = 15.0
 _BEST_AXES_LENGTH = 0.08
 _BEST_AXES_RADIUS = 0.004
 _BEST_ORIGIN_RADIUS = 0.008
@@ -271,6 +274,19 @@ def _propagated_robot_mask_cache_path(
     )
 
 
+def _propagated_robot_mask_video_path(
+    h5_path: pathlib.Path,
+    camera: str,
+    kmax: int,
+    score_threshold: float,
+) -> pathlib.Path:
+    return (
+        h5_path.parent
+        / h5_path.stem
+        / f"robot-mask-propagated__{camera}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
+    )
+
+
 def _load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int]) -> np.ndarray:
     mask = np.load(path)
     assert isinstance(mask, np.ndarray), f"{path}: expected ndarray, got {type(mask)}"
@@ -280,7 +296,36 @@ def _load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int]) -> np.ndarra
     return mask
 
 
-def _propagate_robot_masks(rgb: np.ndarray, predictor: GroundedSAMPredictor, seed_mask: np.ndarray) -> np.ndarray:
+def _n_consecutive_cached_masks(paths: list[pathlib.Path]) -> int:
+    """Count how many leading cache files exist (0 if the first is missing)."""
+    n = 0
+    for path in paths:
+        if not path.is_file():
+            break
+        n += 1
+    return n
+
+
+def _save_cached_bool_mask(path: pathlib.Path, mask: np.ndarray) -> None:
+    assert mask.dtype == bool, f"{path}: mask dtype must be bool, got {mask.dtype}"
+    assert mask.any(), f"{path}: cannot cache an empty robot mask"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, mask)
+
+
+def _load_grounded_sam() -> GroundedSAMPredictor:
+    t0 = time.perf_counter()
+    predictor = GroundedSAMPredictor()
+    _log_elapsed("GroundedSAM loaded", t0)
+    return predictor
+
+
+def _propagate_robot_masks(
+    rgb: np.ndarray,
+    predictor: GroundedSAMPredictor,
+    seed_mask: np.ndarray,
+    cache_paths: list[pathlib.Path] | None = None,
+) -> np.ndarray:
     """Propagate ``seed_mask`` (frame 0) through ``rgb`` with SAM mask_input + bbox."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
@@ -288,17 +333,22 @@ def _propagate_robot_masks(rgb: np.ndarray, predictor: GroundedSAMPredictor, see
     assert seed_mask.shape == (height, width), f"seed_mask {seed_mask.shape} != image {(height, width)}"
     assert seed_mask.dtype == bool, f"seed_mask dtype must be bool, got {seed_mask.dtype}"
     assert seed_mask.any(), "seed_mask is empty"
+    if cache_paths is not None:
+        assert len(cache_paths) == n_frames, f"cache_paths length {len(cache_paths)} != n_frames {n_frames}"
     masks = np.zeros((n_frames, height, width), dtype=bool)
     masks[0] = seed_mask
+    if cache_paths is not None:
+        _save_cached_bool_mask(cache_paths[0], seed_mask)
     mask_input = binary_mask_to_sam_mask_input(seed_mask)
     prev_mask = seed_mask
     for t in tqdm(range(1, n_frames), desc="Propagate robot masks"):
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
         box = bbox_xyxy_from_mask(prev_mask)
-        mask, score, low_res = predictor.propagate_from_mask(image_bgr, mask_input, box)
+        mask, _score, low_res = predictor.propagate_from_mask(image_bgr, mask_input, box)
         assert mask.shape == (height, width), f"frame {t}: mask {mask.shape} != {(height, width)}"
-        print(f"[info] Propagated robot mask to frame {t} score={score:.4f} pixels={int(mask.sum())}/{mask.size}")
         masks[t] = mask
+        if cache_paths is not None:
+            _save_cached_bool_mask(cache_paths[t], mask)
         mask_input = low_res
         prev_mask = mask
     return masks
@@ -322,65 +372,76 @@ def _compute_propagated_robot_masks(
     propagated_paths = [
         _propagated_robot_mask_cache_path(h5_path, camera, t, sam_kmax, sam_score_threshold) for t in range(n_frames)
     ]
-    if cache_robot_masks and all(path.is_file() for path in propagated_paths):
+    n_cached = _n_consecutive_cached_masks(propagated_paths) if cache_robot_masks else 0
+    if n_cached == n_frames:
         masks = np.stack([_load_cached_bool_mask(path, hw) for path in propagated_paths], axis=0)
         print(f"[info] Loaded {n_frames} propagated robot masks from cache")
     else:
-        seed_path = _robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold)
-        predictor: GroundedSAMPredictor | None = None
-        if cache_robot_masks and seed_path.is_file():
-            seed_mask = _load_cached_bool_mask(seed_path, hw)
-            print(f"[info] Loaded frame-0 robot mask from {seed_path}")
+        masks = np.zeros((n_frames, height, width), dtype=bool)
+        cache_paths = propagated_paths if cache_robot_masks else None
+        if n_cached >= 1:
+            for t in range(n_cached):
+                masks[t] = _load_cached_bool_mask(propagated_paths[t], hw)
+            print(f"[info] Resuming robot-mask propagation from frame {n_cached} ({n_cached}/{n_frames} cached)")
+            predictor = _load_grounded_sam()
+            rest = _propagate_robot_masks(
+                rgb[n_cached - 1 :],
+                predictor,
+                masks[n_cached - 1],
+                cache_paths=None if cache_paths is None else cache_paths[n_cached - 1 :],
+            )
+            assert rest.shape[0] == n_frames - n_cached + 1, f"rest frames {rest.shape[0]} != {n_frames - n_cached + 1}"
+            masks[n_cached:] = rest[1:]
         else:
-            print("[info] Loading GroundedSAM on cpu ...")
-            t0 = time.perf_counter()
-            predictor = GroundedSAMPredictor(device="cpu")
-            _log_elapsed("GroundedSAM loaded", t0)
-            image_bgr0 = cv2.cvtColor(rgb[0], cv2.COLOR_RGB2BGR)
-            print(f"[info] Segmenting '{robot_description}' on frame 0 ...")
-            t0 = time.perf_counter()
-            ranked_masks, scores, phrases = ImageUtils.get_sam_masks_ranked(predictor, image_bgr0, robot_description)
-            _log_elapsed(f"Segmented '{robot_description}' on frame 0 ({ranked_masks.shape[0]} masks)", t0)
-            for rank in range(min(sam_kmax, ranked_masks.shape[0])):
-                print(
-                    f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
-                    f"pixels={int(ranked_masks[rank].sum())}"
-                )
-            seed_mask = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
-            if visualize_robot_masks:
-                _dump_top_sam_masks(
-                    image_bgr0,
-                    ranked_masks,
-                    scores,
-                    phrases,
-                    h5_path.parent,
-                    camera,
-                    0,
-                    sam_kmax,
-                    sam_score_threshold,
-                )
-            if cache_robot_masks:
-                seed_path.parent.mkdir(parents=True, exist_ok=True)
-                np.save(seed_path, seed_mask)
-                print(f"[info] Saved frame-0 robot mask to {seed_path}")
-
-        if n_frames == 1:
-            masks = seed_mask[None, ...]
-        else:
-            if predictor is None:
-                print("[info] Loading GroundedSAM on cpu ...")
+            seed_path = _robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold)
+            predictor: GroundedSAMPredictor | None = None
+            if cache_robot_masks and seed_path.is_file():
+                seed_mask = _load_cached_bool_mask(seed_path, hw)
+                print(f"[info] Loaded frame-0 robot mask from {seed_path}")
+            else:
+                predictor = _load_grounded_sam()
+                image_bgr0 = cv2.cvtColor(rgb[0], cv2.COLOR_RGB2BGR)
+                print(f"[info] Segmenting '{robot_description}' on frame 0 ...")
                 t0 = time.perf_counter()
-                predictor = GroundedSAMPredictor(device="cpu")
-                _log_elapsed("GroundedSAM loaded", t0)
-            print(f"[info] Propagating frame-0 robot mask through {n_frames} frames ...")
-            t0 = time.perf_counter()
-            masks = _propagate_robot_masks(rgb, predictor, seed_mask)
-            _log_elapsed(f"Propagated robot mask through {n_frames} frames", t0)
+                ranked_masks, scores, phrases = ImageUtils.get_sam_masks_ranked(
+                    predictor, image_bgr0, robot_description
+                )
+                _log_elapsed(f"Segmented '{robot_description}' on frame 0 ({ranked_masks.shape[0]} masks)", t0)
+                for rank in range(min(sam_kmax, ranked_masks.shape[0])):
+                    print(
+                        f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
+                        f"pixels={int(ranked_masks[rank].sum())}"
+                    )
+                seed_mask = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
+                if visualize_robot_masks:
+                    _dump_top_sam_masks(
+                        image_bgr0,
+                        ranked_masks,
+                        scores,
+                        phrases,
+                        h5_path.parent,
+                        camera,
+                        0,
+                        sam_kmax,
+                        sam_score_threshold,
+                    )
+                if cache_robot_masks:
+                    _save_cached_bool_mask(seed_path, seed_mask)
+                    print(f"[info] Saved frame-0 robot mask to {seed_path}")
+
+            if n_frames == 1:
+                masks = seed_mask[None, ...]
+                if cache_paths is not None:
+                    _save_cached_bool_mask(cache_paths[0], seed_mask)
+            else:
+                if predictor is None:
+                    predictor = _load_grounded_sam()
+                print(f"[info] Propagating frame-0 robot mask through {n_frames} frames ...")
+                t0 = time.perf_counter()
+                masks = _propagate_robot_masks(rgb, predictor, seed_mask, cache_paths=cache_paths)
+                _log_elapsed(f"Propagated robot mask through {n_frames} frames", t0)
         assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
         if cache_robot_masks:
-            propagated_paths[0].parent.mkdir(parents=True, exist_ok=True)
-            for t, path in enumerate(propagated_paths):
-                np.save(path, masks[t])
             print(f"[info] Saved {n_frames} propagated robot masks")
     _save_propagated_mask_demo_overlays(rgb, masks, h5_path, camera, sam_kmax, sam_score_threshold)
     return masks
@@ -394,16 +455,30 @@ def _save_propagated_mask_demo_overlays(
     kmax: int,
     score_threshold: float,
 ) -> None:
-    """Write a dimmed-mask demo PNG for every trajectory frame."""
+    """Write a dimmed-mask demo PNG for every trajectory frame and an mp4 of those overlays."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
+    video_path = _propagated_robot_mask_video_path(h5_path, camera, kmax, score_threshold)
+    video_path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(video_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        _MASK_VIDEO_FPS,
+        (width, height),
+    )
+    assert writer.isOpened(), f"Failed to open video writer at {video_path}"
     for t in range(n_frames):
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
         overlay_path = _propagated_robot_mask_cache_path(h5_path, camera, t, kmax, score_threshold).with_suffix(
             ".demo.png"
         )
-        ImageUtils.save_demo_overlay(image_bgr, masks[t], overlay_path)
+        demo = ImageUtils.demo_overlay(image_bgr, masks[t])
+        assert overlay_path.name.endswith(".demo.png"), f"demo overlay path must end with .demo.png, got {overlay_path}"
+        assert cv2.imwrite(str(overlay_path), demo), f"Failed to write {overlay_path}"
+        writer.write(demo)
+    writer.release()
+    print(f"[info] Saved {n_frames} robot-mask demo overlays and video to {video_path}")
 
 
 def _union_top_sam_masks(
