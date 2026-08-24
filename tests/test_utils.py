@@ -145,3 +145,49 @@ class TestFarthestPointSamplePygLib:
             farthest_point_sample_pyg_lib(np.zeros((5,), dtype=np.float32), 2, device=device)
         with pytest.raises(AssertionError):
             farthest_point_sample_pyg_lib(pts, 2, device="")
+
+
+class _FakeSAM3Predictor:
+    def __init__(self, masks: np.ndarray, scores: np.ndarray, phrases: list[str]):
+        self._processor = object()
+        self.masks = masks
+        self.scores = scores
+        self.phrases = phrases
+
+    def get_ranked_sam_masks(self, image_bgr, object_name):
+        assert image_bgr.ndim == 3
+        assert len(object_name) > 0
+        return self.masks, self.scores, self.phrases
+
+
+class TestImageUtilsSamMasks:
+    def test_get_sam_mask_returns_highest_confidence(self):
+        from r2st.utils import ImageUtils
+
+        image = np.zeros((8, 10, 3), dtype=np.uint8)
+        masks = np.zeros((2, 8, 10), dtype=bool)
+        masks[0, 1:3, 1:4] = True
+        masks[1, 4:6, 5:8] = True
+        scores = np.array([0.9, 0.4], dtype=np.float64)
+        predictor = _FakeSAM3Predictor(masks, scores, ["red block", "red block"])
+        out = ImageUtils.get_sam_mask(predictor, image, "red block")
+        assert out.dtype == bool
+        assert np.array_equal(out, masks[0])
+
+    def test_get_sam_masks_ranked_rejects_empty_object_name(self):
+        from r2st.utils import ImageUtils
+
+        image = np.zeros((8, 10, 3), dtype=np.uint8)
+        predictor = _FakeSAM3Predictor(np.zeros((1, 8, 10), dtype=bool), np.array([1.0]), ["x"])
+        with pytest.raises(AssertionError, match="object_name"):
+            ImageUtils.get_sam_masks_ranked(predictor, image, "")
+
+    def test_get_sam_masks_ranked_rejects_unloaded_predictor(self):
+        from r2st.utils import ImageUtils
+
+        class _Unloaded:
+            _processor = None
+
+        image = np.zeros((8, 10, 3), dtype=np.uint8)
+        with pytest.raises(AssertionError, match="not loaded"):
+            ImageUtils.get_sam_masks_ranked(_Unloaded(), image, "robot arm")

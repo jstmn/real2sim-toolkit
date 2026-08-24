@@ -197,7 +197,7 @@ class _FakePropagatePredictor:
         height, width = image_bgr.shape[:2]
         mask = np.zeros((height, width), dtype=bool)
         mask[2 : 2 + t, 3 : 5 + t] = True
-        low_res = np.full((1, 256, 256), float(t), dtype=np.float32)
+        low_res = np.full((1, 288, 288), float(t), dtype=np.float32)
         return mask, 0.9, low_res
 
 
@@ -224,7 +224,7 @@ def test_propagate_robot_masks_feeds_union_then_logits():
     assert np.array_equal(out[1], expected1)
     assert np.array_equal(out[2], expected2)
     _, mask_input1, box1 = predictor.calls[1]
-    assert np.allclose(mask_input1, np.full((1, 256, 256), 1.0, dtype=np.float32))
+    assert np.allclose(mask_input1, np.full((1, 288, 288), 1.0, dtype=np.float32))
     assert np.allclose(box1, bbox_xyxy_from_mask(expected1))
 
 
@@ -292,7 +292,7 @@ def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, mon
         np.save(_propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3), mask)
 
     fake = _FakePropagatePredictor()
-    monkeypatch.setattr(ece, "_load_grounded_sam", lambda: fake)
+    monkeypatch.setattr(ece, "_load_sam3", lambda: fake)
     out = ece._compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
     assert np.array_equal(out[0], cached[0])
     assert np.array_equal(out[1], cached[1])

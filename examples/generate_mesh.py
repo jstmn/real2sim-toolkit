@@ -5,7 +5,7 @@ import shutil
 import cv2
 import tyro
 
-from r2st.core import GroundedSAMPredictor
+from r2st.core import SAM3Predictor
 from r2st.openai import list_objects_in_image
 from r2st.types import CameraImage, ObjectAssets
 from r2st.utils import ImageUtils, MeshUtils
@@ -42,7 +42,7 @@ def _pick_target_object(objects: list[str]) -> str:
     return objects[0]
 
 
-def _load_camera_image(image_path: pathlib.Path, predictor: GroundedSAMPredictor) -> tuple[CameraImage, str]:
+def _load_camera_image(image_path: pathlib.Path, predictor: SAM3Predictor) -> tuple[CameraImage, str]:
     """Detect the single target object in `image_path` and segment it.
 
     Asserts exactly one object per camera. Cross-view object matching/merging is not
@@ -71,7 +71,7 @@ def main(args: Args) -> None:
         assert image_path.exists(), f"Image file '{image_path}' not found"
         assert image_path.is_file(), f"Image path '{image_path}' is not a file"
 
-    predictor = GroundedSAMPredictor()
+    predictor = SAM3Predictor()
     loaded = [_load_camera_image(image_path, predictor) for image_path in args.images]
     camera_images = [camera_image for camera_image, _ in loaded]
     target = loaded[0][1]

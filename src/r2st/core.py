@@ -2,18 +2,13 @@
 
 Implements the same public helpers as the original (intrinsics, depth alignment,
 pose transforms, rendering stubs) but without hard ROS/Sapien dependencies.
-Heavy deps (torch, sapien, grounded-sam) are imported lazily so pure geometry
-tests run with only numpy.
+Heavy deps (torch, sapien, SAM 3) are imported lazily so pure geometry tests
+run with only numpy.
 """
 
 import os
-import sys
-import warnings
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-
-# Make groundingdino importable as top-level (internal code does `from groundingdino.util ...`)
-sys.path.insert(0, str(Path(__file__).parent / "GroundingDINO"))
 
 import cv2
 import matplotlib
@@ -45,17 +40,9 @@ __all__ = [
     "transform_pose_cam_to_world",
 ]
 
-_R2ST_DIR = Path(__file__).resolve().parent
-GROUNDING_DINO_CONFIG = _R2ST_DIR / "GroundingDINO" / "groundingdino" / "config" / "GroundingDINO_SwinT_OGC.py"
-GROUNDING_DINO_CHECKPOINT = _R2ST_DIR / "models" / "groundingdino_swint_ogc.pth"
-SAM_CHECKPOINT = _R2ST_DIR / "models" / "sam_vit_h_4b8939.pth"
-SAM_VERSION = "vit_h"
-SAM_MASK_INPUT_HW = 256
+# SAM 3 interactive mask prompt is 4 * (image_size / backbone_stride) = 4 * (1008 / 14) = 288.
+SAM_MASK_INPUT_HW = 288
 MESHY_ASSET_DIR = Path("data/meshyai")
-
-assert GROUNDING_DINO_CONFIG.is_file(), f"GroundingDINO config not found: {GROUNDING_DINO_CONFIG}"
-assert GROUNDING_DINO_CHECKPOINT.is_file(), f"GroundingDINO checkpoint not found: {GROUNDING_DINO_CHECKPOINT}"
-assert SAM_CHECKPOINT.is_file(), f"SAM checkpoint not found: {SAM_CHECKPOINT}"
 
 
 # ---------------------------------------------------------------------------
@@ -88,11 +75,11 @@ def save_mask_image(
         show_mask(mask.cpu().numpy(), plt.gca(), random_color=True)
     for box, label in zip(box_list, label_list):
         show_box(box.numpy(), plt.gca(), label)
-    now = datetime.now().strftime("%m:%d_%H:%M:%S")
+    now = datetime.now(UTC).strftime("%m:%d_%H:%M:%S")
     plt.axis("off")
-    save_filepath = os.path.join(output_dir, f"grounded_sam_output__{now}.jpg")
+    save_filepath = os.path.join(output_dir, f"sam3_output__{now}.jpg")
     plt.savefig(save_filepath, bbox_inches="tight", dpi=300, pad_inches=0.0)
-    print(f"Saved grounded SAM output to '{save_filepath}'")
+    print(f"Saved SAM 3 output to '{save_filepath}'")
 
 
 def save_mask_image_2(img: np.ndarray, mask: np.ndarray | torch.Tensor, save_filepath: str, text: str):
@@ -147,7 +134,7 @@ def bbox_xyxy_from_mask(mask: np.ndarray) -> np.ndarray:
 
 
 def binary_mask_to_sam_mask_input(mask: np.ndarray) -> np.ndarray:
-    """Resize a full-res bool mask to SAM's dense prompt: ``(1, 256, 256)`` float32."""
+    """Resize a full-res bool mask to SAM 3's dense prompt: ``(1, 288, 288)`` float32."""
     assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
     assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
     assert mask.any(), "Cannot convert an empty mask to SAM mask_input"
@@ -163,178 +150,77 @@ def binary_mask_to_sam_mask_input(mask: np.ndarray) -> np.ndarray:
     return resized[None, :, :].astype(np.float32)
 
 
-class GroundedSAMPredictor:
-    """GroundedSAM predictor with _sam_predictor for full pipeline."""
+class SAM3Predictor:
+    """SAM 3 text-prompted segmentation plus interactive mask/box propagation."""
 
     def __init__(
         self,
         device: str | None = None,
-        box_threshold: float = 0.3,
-        text_threshold: float = 0.25,
+        confidence_threshold: float = 0.3,
         debug_output_dir: str | None = None,
     ):
+        from sam3.model.sam3_image_processor import Sam3Processor
+        from sam3.model_builder import build_sam3_image_model
+        from termcolor import colored
+
         self._debug_output_dir = debug_output_dir
         if self._debug_output_dir is not None:
             os.makedirs(self._debug_output_dir, exist_ok=True)
-        from r2st.segment_anything.segment_anything import (
-            SamPredictor,
-            sam_model_registry,
-        )
-
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         assert device in ("cpu", "cuda"), f"device must be 'cpu' or 'cuda', got {device!r}"
+        assert 0.0 <= confidence_threshold <= 1.0, f"confidence_threshold must be in [0, 1], got {confidence_threshold}"
         self._device = device
-        self._box_threshold = box_threshold
-        self._text_threshold = text_threshold
-        self._bert_model = self._load_bert_model(
-            str(GROUNDING_DINO_CONFIG), str(GROUNDING_DINO_CHECKPOINT), None, self._device
-        )
-        self._sam_predictor = SamPredictor(
-            sam_model_registry[SAM_VERSION](checkpoint=str(SAM_CHECKPOINT)).to(self._device)
-        )
-        assert self._bert_model is not None, "GroundedSAM bert model not loaded"
-        assert self._sam_predictor is not None, "GroundedSAM predictor not loaded"
-        from termcolor import colored
-
-        sam_dev = self._sam_predictor.model.device
-        if sam_dev.type == "cuda":
-            sam_where = f"GPU ({sam_dev})"
+        self._confidence_threshold = confidence_threshold
+        model = build_sam3_image_model(device=self._device, enable_inst_interactivity=True)
+        self._processor = Sam3Processor(model, device=self._device, confidence_threshold=self._confidence_threshold)
+        self._interactive = model.inst_interactive_predictor
+        assert self._processor is not None, "SAM 3 processor not loaded"
+        assert self._interactive is not None, "SAM 3 interactive predictor not loaded"
+        if torch.device(self._device).type == "cuda":
+            sam_where = f"GPU ({self._device})"
         else:
             sam_where = "CPU"
-        print(colored(f"[info] SAM is using {sam_where}", "yellow"))
-
-    @staticmethod
-    def _load_bert_model(model_config_path: str, model_checkpoint_path: str, bert_base_uncased_path, device: str):
-        # Third-party FutureWarnings from transformers / huggingface_hub on current torch.
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*_register_pytree_node.*is deprecated.*",
-            category=FutureWarning,
-            module=r"transformers(\..*)?",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*resume_download.*is deprecated.*",
-            category=FutureWarning,
-            module=r"huggingface_hub(\..*)?",
-        )
-
-        from r2st.GroundingDINO.groundingdino.models import build_model
-        from r2st.GroundingDINO.groundingdino.util.slconfig import SLConfig
-        from r2st.GroundingDINO.groundingdino.util.utils import clean_state_dict
-
-        args = SLConfig.fromfile(model_config_path)
-        args.device = device
-        args.bert_base_uncased_path = bert_base_uncased_path
-        model = build_model(args)
-        checkpoint = torch.load(model_checkpoint_path, map_location="cpu")
-        load_res = model.load_state_dict(clean_state_dict(checkpoint["model"]), strict=False)
-        print(load_res)
-        _ = model.eval()
-        return model
-
-    @staticmethod
-    def _get_grounding_output(
-        model,
-        image: np.ndarray,
-        caption: str,
-        box_threshold: float,
-        text_threshold: float,
-        with_logits: bool = True,
-        device: str = "cpu",
-    ):
-        import torch
-
-        assert getattr(model, "tokenizer", None) is not None, "GroundingDINO model has no tokenizer"
-        import r2st.GroundingDINO.groundingdino.datasets.transforms as T
-        from r2st.GroundingDINO.groundingdino.util.utils import get_phrases_from_posmap
-
-        def load_image(image_: np.ndarray):
-            image_pil = PILImage.fromarray(image_).convert("RGB")
-            transform = T.Compose(
-                [
-                    T.RandomResize([800], max_size=1333),
-                    T.ToTensor(),
-                    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-                ]
-            )
-            img, _ = transform(image_pil, None)
-            return img
-
-        image_t = load_image(image).to(device)
-        caption = caption.lower().strip()
-        if not caption.endswith("."):
-            caption = caption + "."
-        model = model.to(device)
-        image_t = image_t.to(device)
-        with torch.no_grad():
-            outputs = model(image_t[None], captions=[caption])
-        logits = outputs["pred_logits"].cpu().sigmoid()[0]
-        boxes = outputs["pred_boxes"].cpu()[0]
-        logits_filt = logits.clone()
-        boxes_filt = boxes.clone()
-        filt_mask = logits_filt.max(dim=1)[0] > box_threshold
-        logits_filt = logits_filt[filt_mask]
-        boxes_filt = boxes_filt[filt_mask]
-        tokenlizer = model.tokenizer
-        tokenized = tokenlizer(caption)
-        pred_phrases = []
-        for logit, box in zip(logits_filt, boxes_filt):
-            pred_phrase = get_phrases_from_posmap(logit > text_threshold, tokenized, tokenlizer)
-            if with_logits:
-                pred_phrases.append(pred_phrase + f"({str(logit.max().item())[:4]})")
-            else:
-                pred_phrases.append(pred_phrase)
-        box_scores = logits_filt.max(dim=1)[0]
-        return boxes_filt, pred_phrases, box_scores
+        print(colored(f"[info] SAM 3 is using {sam_where}", "yellow"))
 
     def get_ranked_sam_masks(self, image: np.ndarray, object_name: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
-        """Return all SAM masks for `object_name`, sorted by confidence descending.
+        """Return all SAM 3 masks for `object_name`, sorted by confidence descending.
 
-        GroundingDINO boxes each produce three SAM hypotheses (`multimask_output=True`).
-        Score is `box_logit * sam_iou`. Returns `(N, H, W)` bool, `(N,)` scores, phrases.
+        Returns `(N, H, W)` bool, `(N,)` scores, and a phrase list (the text prompt, once per mask).
         """
-        import torch
-
-        assert self._sam_predictor is not None and self._bert_model is not None, "GroundedSAM not initialized"
+        assert self._processor is not None, "SAM 3 predictor not loaded"
+        assert image.ndim == 3 and image.shape[2] == 3, f"Image must be HxWx3, got {image.shape}"
+        assert len(object_name) > 0, "object_name must not be empty"
+        height, width = image.shape[:2]
         image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        assert isinstance(image_rgb, np.ndarray)
-        self._sam_predictor.set_image(image_rgb)
-        boxes_filt, pred_phrases, box_scores = self._get_grounding_output(
-            self._bert_model, image_rgb, object_name, self._box_threshold, self._text_threshold, device=self._device
-        )
-        assert boxes_filt.size(0) > 0, f"GroundingDINO found no boxes for {object_name!r}"
-        assert box_scores.shape == (
-            boxes_filt.size(0),
-        ), f"box_scores {box_scores.shape} != n_boxes {boxes_filt.size(0)}"
-        img_size = image_rgb.shape[:2]
-        W, H = img_size[1], img_size[0]
-        assert H < W, f"Image height ({H}) should be less than width ({W})"
-        for i in range(boxes_filt.size(0)):
-            boxes_filt[i] = boxes_filt[i] * torch.Tensor([W, H, W, H])
-            boxes_filt[i][:2] -= boxes_filt[i][2:] / 2
-            boxes_filt[i][2:] += boxes_filt[i][:2]
-        boxes_filt = boxes_filt.cpu()
-        transformed_boxes = self._sam_predictor.transform.apply_boxes_torch(boxes_filt, img_size).to(self._device)
-        masks, iou_preds, _ = self._sam_predictor.predict_torch(
-            point_coords=None, point_labels=None, boxes=transformed_boxes.to(self._device), multimask_output=True
-        )
-        assert masks.ndim == 4, f"Expected (n_boxes, n_hyp, H, W) masks, got {tuple(masks.shape)}"
-        n_boxes, n_hyp, mh, mw = masks.shape
-        assert (mh, mw) == (H, W), f"Mask size {(mh, mw)} != image {(H, W)}"
-        assert iou_preds.shape == (n_boxes, n_hyp), f"iou_preds {tuple(iou_preds.shape)} != {(n_boxes, n_hyp)}"
-        combined = box_scores.to(iou_preds.device)[:, None] * iou_preds
-        masks_flat = masks.reshape(n_boxes * n_hyp, H, W)
-        scores_flat = combined.reshape(n_boxes * n_hyp)
-        phrases_flat = [pred_phrases[b] for b in range(n_boxes) for _ in range(n_hyp)]
-        order = torch.argsort(scores_flat, descending=True)
-        masks_np = masks_flat[order].cpu().numpy().astype(bool)
-        scores_np = scores_flat[order].detach().cpu().numpy().astype(np.float64)
-        phrases_sorted = [phrases_flat[int(i)] for i in order.cpu().numpy()]
+        image_pil = PILImage.fromarray(image_rgb)
+        state = self._processor.set_image(image_pil)
+        output = self._processor.set_text_prompt(state=state, prompt=object_name)
+        masks_t = output["masks"]
+        scores_t = output["scores"]
+        boxes_t = output["boxes"]
+        assert torch.is_tensor(masks_t), f"Expected tensor masks, got {type(masks_t)}"
+        assert torch.is_tensor(scores_t), f"Expected tensor scores, got {type(scores_t)}"
+        if masks_t.ndim == 4:
+            assert masks_t.shape[1] == 1, f"Expected (N, 1, H, W) masks, got {tuple(masks_t.shape)}"
+            masks_t = masks_t[:, 0]
+        assert masks_t.ndim == 3, f"Expected (N, H, W) masks, got {tuple(masks_t.shape)}"
+        assert masks_t.shape[0] >= 1, f"SAM 3 returned no masks for {object_name!r}"
+        assert masks_t.shape[1:] == (height, width), f"Mask size {tuple(masks_t.shape[1:])} != image {(height, width)}"
+        assert scores_t.shape == (masks_t.shape[0],), f"scores {tuple(scores_t.shape)} != n_masks {masks_t.shape[0]}"
+        order = torch.argsort(scores_t, descending=True)
+        masks_np = masks_t[order].detach().cpu().numpy().astype(bool)
+        scores_np = scores_t[order].detach().cpu().numpy().astype(np.float64)
+        phrases_sorted = [object_name] * int(masks_np.shape[0])
         if self._debug_output_dir is not None:
-            print(f"Saving grounded SAM output to '{self._debug_output_dir}'")
-            save_mask_image(image_rgb, self._debug_output_dir, masks, boxes_filt, pred_phrases)
+            print(f"Saving SAM 3 output to '{self._debug_output_dir}'")
+            save_mask_image(
+                image_rgb,
+                self._debug_output_dir,
+                masks_t[order].detach(),
+                boxes_t[order].detach().cpu(),
+                phrases_sorted,
+            )
         return masks_np, scores_np, phrases_sorted
 
     def propagate_from_mask(
@@ -343,12 +229,12 @@ class GroundedSAMPredictor:
         mask_input: np.ndarray,
         box_xyxy: np.ndarray,
     ) -> tuple[np.ndarray, float, np.ndarray]:
-        """SAM-decode one mask on ``image_bgr`` from a previous mask prompt.
+        """SAM 3-decode one mask on ``image_bgr`` from a previous mask prompt.
 
-        ``mask_input`` is SAM's dense prompt ``(1, 256, 256)``. ``box_xyxy`` is the
-        previous binary mask's XYXY box in pixel coordinates. GroundingDINO is not used.
+        ``mask_input`` is SAM 3's dense prompt ``(1, 288, 288)``. ``box_xyxy`` is the
+        previous binary mask's XYXY box in pixel coordinates.
         """
-        assert self._sam_predictor is not None, "GroundedSAM predictor not loaded"
+        assert self._interactive is not None, "SAM 3 interactive predictor not loaded"
         assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"image_bgr must be HxWx3, got {image_bgr.shape}"
         assert mask_input.shape == (
             1,
@@ -360,8 +246,8 @@ class GroundedSAMPredictor:
         assert np.isfinite(box_xyxy).all(), f"box_xyxy contains non-finite values: {box_xyxy}"
         assert box_xyxy[2] > box_xyxy[0] and box_xyxy[3] > box_xyxy[1], f"Degenerate box {box_xyxy.tolist()}"
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        self._sam_predictor.set_image(image_rgb)
-        masks, ious, low_res = self._sam_predictor.predict(
+        self._interactive.set_image(image_rgb)
+        masks, ious, low_res = self._interactive.predict(
             point_coords=None,
             point_labels=None,
             box=box_xyxy.astype(np.float32),
@@ -377,7 +263,7 @@ class GroundedSAMPredictor:
             SAM_MASK_INPUT_HW,
         ), f"low_res must be (1, {SAM_MASK_INPUT_HW}, {SAM_MASK_INPUT_HW}), got {low_res.shape}"
         mask = masks[0].astype(bool)
-        assert mask.any(), "SAM propagation produced an empty mask"
+        assert mask.any(), "SAM 3 propagation produced an empty mask"
         return mask, float(ious[0]), low_res.astype(np.float32)
 
     def get_sam_mask(self, image: np.ndarray, object_name: str) -> torch.Tensor:

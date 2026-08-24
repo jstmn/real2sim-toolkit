@@ -5,9 +5,7 @@ This repository is an API for creating and maintaining a digital twin of a physi
 ## Installation
 
 ```bash
-# Download model weights
-wget --no-check-certificate https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -O src/r2st/models/sam_vit_h_4b8939.pth
-wget --no-check-certificate https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth -O src/r2st/models/groundingdino_swint_ogc.pth
+# Download FoundationPose weights
 gcloud storage cp --recursive gs://r2st-public/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/
 gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/FoundationPose/weights/
 
@@ -15,15 +13,19 @@ gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/Foun
 export MESHY_API_KEY=your_meshy_api_key
 export OPENAI_API_KEY=your_openai_api_key
 
+# Clone this repo with submodules (`git clone --recurse-submodules ...`), or init them after clone:
+git submodule update --init src/r2st/sam3
+
 # Clone ManiSkill and Jrl2 (required before `uv sync`)
 git clone git@github.com:jstmn/ManiSkill.git thirdparty/ManiSkill
 git clone git@github.com:jstmn/Jrl2.git thirdparty/Jrl2
 
+# SAM 3 checkpoints are gated. Request access at https://huggingface.co/facebook/sam3
+# then authenticate after `uv sync` (which installs the local `src/r2st/sam3` package):
+
 # Initialize uv
 uv sync
-
-# Optional: build GroundingDINO CUDA ops (faster GPU GroundedSAM; PyTorch fallback is used if skipped)
-uv run python src/r2st/GroundingDINO/setup.py build_ext --inplace
+uv run hf auth login
 
 # Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
@@ -39,14 +41,32 @@ cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
 
 ### OPTIONAL
-# Download saved demonstrations (used by Examples 2 and 3). You need to be logged into Google Cloud Platform to do this. Run `gcloud auth login` to do so.
+# Download saved demonstrations (used by Examples 2, 4, and 5). You need to be logged into Google Cloud Platform to do this. Run `gcloud auth login` to do so.
 mkdir -p data
 gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 ```
 
 ## Examples
 
-**Example 1: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:**
+**Example 1: Segment an object with SAM 3.** This is the smoke test for text-prompted masking. It writes a dimmed overlay, a masked crop, and a bool `.npy` mask. The first run downloads the gated SAM 3 checkpoint from Hugging Face (see Installation).
+
+```bash
+uv run python examples/generate_mask.py --image data/red_T_block_1.png --object-description "red T block"
+uv run python examples/generate_mask.py --image data/raise_cube_0__camera_base__t=0.rgb.png --object-description "blue cube"
+```
+
+
+**Example 2: Track a mask through a demonstration.** SAM 3 segments the prompt on **frame 0** (union of the top `--sam-kmax` masks whose score is above `--sam-score-threshold`). That union is propagated through later RGB frames with SAM 3 `mask_input` plus the previous mask's bbox. Writes per-frame `.npy` masks, dimmed overlays, and an mp4 under `<h5_dir>/<h5_stem>/`.
+
+```bash
+uv run python examples/generate_masks_across_trajectory.py \
+    --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --camera cam_1 \
+    --object-description "robot arm"
+```
+
+
+**Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:**
 
 ```bash
 uv run python examples/generate_mesh.py --images data/red_T_block_1.png --visualize
@@ -54,7 +74,7 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 ```
 
 
-**Example 2: Estimate camera extrinsics and save results to a yaml file.** This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
+**Example 4: Estimate camera extrinsics and save results to a yaml file.** This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
 ```bash
 uv run python examples/estimate_camera_extrinsics.py \
   --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
@@ -90,11 +110,11 @@ end effector (`__` delimits robot vs EEF; `_` stays inside each token):
 Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
 are pinned at 0 (closed gripper).
 
-Robot masks: GroundedSAM runs on **frame 0** (union of the top `--sam-kmax` masks). That union is
-propagated through the rest of the trajectory with SAM `mask_input` plus the previous mask's bbox,
+Robot masks: SAM 3 runs on **frame 0** (union of the top `--sam-kmax` masks). That union is
+propagated through the rest of the trajectory with SAM 3 `mask_input` plus the previous mask's bbox,
 so contact with an object does not expand the robot mask.
 
-**Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
+**Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
 demonstration, then track that object through the demonstration:**
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv. 
@@ -159,8 +179,7 @@ imported as a package).
 
 ## Third party models used
 
-* [Segment Anything](https://github.com/facebookresearch/segment-anything)
-* [Grounding DINO](https://github.com/IDEA-Research/Grounded-Segment-Anything/tree/main/GroundingDINO)
+* [SAM 3](https://github.com/jstmn/sam3) (fork of [facebookresearch/sam3](https://github.com/facebookresearch/sam3))
 * [FoundationPose](https://github.com/OpenGVLab/FoundationPose)
 * [Cutie](https://github.com/hkchengrex/Cutie) — optional 2D tracker used by `FoundationPoseTracker(use_2d_tracker=True)` to
   re-anchor FoundationPose's translation each frame (ported from
