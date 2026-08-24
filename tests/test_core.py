@@ -37,3 +37,31 @@ class TestCoreHelpers:
         ce = CameraExtrinsics(matrix=np.eye(4))
         m = get_camera_extrinsic("camera_south", {"camera_south": ce})
         assert m.shape == (4, 4)
+
+
+def test_bbox_xyxy_from_mask():
+    from r2st.core import bbox_xyxy_from_mask
+
+    mask = np.zeros((20, 30), dtype=bool)
+    mask[2:5, 7:10] = True
+    box = bbox_xyxy_from_mask(mask)
+    assert box.tolist() == [7.0, 2.0, 10.0, 5.0]
+
+
+def test_bbox_xyxy_from_empty_mask_raises():
+    from r2st.core import bbox_xyxy_from_mask
+
+    with pytest.raises(AssertionError, match="empty"):
+        bbox_xyxy_from_mask(np.zeros((4, 4), dtype=bool))
+
+
+def test_binary_mask_to_sam_mask_input_shape():
+    from r2st.core import SAM_MASK_INPUT_HW, binary_mask_to_sam_mask_input
+
+    mask = np.zeros((48, 64), dtype=bool)
+    mask[10:30, 20:40] = True
+    mask_input = binary_mask_to_sam_mask_input(mask)
+    assert mask_input.shape == (1, SAM_MASK_INPUT_HW, SAM_MASK_INPUT_HW)
+    assert mask_input.dtype == np.float32
+    assert float(mask_input.max()) == 1.0
+    assert float(mask_input.min()) == 0.0

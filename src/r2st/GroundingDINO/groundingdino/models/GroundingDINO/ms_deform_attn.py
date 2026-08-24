@@ -19,15 +19,21 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from termcolor import colored
 from torch import nn
 from torch.autograd import Function
 from torch.autograd.function import once_differentiable
 from torch.nn.init import constant_, xavier_uniform_
 
-# try:
-#     from groundingdino import _C
-# except:
-#     warnings.warn("Failed to load custom C++ ops. Running on CPU mode Only!")
+try:
+    from ... import _C
+except ImportError:
+    _C = None
+
+if _C is None:
+    print(colored("[info] GroundingDINO _C CUDA ops are not built; using PyTorch fallback", "blue"))
+else:
+    print(colored("[info] GroundingDINO _C CUDA ops are built", "green"))
 
 
 # helpers
@@ -48,9 +54,6 @@ class MultiScaleDeformableAttnFunction(Function):
         attention_weights,
         im2col_step,
     ):
-        raise NotImplementedError(
-            "This function depends on custom C++ ops. Build GroundingDINO with `python setup.py develop` and then comment this out."
-        )
         ctx.im2col_step = im2col_step
         output = _C.ms_deform_attn_forward(
             value,
@@ -313,7 +316,7 @@ class MultiScaleDeformableAttention(nn.Module):
                 f"Last dim of reference_points must be 2 or 4, but get {reference_points.shape[-1]} instead."
             )
 
-        if torch.cuda.is_available() and value.is_cuda:
+        if _C is not None and torch.cuda.is_available() and value.is_cuda:
             halffloat = False
             if value.dtype == torch.float16:
                 halffloat = True

@@ -7,34 +7,41 @@ This repository is an API for creating and maintaining a digital twin of a physi
 ```bash
 # Download model weights
 wget --no-check-certificate https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -O src/r2st/models/sam_vit_h_4b8939.pth
-wget https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth -O src/r2st/models/groundingdino_swint_ogc.pth
+wget --no-check-certificate https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth -O src/r2st/models/groundingdino_swint_ogc.pth
 gcloud storage cp --recursive gs://r2st-public/2024-01-11-20-02-45 src/r2st/FoundationPose/weights/
 gcloud storage cp --recursive gs://r2st-public/2023-10-28-18-33-37 src/r2st/FoundationPose/weights/
 
-# Set your Meshy and OpenAI API keys (recommended to add to your ~/.bashrc)
+# Set your Meshy and OpenAI API keys (recommend adding to ~/.bashrc)
 export MESHY_API_KEY=your_meshy_api_key
 export OPENAI_API_KEY=your_openai_api_key
 
-# Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-# The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
-# current-gen GPUs (e.g. RTX 50-series/Blackwell); pinning to your driver/GPU isn't needed b/c
-# CUDA 12.8 covers everything back through sm_70.
-cd src/r2st/FoundationPose/docker
-docker build --network host -t foundationpose -f dockerfile ..
-bash run_container.sh
-# In the docker container:
-cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
-
-# Clone ManiSkill and Jrl2
+# Clone ManiSkill and Jrl2 (required before `uv sync`)
 git clone git@github.com:jstmn/ManiSkill.git thirdparty/ManiSkill
 git clone git@github.com:jstmn/Jrl2.git thirdparty/Jrl2
 
 # Initialize uv
 uv sync
 
+# Optional: build GroundingDINO CUDA ops (faster GPU GroundedSAM; PyTorch fallback is used if skipped)
+uv run python src/r2st/GroundingDINO/setup.py build_ext --inplace
 
-uv run python src/r2st/GroundingDINO/setup.py develop
+# Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+# The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
+# current-gen GPUs (e.g. RTX 50-series/Blackwell). That covers GPU *architectures* back through
+# sm_70; the host NVIDIA *driver* still needs to be new enough for CUDA 12.8 (Linux driver >= 570).
+# Check with `nvidia-smi` (CUDA Version in the header). Driver 550 is CUDA 12.4 and will fail
+# inside the container with CUDA error 804.
+cd src/r2st/FoundationPose/docker
+docker build --network host -t foundationpose -f dockerfile ..
+bash run_container.sh
+# In the docker container:
+cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
+
+### OPTIONAL
+# Download saved demonstrations (used by Examples 2 and 3). You need to be logged into Google Cloud Platform to do this. Run `gcloud auth login` to do so.
+mkdir -p data
+gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 ```
 
 ## Examples
@@ -51,16 +58,41 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 ```bash
 uv run python examples/estimate_camera_extrinsics.py \
   --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-  --robot-id xarm7 \
+  --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
-  --n_timesteps 2 \
+  --n-timesteps 2 \
   --output-path data/demonstrations/0802/extrinsics.yaml \
+  --seed-from-gui \
   --visualize \
   --visualize-robot-masks
 ```
 
+Exactly one seed mode is required:
+
+- `--seed-automatically` evaluates the configured spherical grid before CMA-ES.
+- `--seed-from-gui` starts Viser and waits for a manual seed. Click the 3D view, then use
+  world-frame (robot-base) hotkeys: R/F X, T/G Y, Y/H Z, U/J roll about X, I/K pitch about Y,
+  O/L yaw about Z (top row +, bottom row -). Press Enter or click **Select seed and start CMA-ES**.
+  `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
+
+`--robot-id` is a Jrl2 robot name. A bare name is the arm only. `{robot}__{eef}` is the same arm with that
+end effector (`__` delimits robot vs EEF; `_` stays inside each token):
+
+| `--robot-id` | End effector |
+| --- | --- |
+| `xarm7` | none (wrist flange only) |
+| `xarm7__gripper` | UFACTORY parallel-jaw gripper |
+| `xarm7__bio_gripper` | UFACTORY BIO gripper |
+| `xarm7__vacuum_gripper` | UFACTORY vacuum gripper |
+
+Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
+are pinned at 0 (closed gripper).
+
+Robot masks: GroundedSAM runs on **frame 0** (union of the top `--sam-kmax` masks). That union is
+propagated through the rest of the trajectory with SAM `mask_input` plus the previous mask's bbox,
+so contact with an object does not expand the robot mask.
 
 **Example 3: Generate a mesh for the "mustard bottle" seen in the first frame of a
 demonstration, then track that object through the demonstration:**
@@ -69,11 +101,6 @@ Note: FoundationPose runs inside the Docker container (see Installation above), 
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
 
 ```bash
-# First download the saved demonstrations to data/0802
-mkdir -p data
-gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
-
-
 # Start the server (`cd src/r2st/FoundationPose/docker; bash run_container.sh`), then in the container:
 cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
@@ -103,7 +130,10 @@ uv run python examples/track_object.py \
 
 ## Pose tracking (gRPC)
 
+Start the server inside the FoundationPose container (`bash run_container.sh` from `src/r2st/FoundationPose/docker`):
+
 ```bash
+cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 ```
 
 Then, on the host:
@@ -149,3 +179,9 @@ docker info | grep -iA3 Runtimes   # confirm "nvidia" shows up
 ```
 
 Error building `kaolin`/`pytorch3d` inside the container: `nvcc fatal: Unsupported gpu architecture 'compute_XX'` or a PyTorch warning that your GPU's CUDA capability (e.g. `sm_120` for RTX 50-series/Blackwell) isn't supported by the current PyTorch install. This means the image's CUDA/PyTorch versions predate your GPU's architecture — rebuild the image from `src/r2st/FoundationPose/docker/dockerfile` (already pinned to CUDA 12.8 + PyTorch 2.8, which covers everything through Blackwell); don't `docker pull` an older prebuilt image.
+
+Error inside the container: `CUDA initialization: ... Error 804: forward compatibility was attempted on non supported HW`, or on the host: `The NVIDIA driver on your system is too old`. CUDA 12.8 userspace needs a driver that reports CUDA >= 12.8 (typically 570+). `nvidia-smi` showing CUDA 12.4 / driver 550 is too old; upgrading the driver is required — rebuilding the image will not help.
+
+`gcloud storage cp` fails with `Reauthentication failed`: run `gcloud auth login`.
+
+`docker build` fails with `docker-credential-pass: executable file not found in $PATH`: `credsStore` in `~/.docker/config.json` is `pass`, but the helper is not on `PATH`. Put `$HOME/.local/bin` on `PATH` (a literal `~/.local/bin` in PATH is not expanded) and retry.

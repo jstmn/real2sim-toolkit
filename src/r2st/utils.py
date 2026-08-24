@@ -213,7 +213,7 @@ class ImageUtils:
             f"[info] Saved masked cropped image to {masked_cropped_path} "
             f"({masked_cropped.shape[1]}x{masked_cropped.shape[0]})"
         )
-        ImageUtils.save_demo_overlay(image_bgr, mask, asset_dir / f"{prefix}__demo.png")
+        ImageUtils.save_demo_overlay(image_bgr, mask, asset_dir / f"{prefix}.demo.png")
         return masked_cropped_path
 
     @staticmethod

@@ -6,11 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "cma>=4.4.4",
+    "cuda-toolkit[cccl,nvcc]>=13.0.3.0",
     "grpcio>=1.83.0",
     "h5py>=3.16.0",
     "jrl2",
     "mani_skill",
     "matplotlib>=3.11.1",
+    "ninja>=1.13.0",
     "numpy",
     "onnx>=1.22.0",
     "onnxruntime>=1.28.0",
