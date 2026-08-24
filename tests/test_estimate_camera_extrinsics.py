@@ -292,7 +292,7 @@ def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, mon
         np.save(_propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3), mask)
 
     fake = _FakePropagatePredictor()
-    monkeypatch.setattr(ece, "_load_grounded_sam", lambda: fake)
+    monkeypatch.setattr(ece, "_load_sam2", lambda: fake)
     out = ece._compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
     assert np.array_equal(out[0], cached[0])
     assert np.array_equal(out[1], cached[1])

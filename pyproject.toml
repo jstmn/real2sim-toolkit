@@ -23,6 +23,7 @@ dependencies = [
     "pyg-lib>=0.6.0",
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
+    "sam-2",
     "termcolor>=3.3.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
@@ -70,3 +71,4 @@ find-links = ["https://data.pyg.org/whl/torch-2.13.0+cu130.html"]
 [tool.uv.sources]
 jrl2 = { path = "thirdparty/Jrl2", editable = true }
 mani_skill = { path = "thirdparty/ManiSkill", editable = true }
+sam-2 = { path = "src/r2st/sam2", editable = true }

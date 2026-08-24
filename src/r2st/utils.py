@@ -249,18 +249,18 @@ class ImageUtils:
     def get_sam_masks_ranked(
         predictor, image_bgr: np.ndarray, object_name: str
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-        """Run GroundedSAM and return all masks sorted by confidence descending.
+        """Run GroundingDINO + SAM 2 and return all masks sorted by confidence descending.
 
         Returns `(N, H, W)` bool, `(N,)` scores, and GroundingDINO phrases.
         """
         assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
         assert len(object_name) > 0, "object_name must not be empty"
-        assert predictor._sam_predictor is not None, "GroundedSAM predictor not loaded"
-        assert predictor._bert_model is not None, "GroundedSAM bert model not loaded"
+        assert predictor._sam_predictor is not None, "SAM 2 predictor not loaded"
+        assert predictor._bert_model is not None, "GroundingDINO model not loaded"
         masks, scores, phrases = predictor.get_ranked_sam_masks(image_bgr, object_name)
         assert isinstance(masks, np.ndarray) and masks.dtype == bool, f"Expected bool ndarray masks, got {type(masks)}"
         assert masks.ndim == 3, f"Expected (N, H, W) masks, got {masks.shape}"
-        assert masks.shape[0] >= 1, "GroundedSAM returned no masks"
+        assert masks.shape[0] >= 1, "SAM 2 returned no masks"
         assert masks.shape[1:] == image_bgr.shape[:2], f"Mask shape {masks.shape[1:]} != image {image_bgr.shape[:2]}"
         assert scores.shape == (masks.shape[0],), f"scores {scores.shape} != n_masks {masks.shape[0]}"
         assert len(phrases) == masks.shape[0], f"phrases {len(phrases)} != n_masks {masks.shape[0]}"
@@ -268,7 +268,7 @@ class ImageUtils:
 
     @staticmethod
     def get_sam_mask(predictor, image_bgr: np.ndarray, object_name: str) -> np.ndarray:
-        """Run GroundedSAM and return the highest-confidence bool HxW mask for `object_name`."""
+        """Run GroundingDINO + SAM 2 and return the highest-confidence bool HxW mask for `object_name`."""
         masks, _, _ = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, object_name)
         return masks[0]
 

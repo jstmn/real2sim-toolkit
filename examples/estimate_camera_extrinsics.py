@@ -14,8 +14,8 @@ is the one-sided squared nearest-neighbor distance from pcd_real to pcd_sim.
 
 Notes:
 1. A preprocessing step is performed on the measured pointclouds to remove points that aren't part of the robot.
-    Frame 0 is GroundedSAM (union of top --sam-kmax masks). That union is then propagated through every later
-    RGB frame with SAM ``mask_input`` + the previous mask's bbox (no GroundingDINO after frame 0).
+    Frame 0 is GroundingDINO + SAM 2 (union of top --sam-kmax masks). That union is then propagated through every later
+    RGB frame with SAM 2 ``mask_input`` + the previous mask's bbox (no GroundingDINO after frame 0).
 2. If --visualize is set, a viser server is started. The server shows measured vs best-so-far
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
@@ -23,7 +23,7 @@ Notes:
 4. If --cache-robot-masks is set (default), each propagated mask is written as soon as it is computed to
    `<h5_dir>/<h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
     A later run loads a consecutive prefix of those files and resumes SAM from the last cached frame.
-    Frame 0's GroundedSAM union may also be read from the older
+    Frame 0's SAM 2 union may also be read from the older
     `robot-mask__<camera>__idx=0__...npy` seed cache. After the last frame, a dimmed-mask video is written to
     `robot-mask-propagated__<camera>__kmax=<k>__score_threshold=<t>.mp4`.
 
@@ -88,7 +88,7 @@ from r2st.constants import (
     get_depth_to_color_extrinsics,
 )
 from r2st.core import (
-    GroundedSAMPredictor,
+    SAM2Predictor,
     bbox_xyxy_from_mask,
     binary_mask_to_sam_mask_input,
 )
@@ -217,7 +217,7 @@ class Args:
     """CMA-ES population size. If unset, the cma library default is used."""
 
     robot_description: str = "robot arm"
-    """GroundedSAM text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
+    """GroundingDINO + SAM 2 text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
 
     sam_kmax: int = 5
     """Union at most this many highest-confidence SAM masks into the frame-0 robot mask."""
@@ -313,20 +313,20 @@ def _save_cached_bool_mask(path: pathlib.Path, mask: np.ndarray) -> None:
     np.save(path, mask)
 
 
-def _load_grounded_sam() -> GroundedSAMPredictor:
+def _load_sam2() -> SAM2Predictor:
     t0 = time.perf_counter()
-    predictor = GroundedSAMPredictor()
-    _log_elapsed("GroundedSAM loaded", t0)
+    predictor = SAM2Predictor()
+    _log_elapsed("SAM 2 loaded", t0)
     return predictor
 
 
 def _propagate_robot_masks(
     rgb: np.ndarray,
-    predictor: GroundedSAMPredictor,
+    predictor: SAM2Predictor,
     seed_mask: np.ndarray,
     cache_paths: list[pathlib.Path] | None = None,
 ) -> np.ndarray:
-    """Propagate ``seed_mask`` (frame 0) through ``rgb`` with SAM mask_input + bbox."""
+    """Propagate ``seed_mask`` (frame 0) through ``rgb`` with SAM 2 mask_input + bbox."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
@@ -364,7 +364,7 @@ def _compute_propagated_robot_masks(
     cache_robot_masks: bool,
     visualize_robot_masks: bool,
 ) -> np.ndarray:
-    """Return ``(T, H, W)`` robot masks. Frame 0 is GroundedSAM; later frames are SAM-propagated."""
+    """Return ``(T, H, W)`` robot masks. Frame 0 is GroundingDINO + SAM 2; later frames are SAM 2-propagated."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
@@ -383,7 +383,7 @@ def _compute_propagated_robot_masks(
             for t in range(n_cached):
                 masks[t] = _load_cached_bool_mask(propagated_paths[t], hw)
             print(f"[info] Resuming robot-mask propagation from frame {n_cached} ({n_cached}/{n_frames} cached)")
-            predictor = _load_grounded_sam()
+            predictor = _load_sam2()
             rest = _propagate_robot_masks(
                 rgb[n_cached - 1 :],
                 predictor,
@@ -394,12 +394,12 @@ def _compute_propagated_robot_masks(
             masks[n_cached:] = rest[1:]
         else:
             seed_path = _robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold)
-            predictor: GroundedSAMPredictor | None = None
+            predictor: SAM2Predictor | None = None
             if cache_robot_masks and seed_path.is_file():
                 seed_mask = _load_cached_bool_mask(seed_path, hw)
                 print(f"[info] Loaded frame-0 robot mask from {seed_path}")
             else:
-                predictor = _load_grounded_sam()
+                predictor = _load_sam2()
                 image_bgr0 = cv2.cvtColor(rgb[0], cv2.COLOR_RGB2BGR)
                 print(f"[info] Segmenting '{robot_description}' on frame 0 ...")
                 t0 = time.perf_counter()
@@ -435,7 +435,7 @@ def _compute_propagated_robot_masks(
                     _save_cached_bool_mask(cache_paths[0], seed_mask)
             else:
                 if predictor is None:
-                    predictor = _load_grounded_sam()
+                    predictor = _load_sam2()
                 print(f"[info] Propagating frame-0 robot mask through {n_frames} frames ...")
                 t0 = time.perf_counter()
                 masks = _propagate_robot_masks(rgb, predictor, seed_mask, cache_paths=cache_paths)

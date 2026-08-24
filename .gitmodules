@@ -1,0 +1,3 @@
+[submodule "src/r2st/sam2"]
+	path = src/r2st/sam2
+	url = git@github.com:jstmn/sam2.git

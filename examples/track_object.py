@@ -10,7 +10,7 @@ import tyro
 from tqdm import tqdm
 
 from r2st.constants import get_color_intrinsics
-from r2st.core import GroundedSAMPredictor
+from r2st.core import SAM2Predictor
 from r2st.geometry import (
     depth_mm_to_meters,
     masked_depth_to_points,
@@ -136,10 +136,10 @@ def main(args: Args) -> None:
     depth0 = depth_m_all[0]
     image_bgr0 = cv2.cvtColor(rgb0, cv2.COLOR_RGB2BGR)
 
-    print("[info] Loading GroundedSAM (GroundingDINO + SAM weights) ...")
+    print("[info] Loading SAM 2 (GroundingDINO + SAM 2 weights) ...")
     t0 = time.perf_counter()
-    predictor = GroundedSAMPredictor()
-    _log_elapsed("GroundedSAM loaded", t0)
+    predictor = SAM2Predictor()
+    _log_elapsed("SAM 2 loaded", t0)
     print(f"[info] Segmenting '{args.object_description}' on frame 0 ...")
     t0 = time.perf_counter()
     mask = ImageUtils.get_sam_mask(predictor, image_bgr0, args.object_description)
