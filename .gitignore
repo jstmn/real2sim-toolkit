@@ -21,3 +21,6 @@ src/r2st/FoundationPose/weights/*
 
 *.code-workspace
 thirdparty/*/
+
+src/r2st/sam2/
+src/r2st/models/sam2.1_hiera_large.pt

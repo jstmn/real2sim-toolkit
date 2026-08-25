@@ -174,9 +174,9 @@ class SAM3Predictor:
         self._confidence_threshold = confidence_threshold
         model = build_sam3_image_model(device=self._device, enable_inst_interactivity=True)
         self._processor = Sam3Processor(model, device=self._device, confidence_threshold=self._confidence_threshold)
-        self._interactive = model.inst_interactive_predictor
+        self._model = model
         assert self._processor is not None, "SAM 3 processor not loaded"
-        assert self._interactive is not None, "SAM 3 interactive predictor not loaded"
+        assert self._model.inst_interactive_predictor is not None, "SAM 3 interactive predictor not loaded"
         if torch.device(self._device).type == "cuda":
             sam_where = f"GPU ({self._device})"
         else:
@@ -209,16 +209,16 @@ class SAM3Predictor:
         assert masks_t.shape[1:] == (height, width), f"Mask size {tuple(masks_t.shape[1:])} != image {(height, width)}"
         assert scores_t.shape == (masks_t.shape[0],), f"scores {tuple(scores_t.shape)} != n_masks {masks_t.shape[0]}"
         order = torch.argsort(scores_t, descending=True)
-        masks_np = masks_t[order].detach().cpu().numpy().astype(bool)
-        scores_np = scores_t[order].detach().cpu().numpy().astype(np.float64)
+        masks_np = masks_t[order].detach().float().cpu().numpy().astype(bool)
+        scores_np = scores_t[order].detach().float().cpu().numpy().astype(np.float64)
         phrases_sorted = [object_name] * int(masks_np.shape[0])
         if self._debug_output_dir is not None:
             print(f"Saving SAM 3 output to '{self._debug_output_dir}'")
             save_mask_image(
                 image_rgb,
                 self._debug_output_dir,
-                masks_t[order].detach(),
-                boxes_t[order].detach().cpu(),
+                masks_t[order].detach().float(),
+                boxes_t[order].detach().float().cpu(),
                 phrases_sorted,
             )
         return masks_np, scores_np, phrases_sorted
@@ -234,7 +234,7 @@ class SAM3Predictor:
         ``mask_input`` is SAM 3's dense prompt ``(1, 288, 288)``. ``box_xyxy`` is the
         previous binary mask's XYXY box in pixel coordinates.
         """
-        assert self._interactive is not None, "SAM 3 interactive predictor not loaded"
+        assert self._model is not None, "SAM 3 model not loaded"
         assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"image_bgr must be HxWx3, got {image_bgr.shape}"
         assert mask_input.shape == (
             1,
@@ -246,14 +246,20 @@ class SAM3Predictor:
         assert np.isfinite(box_xyxy).all(), f"box_xyxy contains non-finite values: {box_xyxy}"
         assert box_xyxy[2] > box_xyxy[0] and box_xyxy[3] > box_xyxy[1], f"Degenerate box {box_xyxy.tolist()}"
         image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        self._interactive.set_image(image_rgb)
-        masks, ious, low_res = self._interactive.predict(
+        image_pil = PILImage.fromarray(image_rgb)
+        state = self._processor.set_image(image_pil)
+        masks, ious, low_res = self._model.predict_inst(
+            state,
             point_coords=None,
             point_labels=None,
             box=box_xyxy.astype(np.float32),
             mask_input=mask_input.astype(np.float32),
             multimask_output=False,
         )
+        if masks.ndim == 2:
+            masks = masks[None, ...]
+            ious = np.atleast_1d(ious)
+            low_res = low_res[None, ...] if low_res.ndim == 2 else low_res
         assert masks.ndim == 3 and masks.shape[0] == 1, f"Expected (1, H, W) masks, got {masks.shape}"
         assert masks.shape[1:] == image_bgr.shape[:2], f"Mask {masks.shape[1:]} != image {image_bgr.shape[:2]}"
         assert ious.shape == (1,), f"Expected one IoU, got {ious.shape}"
