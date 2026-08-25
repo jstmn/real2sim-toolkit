@@ -79,6 +79,9 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 
 
 **Example 4: Estimate camera extrinsics and save results to a yaml file.** This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
+
+![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
+
 ```bash
 
 # Seed CMA-ES with the GUI.
