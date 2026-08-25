@@ -64,31 +64,47 @@ uv run python examples/generate_mask.py --image data/raise_cube_0__camera_base__
 uv run python examples/generate_masks_across_trajectory.py \
     --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
-    --object-description "robot arm"
+    --object-description "white robot arm"
 ```
 
 
 **Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:**
+Exactly one of `--object-description` or `--object-description-from-vlm` is required.
 
 ```bash
-uv run python examples/generate_mesh.py --images data/red_T_block_1.png --visualize
-uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --visualize
+# OpenAI returns "red T block" for red_T_block_1.png; SAM 3 returns no mask for that, but does for "red block".
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png --object-description "red block" --visualize
+uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --object-description-from-vlm --visualize
 ```
 
 
 **Example 4: Estimate camera extrinsics and save results to a yaml file.** This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
 ```bash
+
+# Seed CMA-ES with the GUI.
 uv run python examples/estimate_camera_extrinsics.py \
   --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
-  --n-timesteps 2 \
+  --n-timesteps 5 \
   --output-path data/demonstrations/0802/extrinsics.yaml \
   --seed-from-gui \
   --visualize \
   --visualize-robot-masks
+
+# You can also seed CMA-ES with a specific pose.
+uv run python examples/estimate_camera_extrinsics.py \
+  --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --robot-id xarm7__gripper \
+  --camera cam_1 \
+  --camera-model-id d435 \
+  --depth-intrinsics-source rgb \
+  --n-timesteps 5 \
+  --output-path data/demonstrations/0802/extrinsics.yaml \
+  --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
+  --visualize
 ```
 
 Exactly one seed mode is required:
@@ -98,6 +114,7 @@ Exactly one seed mode is required:
   world-frame (robot-base) hotkeys: R/F X, T/G Y, Y/H Z, U/J roll about X, I/K pitch about Y,
   O/L yaw about Z (top row +, bottom row -). Press Enter or click **Select seed and start CMA-ES**.
   `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
+- `--seed-pose x y z qw qx qy qz` seeds CMA-ES with that robot-base camera pose.
 
 `--robot-id` is a Jrl2 robot name. A bare name is the arm only. `{robot}__{eef}` is the same arm with that
 end effector (`__` delimits robot vs EEF; `_` stays inside each token):

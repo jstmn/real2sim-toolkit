@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from transforms3d.axangles import axangle2mat
+from transforms3d.quaternions import mat2quat
 
 from examples.estimate_camera_extrinsics import (
     _CAPTURE_AXES,
@@ -13,6 +14,7 @@ from examples.estimate_camera_extrinsics import (
     _look_at_opencv,
     _look_at_with_roll,
     _n_consecutive_cached_masks,
+    _pose_from_xyz_wxyz,
     _propagate_robot_masks,
     _propagated_robot_mask_cache_path,
     _propagated_robot_mask_video_path,
@@ -22,16 +24,61 @@ from examples.estimate_camera_extrinsics import (
     _world_points_to_camera,
 )
 
-
-@pytest.mark.parametrize(("seed_automatically", "seed_from_gui"), [(True, False), (False, True)])
-def test_exactly_one_seed_mode_is_valid(seed_automatically: bool, seed_from_gui: bool):
-    _validate_seed_mode(seed_automatically, seed_from_gui)
+_SEED_POSE = (0.80, 0.00, 0.50, 1.00, 0.00, 0.00, 0.00)
 
 
-@pytest.mark.parametrize(("seed_automatically", "seed_from_gui"), [(False, False), (True, True)])
-def test_zero_or_two_seed_modes_raise(seed_automatically: bool, seed_from_gui: bool):
+@pytest.mark.parametrize(
+    ("seed_automatically", "seed_from_gui", "seed_pose"),
+    [
+        (True, False, None),
+        (False, True, None),
+        (False, False, _SEED_POSE),
+    ],
+)
+def test_exactly_one_seed_mode_is_valid(
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
+):
+    _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
+
+
+@pytest.mark.parametrize(
+    ("seed_automatically", "seed_from_gui", "seed_pose"),
+    [
+        (False, False, None),
+        (True, True, None),
+        (True, False, _SEED_POSE),
+        (False, True, _SEED_POSE),
+        (True, True, _SEED_POSE),
+    ],
+)
+def test_zero_or_two_seed_modes_raise(
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
+):
     with pytest.raises(AssertionError, match="Exactly one"):
-        _validate_seed_mode(seed_automatically, seed_from_gui)
+        _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
+
+
+def test_pose_from_xyz_wxyz_roundtrip():
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = [0.1, -0.2, 0.3]
+    T[:3, :3] = axangle2mat(np.array([0.0, 0.0, 1.0]), 0.4)
+    q = mat2quat(T[:3, :3])
+    T_back = _pose_from_xyz_wxyz(np.concatenate([T[:3, 3], q]))
+    assert np.allclose(T_back, T)
+
+
+def test_pose_from_xyz_wxyz_rejects_zero_quaternion():
+    with pytest.raises(AssertionError, match="zero"):
+        _pose_from_xyz_wxyz((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+
+def test_pose_from_xyz_wxyz_rejects_nonunit_quaternion():
+    with pytest.raises(AssertionError, match="unit"):
+        _pose_from_xyz_wxyz((0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0))
 
 
 def test_world_translation_ignores_camera_orientation():

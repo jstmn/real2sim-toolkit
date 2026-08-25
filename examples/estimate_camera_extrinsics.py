@@ -79,7 +79,7 @@ import yaml
 from jrl2.robots import NAME_TO_ROBOT, get_robot_by_name
 from tqdm import tqdm
 from transforms3d.axangles import axangle2mat, mat2axangle
-from transforms3d.quaternions import mat2quat
+from transforms3d.quaternions import mat2quat, quat2mat
 
 from r2st.constants import (
     MIN_DEPTH_M,
@@ -174,11 +174,14 @@ class Args:
     n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
 
-    n_pcd_samples: int = 512
-    """Number of FPS points kept from each real robot cloud and from the fused 6-view sim cloud."""
+    n_pcd_samples_real: int = 1024
+    """Number of FPS points kept from each measured robot cloud."""
 
-    n_random_downsample_initial: int = 1024
-    """Random pre-FPS cap for each real robot cloud. Must be >= n_pcd_samples."""
+    n_pcd_samples_sim: int = 4096
+    """Number of FPS points kept from each fused 6-view sim robot cloud."""
+
+    n_random_downsample_initial: int = 16384
+    """Random pre-FPS cap for each measured robot cloud. Must be >= n_pcd_samples_real."""
 
     cma_sigma_pos: float = 0.10
     """CMA-ES initial std for camera translation (meters)."""
@@ -194,6 +197,9 @@ class Args:
 
     seed_from_gui: bool = False
     """If set, choose the CMA-ES seed interactively with Viser GUI controls."""
+
+    seed_pose: tuple[float, float, float, float, float, float, float] | None = None
+    """If set, seed CMA-ES with this robot-base camera pose: x y z qw qx qy qz."""
 
     gui_translation_step_m: float = 0.02
     """World-frame translation per GUI button press, in meters."""
@@ -242,8 +248,13 @@ def _log_elapsed(label: str, t0: float) -> None:
     print(f"[info] {label} ({time.perf_counter() - t0:.1f}s)")
 
 
-def _validate_seed_mode(seed_automatically: bool, seed_from_gui: bool) -> None:
-    assert seed_automatically != seed_from_gui, "Exactly one of --seed-automatically or --seed-from-gui must be passed"
+def _validate_seed_mode(
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
+) -> None:
+    n_modes = int(seed_automatically) + int(seed_from_gui) + int(seed_pose is not None)
+    assert n_modes == 1, "Exactly one of --seed-automatically, --seed-from-gui, or --seed-pose must be passed"
 
 
 def _robot_mask_cache_path(
@@ -765,6 +776,21 @@ def _generate_seed_poses(
     assert len(poses) == n_expected, f"expected {n_expected} seeds, got {len(poses)}"
     assert all(T[2, 3] > 0.0 for T in poses), "All seed camera poses must have translation z > 0"
     return poses
+
+
+def _pose_from_xyz_wxyz(xyz_wxyz: np.ndarray | tuple[float, ...]) -> np.ndarray:
+    """Build OpenCV T_world_cam from robot-base x y z qw qx qy qz."""
+    xyz_wxyz = np.asarray(xyz_wxyz, dtype=np.float64).reshape(-1)
+    assert xyz_wxyz.shape == (7,), f"seed pose must be x y z qw qx qy qz, got shape {xyz_wxyz.shape}"
+    t = xyz_wxyz[:3]
+    q = xyz_wxyz[3:]
+    q_norm = float(np.linalg.norm(q))
+    assert q_norm > 1e-8, f"seed quaternion is zero: {q}"
+    assert abs(q_norm - 1.0) < 1e-3, f"seed quaternion must be unit length, got norm={q_norm} q={q}"
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = quat2mat(q / q_norm)
+    T[:3, 3] = t
+    return T
 
 
 def _T_to_vec(T: np.ndarray) -> np.ndarray:
@@ -1533,6 +1559,7 @@ def _optimize_extrinsics(
     chamfer_device: str,
     seed_automatically: bool,
     seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
     gui_translation_step_m: float,
     gui_rotation_step_deg: float,
     n_seed_azimuth: int,
@@ -1554,7 +1581,7 @@ def _optimize_extrinsics(
     assert n_seed_radii >= 1, f"n_seed_radii must be >= 1, got {n_seed_radii}"
     assert cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {cma_sigma_pos}"
     assert cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {cma_sigma_rot}"
-    _validate_seed_mode(seed_automatically, seed_from_gui)
+    _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
     if seed_automatically:
         seed_Ts = _generate_seed_poses(n_seed_azimuth, n_seed_polar, n_seed_rolls, n_seed_radii)
         radii = np.linspace(_SEED_RADIUS_MIN_M, _SEED_RADIUS_MAX_M, n_seed_radii, dtype=np.float64)
@@ -1572,13 +1599,26 @@ def _optimize_extrinsics(
             vis,
         )
         _log_elapsed(f"Seed search finished, best={best_cost:.6f}", t0_seed)
-    else:
+    elif seed_from_gui:
         assert vis is not None, "GUI seed selection requires an ExtrinsicsVisualizer"
         best_T, best_cost, best_pcd_sims = vis.select_seed_from_gui(
             gui_translation_step_m,
             gui_rotation_step_deg,
         )
         print(f"[info] Manual seed selected: cost={best_cost:.6f} T_world_cam=\n{best_T}")
+    else:
+        assert seed_pose is not None, "seed_pose is required when not using --seed-automatically or --seed-from-gui"
+        best_T = _pose_from_xyz_wxyz(seed_pose)
+        t0_seed = time.perf_counter()
+        best_cost, best_pcd_sims, _, _ = _pose_cost(best_T, pcd_reals, pcd_sim_worlds, chamfer_device)
+        if vis is not None:
+            vis.set_best(best_pcd_sims, best_cost, best_T)
+            vis.record_seed_best(time.perf_counter() - t0_seed, best_cost)
+        q_wxyz = mat2quat(best_T[:3, :3])
+        print(
+            f"[info] Seed pose xyz={best_T[:3, 3].tolist()} wxyz={q_wxyz.tolist()} "
+            f"cost={best_cost:.6f} T_world_cam=\n{best_T}"
+        )
 
     x0 = _T_to_vec(best_T)
     cma_stds = [cma_sigma_pos, cma_sigma_pos, cma_sigma_pos, cma_sigma_rot, cma_sigma_rot, cma_sigma_rot]
@@ -1659,16 +1699,17 @@ def main(args: Args) -> None:
         args.robot_id.lower() in NAME_TO_ROBOT
     ), f"Unknown robot_id {args.robot_id!r}. Available: {sorted(NAME_TO_ROBOT)}"
     assert args.n_timesteps >= 1, f"n_timesteps must be >= 1, got {args.n_timesteps}"
-    assert args.n_pcd_samples >= 1, f"n_pcd_samples must be >= 1, got {args.n_pcd_samples}"
-    assert args.n_random_downsample_initial >= args.n_pcd_samples, (
+    assert args.n_pcd_samples_real >= 1, f"n_pcd_samples_real must be >= 1, got {args.n_pcd_samples_real}"
+    assert args.n_pcd_samples_sim >= 1, f"n_pcd_samples_sim must be >= 1, got {args.n_pcd_samples_sim}"
+    assert args.n_random_downsample_initial >= args.n_pcd_samples_real, (
         f"n_random_downsample_initial ({args.n_random_downsample_initial}) must be >= "
-        f"n_pcd_samples ({args.n_pcd_samples})"
+        f"n_pcd_samples_real ({args.n_pcd_samples_real})"
     )
     assert args.cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {args.cma_sigma_pos}"
     assert args.cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {args.cma_sigma_rot}"
     assert args.cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {args.cma_maxiter}"
     assert args.cma_popsize is None or args.cma_popsize >= 2, f"cma_popsize must be >= 2, got {args.cma_popsize}"
-    _validate_seed_mode(args.seed_automatically, args.seed_from_gui)
+    _validate_seed_mode(args.seed_automatically, args.seed_from_gui, args.seed_pose)
     assert args.gui_translation_step_m > 0.0, f"gui_translation_step_m must be > 0, got {args.gui_translation_step_m}"
     assert args.gui_rotation_step_deg > 0.0, f"gui_rotation_step_deg must be > 0, got {args.gui_rotation_step_deg}"
     assert args.n_seed_azimuth >= 1, f"n_seed_azimuth must be >= 1, got {args.n_seed_azimuth}"
@@ -1777,7 +1818,7 @@ def main(args: Args) -> None:
         )
         demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
         pts = masked_depth_to_points(depth_m_sel[i], mask, K)
-        pts = _subsample_pcd(pts, args.n_pcd_samples, args.n_random_downsample_initial, chamfer_device, rng)
+        pts = _subsample_pcd(pts, args.n_pcd_samples_real, args.n_random_downsample_initial, chamfer_device, rng)
         assert pts.shape[0] >= 1, f"No robot points at frame {frame_idx}"
         pcd_reals.append(pts)
         print(f"[info] pcd_real[{i}] n={pts.shape[0]}")
@@ -1795,7 +1836,7 @@ def main(args: Args) -> None:
     pcd_sim_worlds: list[np.ndarray] = []
     t0_sim = time.perf_counter()
     for i, q in enumerate(qpos_sel):
-        p_world = renderer.render_multiview_world(q, args.n_pcd_samples, chamfer_device)
+        p_world = renderer.render_multiview_world(q, args.n_pcd_samples_sim, chamfer_device)
         pcd_sim_worlds.append(p_world)
         print(f"[info] pcd_sim_world[{i}] n={p_world.shape[0]}")
     _log_elapsed(f"Rendered 6-view sim clouds for {len(pcd_sim_worlds)} timesteps", t0_sim)
@@ -1814,6 +1855,7 @@ def main(args: Args) -> None:
         chamfer_device,
         args.seed_automatically,
         args.seed_from_gui,
+        args.seed_pose,
         args.gui_translation_step_m,
         args.gui_rotation_step_deg,
         args.n_seed_azimuth,
