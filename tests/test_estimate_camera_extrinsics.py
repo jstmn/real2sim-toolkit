@@ -18,6 +18,7 @@ from examples.estimate_camera_extrinsics import (
     _propagate_robot_masks,
     _propagated_robot_mask_cache_path,
     _propagated_robot_mask_video_path,
+    _remove_radius_outliers,
     _step_pose_world,
     _transform_points,
     _validate_seed_mode,
@@ -133,6 +134,21 @@ def test_look_at_roll_pi_flips_camera_x_and_y():
     assert np.allclose(T[:3, 2], T0[:3, 2])
     assert np.allclose(T[:3, 0], -T0[:3, 0])
     assert np.allclose(T[:3, 1], -T0[:3, 1])
+
+
+def test_remove_radius_outliers_drops_isolated_points():
+    xs, ys, zs = np.mgrid[0:5, 0:5, 0:2]
+    cluster = np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1).astype(np.float64) * 0.01
+    isolated = np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0]], dtype=np.float64)
+    out = _remove_radius_outliers(np.vstack([cluster, isolated]), nb_points=10, radius_m=0.10)
+    assert out.shape[0] == 50
+    assert np.all(np.linalg.norm(out, axis=1) < 0.2)
+
+
+def test_remove_radius_outliers_rejects_all_isolated_points():
+    pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    with pytest.raises(AssertionError, match="removed all"):
+        _remove_radius_outliers(pts, nb_points=10, radius_m=0.10)
 
 
 def test_world_points_to_camera_inverts_transform_points():

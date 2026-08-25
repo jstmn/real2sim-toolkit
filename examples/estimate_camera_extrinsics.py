@@ -16,6 +16,8 @@ Notes:
 1. A preprocessing step is performed on the measured pointclouds to remove points that aren't part of the robot.
     Frame 0 is SAM 3 (union of top --sam-kmax masks). That union is then propagated through every later
     RGB frame with SAM 3 ``mask_input`` + the previous mask's bbox (text prompt only on frame 0).
+    After unprojection, Open3D ``remove_radius_outlier`` drops points with fewer than
+    ``--radius-outlier-nb-points`` neighbors in ``--radius-outlier-radius-m`` (default 10 in 10 cm).
 2. If --visualize is set, a viser server is started. The server shows measured vs best-so-far
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
@@ -174,7 +176,7 @@ class Args:
     n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
 
-    n_pcd_samples_real: int = 1024
+    n_pcd_samples_real: int = 4096
     """Number of FPS points kept from each measured robot cloud."""
 
     n_pcd_samples_sim: int = 4096
@@ -234,8 +236,14 @@ class Args:
     cache_robot_masks: bool = True
     """If set, load/save propagated robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
 
-    mask_erode_px: int = 7
+    mask_erode_px: int = 9
     """Erode the robot mask with an elliptical kernel of this size (pixels) before unprojecting. 0 skips erosion."""
+
+    radius_outlier_nb_points: int = 10
+    """Keep a measured point only if this many points lie within radius_outlier_radius_m of it."""
+
+    radius_outlier_radius_m: float = 0.10
+    """Search radius (meters) for the measured-cloud radius-outlier filter."""
 
     visualize: bool = False
     """If set, start a viser server with robot-base pointclouds, camera frustum, and a cost plot."""
@@ -853,6 +861,26 @@ def _world_points_to_camera(T_world_cam: np.ndarray, pts_world: np.ndarray) -> n
     R = T_world_cam[:3, :3]
     t = T_world_cam[:3, 3]
     return ((pts_world.astype(np.float64) - t) @ R).astype(np.float32)
+
+
+def _remove_radius_outliers(points: np.ndarray, nb_points: int, radius_m: float) -> np.ndarray:
+    """Drop points with fewer than `nb_points` neighbors inside `radius_m` (Open3D radius outlier)."""
+    import open3d as o3d
+
+    assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
+    assert points.shape[0] >= 1, "points must contain at least 1 point"
+    assert nb_points >= 1, f"nb_points must be >= 1, got {nb_points}"
+    assert radius_m > 0.0, f"radius_m must be > 0, got {radius_m}"
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    filtered, _ind = pcd.remove_radius_outlier(nb_points=nb_points, radius=radius_m)
+    out = np.asarray(filtered.points)
+    assert out.ndim == 2 and out.shape[1] == 3, f"filtered points must be (N, 3), got {out.shape}"
+    assert out.shape[0] >= 1, (
+        f"Radius outlier filter removed all points (n_in={points.shape[0]}, nb_points={nb_points}, "
+        f"radius_m={radius_m})"
+    )
+    return out.astype(np.float64, copy=False)
 
 
 def _subsample_pcd(
@@ -1724,6 +1752,10 @@ def main(args: Args) -> None:
     assert args.mask_erode_px == 0 or (
         args.mask_erode_px >= 1 and args.mask_erode_px % 2 == 1
     ), f"mask_erode_px must be 0 or a positive odd int, got {args.mask_erode_px}"
+    assert (
+        args.radius_outlier_nb_points >= 1
+    ), f"radius_outlier_nb_points must be >= 1, got {args.radius_outlier_nb_points}"
+    assert args.radius_outlier_radius_m > 0.0, f"radius_outlier_radius_m must be > 0, got {args.radius_outlier_radius_m}"
     assert args.depth_intrinsics_source in (
         "rgb",
         "depth",
@@ -1818,6 +1850,12 @@ def main(args: Args) -> None:
         )
         demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
         pts = masked_depth_to_points(depth_m_sel[i], mask, K)
+        n_unproj = int(pts.shape[0])
+        pts = _remove_radius_outliers(pts, args.radius_outlier_nb_points, args.radius_outlier_radius_m)
+        print(
+            f"[info] pcd_real[{i}] radius-outlier: {n_unproj} -> {pts.shape[0]} "
+            f"(nb_points={args.radius_outlier_nb_points}, radius_m={args.radius_outlier_radius_m})"
+        )
         pts = _subsample_pcd(pts, args.n_pcd_samples_real, args.n_random_downsample_initial, chamfer_device, rng)
         assert pts.shape[0] >= 1, f"No robot points at frame {frame_idx}"
         pcd_reals.append(pts)
