@@ -1,5 +1,7 @@
 # Real2sim_toolkit
 
+![Real2sim toolkit](media/real2sim-toolkit.jpg)
+
 This repository is an API for creating and maintaining a digital twin of a physical environment.
 
 ## Installation
@@ -50,7 +52,8 @@ gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 
 ## Examples
 
-**Example 1: Segment an object with SAM 3.** This is the smoke test for text-prompted masking. It writes a dimmed overlay, a masked crop, and a bool `.npy` mask. The first run downloads the gated SAM 3 checkpoint from Hugging Face (see Installation).
+### Example 1: Segment an object with SAM 3.
+This is the smoke test for text-prompted masking. It writes a dimmed overlay, a masked crop, and a bool `.npy` mask. The first run downloads the gated SAM 3 checkpoint from Hugging Face (see Installation).
 
 ```bash
 uv run python examples/generate_mask.py --image data/red_T_block_1.png --object-description "red T block"
@@ -58,7 +61,8 @@ uv run python examples/generate_mask.py --image data/raise_cube_0__camera_base__
 ```
 
 
-**Example 2: Track a mask through a demonstration.** SAM 3 segments the prompt on **frame 0** (union of the top `--sam-kmax` masks whose score is above `--sam-score-threshold`). That union is propagated through later RGB frames with SAM 3 `mask_input` plus the previous mask's bbox. Writes per-frame `.npy` masks, dimmed overlays, and an mp4 under `<h5_dir>/<h5_stem>/`.
+### Example 2: Track a mask through a demonstration.
+SAM 3 segments the prompt on **frame 0** (union of the top `--sam-kmax` masks whose score is above `--sam-score-threshold`). That union is propagated through later RGB frames with SAM 3 `mask_input` plus the previous mask's bbox. Writes per-frame `.npy` masks, dimmed overlays, and an mp4 under `<h5_dir>/<h5_stem>/`.
 
 ```bash
 uv run python examples/generate_masks_across_trajectory.py \
@@ -68,7 +72,7 @@ uv run python examples/generate_masks_across_trajectory.py \
 ```
 
 
-**Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:**
+### Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
 Exactly one of `--object-description` or `--object-description-from-vlm` is required.
 
 ```bash
@@ -78,7 +82,8 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 ```
 
 
-**Example 4: Estimate camera extrinsics and save results to a yaml file.** This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
+### Example 4: Estimate camera extrinsics and save results to a yaml file.
+This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
 
 ![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
 
@@ -119,12 +124,14 @@ Exactly one seed mode is required:
   `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
 - `--seed-pose x y z qw qx qy qz` seeds CMA-ES with that robot-base camera pose.
 
-`--robot-id` is a Jrl2 robot name. A bare name is the arm only. `{robot}__{eef}` is the same arm with that
-end effector (`__` delimits robot vs EEF; `_` stays inside each token):
+`--robot-id` is a Jrl2 robot name. The following are supported:
 
 | `--robot-id` | End effector |
 | --- | --- |
-| `xarm7` | none (wrist flange only) |
+| `panda` | none (wrist flange only) |
+| `ur5` | none |
+| `ur10` | none |
+| `xarm7` | none |
 | `xarm7__gripper` | UFACTORY parallel-jaw gripper |
 | `xarm7__bio_gripper` | UFACTORY BIO gripper |
 | `xarm7__vacuum_gripper` | UFACTORY vacuum gripper |
@@ -136,21 +143,26 @@ Robot masks: SAM 3 runs on **frame 0** (union of the top `--sam-kmax` masks). Th
 propagated through the rest of the trajectory with SAM 3 `mask_input` plus the previous mask's bbox,
 so contact with an object does not expand the robot mask.
 
-**Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
+### Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
 demonstration, then track that object through the demonstration:**
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv. 
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
+FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-path` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
+
+![FoundationPose mustard bottle tracking](media/mustard_bottle__track.foundationpose.gif)
 
 ```bash
 # Start the server (`cd src/r2st/FoundationPose/docker; bash run_container.sh`), then in the container:
 cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
+# Track the object in the camera optical frame.
 uv run python examples/track_object.py \
     --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --camera-model-id d435 \
     --object-description "mustard bottle" \
+    --extrinsics-path data/demonstrations/0802/extrinsics.yaml \
     --visualize
 
 uv run python examples/track_object.py \
@@ -203,8 +215,9 @@ imported as a package).
 
 * [SAM 3](https://github.com/jstmn/sam3) (fork of [facebookresearch/sam3](https://github.com/facebookresearch/sam3))
 * [FoundationPose](https://github.com/OpenGVLab/FoundationPose)
-* [Cutie](https://github.com/hkchengrex/Cutie) — optional 2D tracker used by `FoundationPoseTracker(use_2d_tracker=True)` to
-  re-anchor FoundationPose's translation each frame (ported from
+* [Cutie](https://github.com/hkchengrex/Cutie) — 2D tracker used by default (`FoundationPoseTracker(use_2d_tracker=True)`) to
+  re-anchor FoundationPose's translation each frame, with a 6-DoF Kalman filter (`use_kalman_filter=True`)
+  fusing that measurement (ported from
   [FoundationPose++](https://github.com/lidingsheng/FoundationPose-plus-plus))
 
 

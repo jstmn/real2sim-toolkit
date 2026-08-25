@@ -347,9 +347,9 @@ def bilateral_filter_depth_kernel(
     if w >= W or h >= H:
         return
     out[h, w] = 0.0
-    # Warp treats bare literals as constants; wrap so they can be mutated in the dynamic loop.
-    mean_depth = 0.0
-    num_valid = 0
+    # Warp treats `0.0` as a compile-time constant; `float(0.0)` / `int(0)` make them mutable in dynamic loops.
+    mean_depth = float(0.0)
+    num_valid = int(0)
     for u in range(w - radius, w + radius + 1):
         if u < 0 or u >= W:
             continue
@@ -365,8 +365,8 @@ def bilateral_filter_depth_kernel(
     mean_depth /= float(num_valid)
 
     depthCenter = depth[h, w]
-    sum_weight = 0.0
-    weighted_sum = 0.0
+    sum_weight = float(0.0)
+    weighted_sum = float(0.0)
     for u in range(w - radius, w + radius + 1):
         if u < 0 or u >= W:
             continue
@@ -418,8 +418,9 @@ def erode_depth_kernel(
     d_ori = depth[h, w]
     if d_ori < 0.001 or d_ori >= zfar:
         out[h, w] = 0.0
-    bad_cnt = 0.0
-    total = 0.0
+    # Warp treats `0.0` as a compile-time constant; `float(0.0)` makes them mutable in dynamic loops.
+    bad_cnt = float(0.0)
+    total = float(0.0)
     for u in range(w - radius, w + radius + 1):
         if u < 0 or u >= W:
             continue
@@ -430,7 +431,9 @@ def erode_depth_kernel(
             total += 1.0
             if cur_depth < 0.001 or cur_depth >= zfar or abs(cur_depth - d_ori) > depth_diff_thres:
                 bad_cnt += 1.0
-    if bad_cnt / total > ratio_thres:
+    if total <= 0.0:
+        out[h, w] = d_ori
+    elif bad_cnt / total > ratio_thres:
         out[h, w] = 0.0
     else:
         out[h, w] = d_ori

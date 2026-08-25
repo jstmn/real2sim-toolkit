@@ -62,6 +62,13 @@ class PoseTrackingServicer(pose_tracking_pb2_grpc.PoseTrackingServicer):
         depth_m = codec.decode_image(request.depth_m, np.float32)
         mask = codec.decode_image(request.mask, np.uint8).astype(bool)
         K = codec.decode_k_matrix(request.k_matrix)
+        n_mask = int(mask.sum())
+        n_valid = int(((depth_m >= 0.001) & mask).sum())
+        print(
+            f"[pose_server] Register: mask={n_mask} valid_depth={n_valid} "
+            f"iteration={request.iteration} use_2d_tracker={request.use_2d_tracker} "
+            f"use_kalman_filter={request.use_kalman_filter} mesh={request.mesh_path}"
+        )
 
         with self._lock:
             tracker = FoundationPoseTracker(
@@ -76,7 +83,7 @@ class PoseTrackingServicer(pose_tracking_pb2_grpc.PoseTrackingServicer):
             )
             pose_cam = tracker.register(color_rgb, depth_m, mask, K, iteration=request.iteration)
             self._tracker = tracker
-        print(f"[pose_server] Registered mesh '{request.mesh_path}'")
+        print(f"[pose_server] Registered mesh '{request.mesh_path}' pose_t={pose_cam[:3, 3]}")
         return pose_tracking_pb2.PoseResponse(pose_cam=codec.encode_pose(pose_cam))
 
     def Track(self, request, context):

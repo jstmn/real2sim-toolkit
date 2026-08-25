@@ -346,9 +346,17 @@ class MeshUtils:
         rgb_frames: np.ndarray,
         depth_m_frames: np.ndarray,
         K: np.ndarray,
+        T_world_cam: np.ndarray | None = None,
     ) -> None:
-        """Serve a viser scene of the tracked mesh in the camera frame (blocks)."""
-        vis = TrackingVisualizer(glb_path, rgb_frames, depth_m_frames, K, mesh_position=np.asarray(poses_cam)[0, :3, 3])
+        """Serve a viser scene of the tracked mesh (blocks)."""
+        vis = TrackingVisualizer(
+            glb_path,
+            rgb_frames,
+            depth_m_frames,
+            K,
+            mesh_position=np.asarray(poses_cam)[0, :3, 3],
+            T_world_cam=T_world_cam,
+        )
         vis.set_poses(poses_cam)
         vis.wait()
 
@@ -532,8 +540,20 @@ class MeshUtils:
         return output_path
 
 
+def _transform_points_se3(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply SE(3) `T` to `(N, 3)` points."""
+    assert T.shape == (4, 4), f"T must be 4x4, got {T.shape}"
+    assert pts.ndim == 2 and pts.shape[1] == 3, f"pts must be (N, 3), got {pts.shape}"
+    assert pts.shape[0] >= 1, "pts must contain at least 1 point"
+    return (pts.astype(np.float64) @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
+
+
 class TrackingVisualizer:
-    """Viser scene for pose tracking. Construct as soon as the scaled mesh exists; call `set_poses` later."""
+    """Viser scene for pose tracking. Construct as soon as the scaled mesh exists; call `set_poses` later.
+
+    If `T_world_cam` is set (robot-base T camera from Example 4), the scene is shown in the robot-base
+    frame. Otherwise it stays in the camera optical frame.
+    """
 
     def __init__(
         self,
@@ -542,6 +562,7 @@ class TrackingVisualizer:
         depth_m_frames: np.ndarray,
         K: np.ndarray,
         mesh_position: np.ndarray,
+        T_world_cam: np.ndarray | None = None,
     ) -> None:
         import viser
 
@@ -564,6 +585,11 @@ class TrackingVisualizer:
         ), f"depth {depth_m_frames.shape[1:]} != rgb {rgb_frames.shape[1:3]}"
         assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
         mesh_position = np.asarray(mesh_position, dtype=np.float64).reshape(3)
+        if T_world_cam is not None:
+            T_world_cam = np.asarray(T_world_cam, dtype=np.float64)
+            assert T_world_cam.shape == (4, 4), f"T_world_cam must be 4x4, got {T_world_cam.shape}"
+            assert np.allclose(T_world_cam[3], [0.0, 0.0, 0.0, 1.0]), f"Bad homogeneous row: {T_world_cam[3]}"
+            mesh_position = _transform_points_se3(T_world_cam, mesh_position.reshape(1, 3))[0].astype(np.float64)
 
         H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
         fy = float(K[1, 1])
@@ -575,10 +601,12 @@ class TrackingVisualizer:
         self._rgb_frames = rgb_frames
         self._depth_m_frames = depth_m_frames
         self._K = K
-        self._poses_cam: np.ndarray | None = None
+        self._T_world_cam = T_world_cam
+        self._poses_scene: np.ndarray | None = None
 
         self._server = viser.ViserServer()
-        self._server.scene.set_up_direction("-y")
+        if T_world_cam is None:
+            self._server.scene.set_up_direction("-y")
         self._server.scene.world_axes.visible = True
         self._server.scene.world_axes.scale = 0.15
         MeshUtils.add_xy_grid(self._server)
@@ -594,8 +622,7 @@ class TrackingVisualizer:
             wxyz=wxyz0,
             position=mesh_position,
         )
-        self._frustum = self._server.scene.add_camera_frustum(
-            "/camera",
+        frustum_kwargs: dict = dict(
             fov=fov,
             aspect=aspect,
             scale=0.12,
@@ -603,7 +630,14 @@ class TrackingVisualizer:
             image=rgb_frames[0],
             format="jpeg",
         )
+        if T_world_cam is not None:
+            frustum_wxyz, frustum_pos = MeshUtils._pose_mat_to_wxyz_position(T_world_cam)
+            frustum_kwargs["wxyz"] = frustum_wxyz
+            frustum_kwargs["position"] = frustum_pos
+        self._frustum = self._server.scene.add_camera_frustum("/camera", **frustum_kwargs)
         pts0, colors0 = depth_rgb_to_pointcloud(depth_m_frames[0], rgb_frames[0], K)
+        if T_world_cam is not None:
+            pts0 = _transform_points_se3(T_world_cam, pts0)
         self._pcd_handle = self._server.scene.add_point_cloud(
             "/scene_pcd",
             points=pts0,
@@ -611,25 +645,39 @@ class TrackingVisualizer:
             point_size=0.002,
             point_shape="circle",
         )
-        self._server.initial_camera.up = (0.0, -1.0, 0.0)
-        self._server.initial_camera.look_at = mesh_position
-        self._server.initial_camera.position = mesh_position + np.array([-0.25, -0.2, -0.45], dtype=np.float64)
+        if T_world_cam is None:
+            self._server.initial_camera.up = (0.0, -1.0, 0.0)
+            self._server.initial_camera.look_at = mesh_position
+            self._server.initial_camera.position = mesh_position + np.array([-0.25, -0.2, -0.45], dtype=np.float64)
+        else:
+            self._server.initial_camera.up = (0.0, 0.0, 1.0)
+            self._server.initial_camera.look_at = (0.0, 0.0, 0.3)
+            self._server.initial_camera.position = (1.2, 1.2, 0.8)
         self._gui_image = self._server.gui.add_image(rgb_frames[0], label="RGB", format="jpeg")
+        frame_name = "robot base" if T_world_cam is not None else "cam"
         self._pose_md = self._server.gui.add_markdown(
-            f"scaled mesh at `[{mesh_position[0]:.4f}, {mesh_position[1]:.4f}, {mesh_position[2]:.4f}]` (identity rot)"
+            f"scaled mesh at `[{mesh_position[0]:.4f}, {mesh_position[1]:.4f}, {mesh_position[2]:.4f}]` "
+            f"(identity rot, {frame_name})"
         )
         print(f"[info] Viser tracking view at http://{self._server.get_host()}:{self._server.get_port()}")
 
     def set_poses(self, poses_cam: np.ndarray) -> None:
-        assert self._poses_cam is None, "set_poses already called"
+        from r2st.geometry import transform_pose_cam_to_world
+
+        assert self._poses_scene is None, "set_poses already called"
         poses_cam = np.asarray(poses_cam, dtype=np.float64)
         assert poses_cam.ndim == 3 and poses_cam.shape[1:] == (4, 4), f"poses_cam must be Nx4x4, got {poses_cam.shape}"
         assert (
             poses_cam.shape[0] == self._num_frames
         ), f"poses have {poses_cam.shape[0]} frames, rgb has {self._num_frames}"
-        self._poses_cam = poses_cam
+        if self._T_world_cam is None:
+            self._poses_scene = poses_cam
+        else:
+            self._poses_scene = np.stack(
+                [transform_pose_cam_to_world(self._T_world_cam, T_cam) for T_cam in poses_cam], axis=0
+            )
         if self._num_frames >= 2:
-            traj = poses_cam[:, :3, 3]
+            traj = self._poses_scene[:, :3, 3]
             self._server.scene.add_line_segments(
                 "/trajectory",
                 points=np.stack([traj[:-1], traj[1:]], axis=1),
@@ -647,9 +695,9 @@ class TrackingVisualizer:
     def _apply_timestep(self, t: int) -> None:
         from r2st.geometry import depth_rgb_to_pointcloud
 
-        assert self._poses_cam is not None, "set_poses must be called before applying timesteps"
+        assert self._poses_scene is not None, "set_poses must be called before applying timesteps"
         assert 0 <= t < self._num_frames, f"timestep {t} out of range [0, {self._num_frames})"
-        wxyz, position = MeshUtils._pose_mat_to_wxyz_position(self._poses_cam[t])
+        wxyz, position = MeshUtils._pose_mat_to_wxyz_position(self._poses_scene[t])
         self._mesh_handle.wxyz = wxyz
         self._mesh_handle.position = position
         self._axes_handle.wxyz = wxyz
@@ -657,11 +705,14 @@ class TrackingVisualizer:
         self._frustum.image = self._rgb_frames[t]
         self._gui_image.image = self._rgb_frames[t]
         pts, colors = depth_rgb_to_pointcloud(self._depth_m_frames[t], self._rgb_frames[t], self._K)
+        if self._T_world_cam is not None:
+            pts = _transform_points_se3(self._T_world_cam, pts)
         self._pcd_handle.points = pts
         self._pcd_handle.colors = colors
+        frame_name = "robot base" if self._T_world_cam is not None else "cam"
         self._pose_md.content = (
             f"**t = {t} / {self._num_frames - 1}**\n\n"
-            f"translation (cam): `[{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]`"
+            f"translation ({frame_name}): `[{position[0]:.4f}, {position[1]:.4f}, {position[2]:.4f}]`"
         )
 
     def wait(self) -> None:

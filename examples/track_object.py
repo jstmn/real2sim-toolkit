@@ -14,6 +14,7 @@ from r2st.core import SAM3Predictor
 from r2st.geometry import (
     depth_mm_to_meters,
     masked_depth_to_points,
+    transform_pose_cam_to_world,
 )
 from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
@@ -27,10 +28,11 @@ from r2st.utils import (
 """
 # Example usage (FoundationPose gRPC server must already be running in the container):
     uv run python examples/track_object.py \
-        --h5-path data/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+        --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
         --camera cam_1 \
         --camera-model-id d435 \
         --object-description "mustard bottle" \
+        --extrinsics-path data/demonstrations/0802/extrinsics.yaml \
         --visualize
 """
 
@@ -48,6 +50,9 @@ class Args:
 
     object_description: str
     """Language description of the object to segment and mesh, e.g. 'mustard bottle'."""
+
+    extrinsics_path: pathlib.Path | None = None
+    """YAML from examples/estimate_camera_extrinsics.py (robot-base T camera). If set, poses are also written in the robot-base frame."""
 
     output_dir: pathlib.Path = pathlib.Path("data/meshyai")
     """Directory to save generated mesh assets and tracking outputs."""
@@ -73,6 +78,12 @@ class Args:
     gif: bool = True
     """If set, render a 360-degree orbit GIF of the generated GLB."""
 
+    use_2d_tracker: bool = True
+    """Re-anchor FoundationPose (x, y) each frame with Cutie (FoundationPose++)."""
+
+    use_kalman_filter: bool = True
+    """Fuse Cutie (x, y) with FoundationPose via a 6-DoF Kalman filter. Requires use_2d_tracker."""
+
 
 def _load_rgb_depth(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray]:
     with h5py.File(h5_path, "r") as f:
@@ -83,6 +94,26 @@ def _load_rgb_depth(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.
 
 def _log_elapsed(label: str, t0: float) -> None:
     print(f"[info] {label} ({time.perf_counter() - t0:.1f}s)")
+
+
+def _load_camera_extrinsics_yaml(path: pathlib.Path, camera: str, camera_model_id: str) -> np.ndarray:
+    """Load robot-base T camera (4x4) from an Example 4 extrinsics YAML."""
+    import yaml
+
+    assert path.is_file(), f"Extrinsics YAML not found: {path}"
+    payload = yaml.safe_load(path.read_text())
+    assert isinstance(payload, dict), f"Extrinsics YAML must be a mapping, got {type(payload)}"
+    assert "camera" in payload, f"Extrinsics YAML missing 'camera': {path}"
+    assert payload["camera"] == camera, f"Extrinsics YAML camera {payload['camera']!r} != --camera {camera!r}"
+    assert "camera_model_id" in payload, f"Extrinsics YAML missing 'camera_model_id': {path}"
+    assert (
+        payload["camera_model_id"] == camera_model_id
+    ), f"Extrinsics YAML camera_model_id {payload['camera_model_id']!r} != --camera-model-id {camera_model_id!r}"
+    assert "matrix" in payload, f"Extrinsics YAML missing 'matrix': {path}"
+    T = np.asarray(payload["matrix"], dtype=np.float64)
+    assert T.shape == (4, 4), f"Extrinsics matrix must be 4x4, got {T.shape}"
+    assert np.allclose(T[3], [0.0, 0.0, 0.0, 1.0]), f"Bad homogeneous row: {T[3]}"
+    return T
 
 
 def _draw_pose_axes(color_rgb: np.ndarray, pose_cam: np.ndarray, K: np.ndarray, axis_len: float = 0.08) -> np.ndarray:
@@ -105,7 +136,15 @@ def main(args: Args) -> None:
     assert len(args.object_description) > 0, "object_description must not be empty"
     assert args.est_refine_iter >= 1, f"est_refine_iter must be >= 1, got {args.est_refine_iter}"
     assert args.track_refine_iter >= 1, f"track_refine_iter must be >= 1, got {args.track_refine_iter}"
+    assert args.use_2d_tracker or not args.use_kalman_filter, (
+        "use_kalman_filter requires use_2d_tracker: the filter fuses the 2D tracker's "
+        "image-plane measurement with FoundationPose's pose estimate each frame."
+    )
     assert args.max_frames is None or args.max_frames >= 1, f"max_frames must be >= 1, got {args.max_frames}"
+    T_world_cam = None
+    if args.extrinsics_path is not None:
+        T_world_cam = _load_camera_extrinsics_yaml(args.extrinsics_path, args.camera, args.camera_model_id)
+        print(f"[info] Loaded T_world_cam from {args.extrinsics_path}:\n{T_world_cam}")
 
     color_intrinsics = get_color_intrinsics(args.camera_model_id)
 
@@ -185,13 +224,17 @@ def main(args: Args) -> None:
             depth_m_all,
             K,
             mesh_position=object_pts.mean(axis=0),
+            T_world_cam=T_world_cam,
         )
 
     print(f"[info] Connecting to FoundationPose server at {args.server_address} ...")
     client = FoundationPoseClient(args.server_address)
     poses = np.zeros((num_frames, 4, 4), dtype=np.float64)
 
-    print("[info] Registering object on frame 0 (gRPC; first call can take a while) ...")
+    print(
+        f"[info] Registering object on frame 0 (gRPC; first call can take a while; "
+        f"use_2d_tracker={args.use_2d_tracker} use_kalman_filter={args.use_kalman_filter}) ..."
+    )
     t0 = time.perf_counter()
     poses[0] = client.register(
         mesh_path=mesh_path_abs,
@@ -200,6 +243,8 @@ def main(args: Args) -> None:
         mask=mask,
         K=K,
         iteration=args.est_refine_iter,
+        use_2d_tracker=args.use_2d_tracker,
+        use_kalman_filter=args.use_kalman_filter,
     )
     _log_elapsed(f"Registered pose_cam translation: {poses[0][:3, 3]}", t0)
 
@@ -218,6 +263,11 @@ def main(args: Args) -> None:
     poses_path = asset_dir / f"{object_slug}__poses_cam.npy"
     np.save(poses_path, poses)
     print(f"[info] Saved camera-frame poses to {poses_path} shape={poses.shape}")
+    if T_world_cam is not None:
+        poses_world = np.stack([transform_pose_cam_to_world(T_world_cam, T_cam) for T_cam in poses], axis=0)
+        poses_world_path = asset_dir / f"{object_slug}__poses_world.npy"
+        np.save(poses_world_path, poses_world)
+        print(f"[info] Saved robot-base poses to {poses_world_path} shape={poses_world.shape}")
 
     if args.save_video:
         video_path = asset_dir / f"{object_slug}__track.mp4"
@@ -241,6 +291,8 @@ def main(args: Args) -> None:
     print(f"Frames: {num_frames}")
     print(f"Mesh: {scaled_glb_path}")
     print(f"Poses: {poses_path}")
+    if T_world_cam is not None:
+        print(f"Poses (robot base): {poses_world_path}")
 
     if vis is not None:
         vis.set_poses(poses)

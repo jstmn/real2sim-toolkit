@@ -179,10 +179,9 @@ class FoundationPoseRunner:
 class FoundationPoseTracker:
     """Keeps a single FoundationPose instance alive: register on frame 0, track after.
 
-    Optionally re-anchors FoundationPose's (x, y) translation each frame using a Cutie 2D
-    tracker (``use_2d_tracker``), and/or fuses that measurement with FoundationPose's own
-    pose via a 6-DoF Kalman filter (``use_kalman_filter``) instead of overwriting it outright.
-    This mirrors the tracking loop in FoundationPose++
+    By default this re-anchors FoundationPose's (x, y) translation each frame using a Cutie 2D
+    tracker (``use_2d_tracker``), and fuses that measurement with FoundationPose's own pose via a
+    6-DoF Kalman filter (``use_kalman_filter``). This mirrors the tracking loop in FoundationPose++
     (https://github.com/lidingsheng/FoundationPose-plus-plus, ``src/obj_pose_track.py``).
     """
 
@@ -190,8 +189,8 @@ class FoundationPoseTracker:
         self,
         mesh_file: str | Path,
         debug_dir: str | Path = Path("debug_fp"),
-        use_2d_tracker: bool = False,
-        use_kalman_filter: bool = False,
+        use_2d_tracker: bool = True,
+        use_kalman_filter: bool = True,
         kalman_measurement_noise_scale: float = 0.05,
         scorer=None,
         refiner=None,
@@ -274,6 +273,13 @@ class FoundationPoseTracker:
         assert iteration >= 1, f"iteration must be >= 1, got {iteration}"
 
         self._initial_mask = mask.astype(bool)
+        n_mask = int(self._initial_mask.sum())
+        n_valid = int(((depth_m >= 0.001) & self._initial_mask).sum())
+        assert n_mask >= 1, "Cannot register an empty mask"
+        assert n_valid >= 4, (
+            f"Need >= 4 valid masked depth pixels for FoundationPose.register, got {n_valid} "
+            f"(mask_pixels={n_mask})"
+        )
         pose_cam = self.est.register(
             K=K,
             rgb=color_rgb,
@@ -283,6 +289,10 @@ class FoundationPoseTracker:
         )
         pose_cam = np.asarray(pose_cam, dtype=np.float64)
         assert pose_cam.shape == (4, 4), f"Expected 4x4 pose, got {pose_cam.shape}"
+        assert self.est.pose_last is not None, (
+            "FoundationPose.register did not init tracking pose. "
+            f"mask_pixels={n_mask} valid_depth={n_valid}"
+        )
         self.last_pose_cam = pose_cam
 
         if self._tracker_2d is not None:

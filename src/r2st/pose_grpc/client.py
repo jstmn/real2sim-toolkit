@@ -26,8 +26,8 @@ class FoundationPoseClient:
         mask: np.ndarray,
         K: np.ndarray,
         iteration: int = 5,
-        use_2d_tracker: bool = False,
-        use_kalman_filter: bool = False,
+        use_2d_tracker: bool = True,
+        use_kalman_filter: bool = True,
         kalman_measurement_noise_scale: float = 0.05,
     ) -> np.ndarray:
         """Initialize the server's tracked object from its first frame; returns the 4x4 pose."""

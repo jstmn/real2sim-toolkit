@@ -195,8 +195,11 @@ class FoundationPose:
             else:
                 self.glctx = glctx
 
-        depth = erode_depth(depth, radius=2, device="cuda")
-        depth = bilateral_filter_depth(depth, radius=2, device="cuda")
+        depth = bilateral_filter_depth(
+            erode_depth(depth, radius=2, depth_diff_thres=0.01, device="cuda"),
+            radius=2,
+            device="cuda",
+        )
 
         if self.debug >= 2:
             xyz_map = depth2xyzmap(depth, K)
@@ -208,9 +211,10 @@ class FoundationPose:
         normal_map = None
         valid = (depth >= 0.001) & (ob_mask > 0)
         if valid.sum() < 4:
-            pose = np.eye(4)
-            pose[:3, 3] = self.guess_translation(depth=depth, mask=ob_mask, K=K)
-            return pose
+            raise RuntimeError(
+                "FoundationPose.register needs >= 4 valid masked depth pixels after filtering, "
+                f"got {int(valid.sum())} (mask_pixels={int((ob_mask > 0).sum())})"
+            )
 
         if self.debug >= 2:
             imageio.imwrite(f"{self.debug_dir}/color.png", rgb)
@@ -292,8 +296,12 @@ class FoundationPose:
             raise RuntimeError("Please init pose by register first")
 
         depth = torch.as_tensor(depth, device="cuda", dtype=torch.float)
-        depth = erode_depth(depth, radius=2, device="cuda")
-        depth = bilateral_filter_depth(depth, radius=2, device="cuda")
+        assert self.ob_mask is not None, "register() must set ob_mask before track_one()"
+        depth = bilateral_filter_depth(
+            erode_depth(depth, radius=2, depth_diff_thres=0.01, device="cuda"),
+            radius=2,
+            device="cuda",
+        )
 
         xyz_map = depth2xyzmap_batch(
             depth[None], torch.as_tensor(K, dtype=torch.float, device="cuda")[None], zfar=np.inf
