@@ -5,17 +5,20 @@ import shutil
 import cv2
 import tyro
 
-from r2st.core import GroundedSAMPredictor
+from r2st.core import SAM3Predictor
 from r2st.openai import list_objects_in_image
 from r2st.types import CameraImage, ObjectAssets
 from r2st.utils import ImageUtils, MeshUtils
 
 """
-# Example usage (single image):
-uv run python examples/generate_mesh.py --images data/red_T_block_1.png
+# Example usage (single image, manual SAM 3 prompt):
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png --object-description "red block"
+
+# Example usage (VLM prompt):
+uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --object-description-from-vlm
 
 # Example usage (multiple camera views of the same object, 1-4 images):
-uv run python examples/generate_mesh.py --images data/red_T_block_1.png data/red_T_block_2.png
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png data/red_T_block_2.png --object-description "red block"
 """
 
 
@@ -34,6 +37,12 @@ class Args:
     gif: bool = True
     """If set, render a 360-degree orbit GIF of the generated GLB."""
 
+    object_description: str | None = None
+    """Manual SAM 3 language prompt. Exactly one of this or --object-description-from-vlm is required."""
+
+    object_description_from_vlm: bool = False
+    """If set, query the VLM for the object name (must return exactly one). Mutually exclusive with --object-description."""
+
 
 def _pick_target_object(objects: list[str]) -> str:
     assert (
@@ -42,17 +51,23 @@ def _pick_target_object(objects: list[str]) -> str:
     return objects[0]
 
 
-def _load_camera_image(image_path: pathlib.Path, predictor: GroundedSAMPredictor) -> tuple[CameraImage, str]:
-    """Detect the single target object in `image_path` and segment it.
+def _load_camera_image(
+    image_path: pathlib.Path, predictor: SAM3Predictor, object_description: str | None
+) -> tuple[CameraImage, str]:
+    """Segment the target object in `image_path`.
 
-    Asserts exactly one object per camera. Cross-view object matching/merging is not
-    implemented yet — a separate VLM call will handle that later.
+    Uses ``object_description`` when set. Otherwise queries the VLM and asserts exactly one object.
+    Cross-view object matching/merging is not implemented yet.
     """
-    print(f"[info] Querying VLM for objects in {image_path} ...")
-    objects = list_objects_in_image(str(image_path))
-    print(f"[info] VLM objects: {' . '.join(objects)}")
-    target = _pick_target_object(objects)
-    print(f"[info] Target object for '{image_path.name}': '{target}'")
+    if object_description is not None:
+        target = object_description
+        print(f"[info] Using --object-description '{target}' for '{image_path.name}'")
+    else:
+        print(f"[info] Querying VLM for objects in {image_path} ...")
+        objects = list_objects_in_image(str(image_path))
+        print(f"[info] VLM objects: {' . '.join(objects)}")
+        target = _pick_target_object(objects)
+        print(f"[info] Target object for '{image_path.name}': '{target}'")
     image_bgr = cv2.imread(str(image_path))
     assert image_bgr is not None, f"Failed to load image '{image_path}' with cv2"
     assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
@@ -70,9 +85,13 @@ def main(args: Args) -> None:
     for image_path in args.images:
         assert image_path.exists(), f"Image file '{image_path}' not found"
         assert image_path.is_file(), f"Image path '{image_path}' is not a file"
+    n_desc_modes = int(args.object_description is not None) + int(args.object_description_from_vlm)
+    assert n_desc_modes == 1, "exactly one of --object-description or --object-description-from-vlm is required"
+    if args.object_description is not None:
+        assert len(args.object_description) > 0, "object_description must not be empty"
 
-    predictor = GroundedSAMPredictor()
-    loaded = [_load_camera_image(image_path, predictor) for image_path in args.images]
+    predictor = SAM3Predictor()
+    loaded = [_load_camera_image(image_path, predictor, args.object_description) for image_path in args.images]
     camera_images = [camera_image for camera_image, _ in loaded]
     target = loaded[0][1]
     object_assets = ObjectAssets(object_name=target, camera_images=camera_images)

@@ -619,6 +619,15 @@ wheels = [
 ]
 
 [[package]]
+name = "einops"
+version = "0.8.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/77/850bef8d72ffb9219f0b1aac23fbc1bf7d038ee6ea666f331fa273031aa2/einops-0.8.2.tar.gz", hash = "sha256:609da665570e5e265e27283aab09e7f279ade90c4f01bcfca111f3d3e13f2827", size = 56261, upload-time = "2026-01-26T04:13:17.638Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2a/09/f8d8f8f31e4483c10a906437b4ce31bdf3d6d417b73fe33f1a8b59e34228/einops-0.8.2-py3-none-any.whl", hash = "sha256:54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193", size = 65638, upload-time = "2026-01-26T04:13:18.546Z" },
+]
+
+[[package]]
 name = "embreex"
 version = "4.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -726,6 +735,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/00/78/f34251dadb8f3921264a1d9b8946f5e542014ee2614b285261b4e40e6775/fsspec-2026.7.0.tar.gz", hash = "sha256:c803c40f4cf860b49dea58ee3e1c33cb9c790520e233537e1340049f89b82a88", size = 317040, upload-time = "2026-07-28T16:34:51.052Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/fd/3c/6a2bf344106328fd04963664a60b9bb6496fc25df8e962fcdc1367285fb9/fsspec-2026.7.0-py3-none-any.whl", hash = "sha256:b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279", size = 206583, upload-time = "2026-07-28T16:34:49.538Z" },
+]
+
+[[package]]
+name = "ftfy"
+version = "6.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "wcwidth" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/97/16/79c6e17bd3465f6498282dd23813846c68cd0989fe60bfef68bb1918d041/ftfy-6.1.1.tar.gz", hash = "sha256:bfc2019f84fcd851419152320a6375604a0f1459c281b5b199b2cd0d2e727f8f", size = 63156, upload-time = "2022-02-09T19:44:17.423Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e1/1e/bf736f9576a8979752b826b75cbd83663ff86634ea3055a766e2d8ad3ee5/ftfy-6.1.1-py3-none-any.whl", hash = "sha256:0ffd33fce16b54cccaec78d6ec73d95ad370e5df5a25255c8966a6147bd667ca", size = 53098, upload-time = "2022-02-09T19:44:15.655Z" },
 ]
 
 [[package]]
@@ -1002,6 +1023,17 @@ sdist = { url = "https://files.pythonhosted.org/packages/72/34/14ca021ce8e5dfedc
 wheels = [
     { url = "https://files.pythonhosted.org/packages/cb/b1/3846dd7f199d53cb17f49cba7e651e9ce294d8497c8c150530ed11865bb8/iniconfig-2.3.0-py3-none-any.whl", hash = "sha256:f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12", size = 7484, upload-time = "2025-10-18T21:55:41.639Z" },
 ]
+
+[[package]]
+name = "iopath"
+version = "0.1.10"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "portalocker" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/72/73/b3d451dfc523756cf177d3ebb0af76dc7751b341c60e2a21871be400ae29/iopath-0.1.10.tar.gz", hash = "sha256:3311c16a4d9137223e20f141655759933e1eda24f8bff166af834af3c645ef01", size = 42226, upload-time = "2022-07-09T19:00:50.866Z" }
 
 [[package]]
 name = "ipython"
@@ -2045,6 +2077,15 @@ wheels = [
 ]
 
 [[package]]
+name = "portalocker"
+version = "4.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/66/92/d15473a60e4cb7bc450e10d3160d7d531d6fa8cb144e31395afd76cf4be2/portalocker-4.2.0.tar.gz", hash = "sha256:f4c5024903126159c4798e6aec6c32e30a0759db39bf795c0dbeb180a2e8c843", size = 259245, upload-time = "2026-08-22T00:22:15.62Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/32/49/abd8a4154c911cc6c247edb7195d14846b614314c58ae09cf710d7d56098/portalocker-4.2.0-py3-none-any.whl", hash = "sha256:b33a8ce7d9b74922123a6fe64c2d785c015e5e9049ce7f1db5bd44e288731460", size = 128016, upload-time = "2026-08-22T00:22:14.254Z" },
+]
+
+[[package]]
 name = "prompt-toolkit"
 version = "3.0.53"
 source = { registry = "https://pypi.org/simple" }
@@ -2345,6 +2386,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cma" },
     { name = "cuda-toolkit", extra = ["cccl", "nvcc"] },
+    { name = "einops" },
     { name = "grpcio" },
     { name = "h5py" },
     { name = "jrl2" },
@@ -2354,6 +2396,7 @@ dependencies = [
     { name = "numpy" },
     { name = "onnx" },
     { name = "onnxruntime" },
+    { name = "open3d" },
     { name = "openai" },
     { name = "opencv-python" },
     { name = "pillow" },
@@ -2361,6 +2404,7 @@ dependencies = [
     { name = "pyg-lib" },
     { name = "pyyaml" },
     { name = "requests" },
+    { name = "sam3" },
     { name = "termcolor" },
     { name = "torch" },
     { name = "torchvision" },
@@ -2395,6 +2439,7 @@ dev = [
 requires-dist = [
     { name = "cma", specifier = ">=4.4.4" },
     { name = "cuda-toolkit", extras = ["cccl", "nvcc"], specifier = ">=13.0.3.0" },
+    { name = "einops" },
     { name = "grpcio", specifier = ">=1.83.0" },
     { name = "h5py", specifier = ">=3.16.0" },
     { name = "jrl2", editable = "thirdparty/Jrl2" },
@@ -2404,6 +2449,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "onnx", specifier = ">=1.22.0" },
     { name = "onnxruntime", specifier = ">=1.28.0" },
+    { name = "open3d", specifier = ">=0.19.0" },
     { name = "openai" },
     { name = "opencv-python", specifier = ">=4.0" },
     { name = "pillow" },
@@ -2411,6 +2457,7 @@ requires-dist = [
     { name = "pyg-lib", specifier = ">=0.6.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "requests", specifier = ">=2.34.2" },
+    { name = "sam3", editable = "src/r2st/sam3" },
     { name = "termcolor", specifier = ">=3.3.0" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "torchvision", specifier = ">=0.28.0" },
@@ -2630,6 +2677,68 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/1b/6d/3fba214c1e5e0f69991677ec3bc17023f0421776975e1de0c682dca475e2/safetensors-0.8.0-cp310-abi3-win_amd64.whl", hash = "sha256:096ec1a98435df7beb08853bb5aa9081a84f23d0adc67ed1a0a10550f608373f", size = 355540, upload-time = "2026-06-09T07:52:27.832Z" },
     { url = "https://files.pythonhosted.org/packages/8d/fc/7eedc3510d97878876e32774eebbeb61c43f148a96e915c84229a3e967aa/safetensors-0.8.0-cp310-abi3-win_arm64.whl", hash = "sha256:f7838e5135a406ad3e02efdcb8cf2e5397d368b0154537c4fec682dbc544d452", size = 340500, upload-time = "2026-06-09T07:52:26.745Z" },
 ]
+
+[[package]]
+name = "sam3"
+source = { editable = "src/r2st/sam3" }
+dependencies = [
+    { name = "ftfy" },
+    { name = "huggingface-hub" },
+    { name = "iopath" },
+    { name = "numpy" },
+    { name = "regex" },
+    { name = "timm" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "black", marker = "extra == 'dev'", specifier = "==24.2.0" },
+    { name = "decord", marker = "extra == 'notebooks'" },
+    { name = "einops", marker = "extra == 'notebooks'" },
+    { name = "fairscale", marker = "extra == 'train'" },
+    { name = "ftfy", specifier = "==6.1.1" },
+    { name = "fvcore", marker = "extra == 'train'" },
+    { name = "gitpython", marker = "extra == 'dev'", specifier = "==3.1.31" },
+    { name = "huggingface-hub" },
+    { name = "hydra-core", marker = "extra == 'train'" },
+    { name = "iopath", specifier = ">=0.1.10" },
+    { name = "ipycanvas", marker = "extra == 'notebooks'" },
+    { name = "ipympl", marker = "extra == 'notebooks'" },
+    { name = "ipywidgets", marker = "extra == 'notebooks'" },
+    { name = "jupyter", marker = "extra == 'notebooks'" },
+    { name = "matplotlib", marker = "extra == 'notebooks'" },
+    { name = "notebook", marker = "extra == 'notebooks'" },
+    { name = "numba", marker = "extra == 'dev'" },
+    { name = "numpy", specifier = ">=1.26,<2" },
+    { name = "opencv-python", marker = "extra == 'dev'" },
+    { name = "opencv-python", marker = "extra == 'notebooks'" },
+    { name = "pandas", marker = "extra == 'dev'" },
+    { name = "pycocotools", marker = "extra == 'dev'" },
+    { name = "pycocotools", marker = "extra == 'notebooks'" },
+    { name = "pytest", marker = "extra == 'dev'" },
+    { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "python-rapidjson", marker = "extra == 'dev'" },
+    { name = "regex" },
+    { name = "ruff-api", marker = "extra == 'dev'", specifier = "==0.1.0" },
+    { name = "scikit-image", marker = "extra == 'notebooks'" },
+    { name = "scikit-image", marker = "extra == 'train'" },
+    { name = "scikit-learn", marker = "extra == 'notebooks'" },
+    { name = "scikit-learn", marker = "extra == 'train'" },
+    { name = "scipy", marker = "extra == 'train'" },
+    { name = "submitit", marker = "extra == 'train'" },
+    { name = "tensorboard", marker = "extra == 'train'" },
+    { name = "timm", specifier = ">=1.0.17" },
+    { name = "torchmetrics", marker = "extra == 'train'" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
+    { name = "ufmt", marker = "extra == 'dev'", specifier = "==2.8.0" },
+    { name = "usort", marker = "extra == 'dev'", specifier = "==1.0.2" },
+    { name = "yt-dlp", marker = "extra == 'dev'" },
+    { name = "zstandard", marker = "extra == 'train'" },
+]
+provides-extras = ["dev", "notebooks", "train"]
 
 [[package]]
 name = "sapien"

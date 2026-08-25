@@ -18,7 +18,9 @@ data/*/
 src/r2st/FoundationPose-plus-plus/
 temp.sh
 src/r2st/FoundationPose/weights/*
-src/r2st/GroundingDINO/groundingdino/*.so
 
 *.code-workspace
 thirdparty/*/
+
+src/r2st/sam2/
+src/r2st/models/sam2.1_hiera_large.pt

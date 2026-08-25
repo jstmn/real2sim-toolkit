@@ -1,7 +1,7 @@
 """FoundationPose-based object pose estimation and tracking.
 
 Expects a FoundationPose checkout at ``src/r2st/FoundationPose`` (same layout as
-the GroundingDINO vendor tree). Lazy-imports nvdiffrast and FoundationPose so
+the SAM 3 vendor tree). Lazy-imports nvdiffrast and FoundationPose so
 the rest of the package can load without those heavy deps.
 """
 

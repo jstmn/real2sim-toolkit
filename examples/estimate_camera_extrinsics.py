@@ -14,8 +14,10 @@ is the one-sided squared nearest-neighbor distance from pcd_real to pcd_sim.
 
 Notes:
 1. A preprocessing step is performed on the measured pointclouds to remove points that aren't part of the robot.
-    Frame 0 is GroundedSAM (union of top --sam-kmax masks). That union is then propagated through every later
-    RGB frame with SAM ``mask_input`` + the previous mask's bbox (no GroundingDINO after frame 0).
+    Frame 0 is SAM 3 (union of top --sam-kmax masks). That union is then propagated through every later
+    RGB frame with SAM 3 ``mask_input`` + the previous mask's bbox (text prompt only on frame 0).
+    After unprojection, Open3D ``remove_radius_outlier`` drops points with fewer than
+    ``--radius-outlier-nb-points`` neighbors in ``--radius-outlier-radius-m`` (default 10 in 10 cm).
 2. If --visualize is set, a viser server is started. The server shows measured vs best-so-far
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
@@ -23,7 +25,7 @@ Notes:
 4. If --cache-robot-masks is set (default), each propagated mask is written as soon as it is computed to
    `<h5_dir>/<h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
     A later run loads a consecutive prefix of those files and resumes SAM from the last cached frame.
-    Frame 0's GroundedSAM union may also be read from the older
+    Frame 0's SAM 3 union may also be read from the older
     `robot-mask__<camera>__idx=0__...npy` seed cache. After the last frame, a dimmed-mask video is written to
     `robot-mask-propagated__<camera>__kmax=<k>__score_threshold=<t>.mp4`.
 
@@ -79,7 +81,7 @@ import yaml
 from jrl2.robots import NAME_TO_ROBOT, get_robot_by_name
 from tqdm import tqdm
 from transforms3d.axangles import axangle2mat, mat2axangle
-from transforms3d.quaternions import mat2quat
+from transforms3d.quaternions import mat2quat, quat2mat
 
 from r2st.constants import (
     MIN_DEPTH_M,
@@ -88,7 +90,7 @@ from r2st.constants import (
     get_depth_to_color_extrinsics,
 )
 from r2st.core import (
-    GroundedSAMPredictor,
+    SAM3Predictor,
     bbox_xyxy_from_mask,
     binary_mask_to_sam_mask_input,
 )
@@ -174,11 +176,14 @@ class Args:
     n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
 
-    n_pcd_samples: int = 512
-    """Number of FPS points kept from each real robot cloud and from the fused 6-view sim cloud."""
+    n_pcd_samples_real: int = 4096
+    """Number of FPS points kept from each measured robot cloud."""
 
-    n_random_downsample_initial: int = 1024
-    """Random pre-FPS cap for each real robot cloud. Must be >= n_pcd_samples."""
+    n_pcd_samples_sim: int = 4096
+    """Number of FPS points kept from each fused 6-view sim robot cloud."""
+
+    n_random_downsample_initial: int = 16384
+    """Random pre-FPS cap for each measured robot cloud. Must be >= n_pcd_samples_real."""
 
     cma_sigma_pos: float = 0.10
     """CMA-ES initial std for camera translation (meters)."""
@@ -194,6 +199,9 @@ class Args:
 
     seed_from_gui: bool = False
     """If set, choose the CMA-ES seed interactively with Viser GUI controls."""
+
+    seed_pose: tuple[float, float, float, float, float, float, float] | None = None
+    """If set, seed CMA-ES with this robot-base camera pose: x y z qw qx qy qz."""
 
     gui_translation_step_m: float = 0.02
     """World-frame translation per GUI button press, in meters."""
@@ -217,7 +225,7 @@ class Args:
     """CMA-ES population size. If unset, the cma library default is used."""
 
     robot_description: str = "robot arm"
-    """GroundedSAM text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
+    """SAM 3 text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
 
     sam_kmax: int = 5
     """Union at most this many highest-confidence SAM masks into the frame-0 robot mask."""
@@ -228,8 +236,14 @@ class Args:
     cache_robot_masks: bool = True
     """If set, load/save propagated robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
 
-    mask_erode_px: int = 7
+    mask_erode_px: int = 9
     """Erode the robot mask with an elliptical kernel of this size (pixels) before unprojecting. 0 skips erosion."""
+
+    radius_outlier_nb_points: int = 10
+    """Keep a measured point only if this many points lie within radius_outlier_radius_m of it."""
+
+    radius_outlier_radius_m: float = 0.10
+    """Search radius (meters) for the measured-cloud radius-outlier filter."""
 
     visualize: bool = False
     """If set, start a viser server with robot-base pointclouds, camera frustum, and a cost plot."""
@@ -242,8 +256,13 @@ def _log_elapsed(label: str, t0: float) -> None:
     print(f"[info] {label} ({time.perf_counter() - t0:.1f}s)")
 
 
-def _validate_seed_mode(seed_automatically: bool, seed_from_gui: bool) -> None:
-    assert seed_automatically != seed_from_gui, "Exactly one of --seed-automatically or --seed-from-gui must be passed"
+def _validate_seed_mode(
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
+) -> None:
+    n_modes = int(seed_automatically) + int(seed_from_gui) + int(seed_pose is not None)
+    assert n_modes == 1, "Exactly one of --seed-automatically, --seed-from-gui, or --seed-pose must be passed"
 
 
 def _robot_mask_cache_path(
@@ -313,20 +332,20 @@ def _save_cached_bool_mask(path: pathlib.Path, mask: np.ndarray) -> None:
     np.save(path, mask)
 
 
-def _load_grounded_sam() -> GroundedSAMPredictor:
+def _load_sam3() -> SAM3Predictor:
     t0 = time.perf_counter()
-    predictor = GroundedSAMPredictor()
-    _log_elapsed("GroundedSAM loaded", t0)
+    predictor = SAM3Predictor()
+    _log_elapsed("SAM 3 loaded", t0)
     return predictor
 
 
 def _propagate_robot_masks(
     rgb: np.ndarray,
-    predictor: GroundedSAMPredictor,
+    predictor: SAM3Predictor,
     seed_mask: np.ndarray,
     cache_paths: list[pathlib.Path] | None = None,
 ) -> np.ndarray:
-    """Propagate ``seed_mask`` (frame 0) through ``rgb`` with SAM mask_input + bbox."""
+    """Propagate ``seed_mask`` (frame 0) through ``rgb`` with SAM 3 mask_input + bbox."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
@@ -364,7 +383,7 @@ def _compute_propagated_robot_masks(
     cache_robot_masks: bool,
     visualize_robot_masks: bool,
 ) -> np.ndarray:
-    """Return ``(T, H, W)`` robot masks. Frame 0 is GroundedSAM; later frames are SAM-propagated."""
+    """Return ``(T, H, W)`` robot masks. Frame 0 is SAM 3; later frames are SAM 3-propagated."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
@@ -383,7 +402,7 @@ def _compute_propagated_robot_masks(
             for t in range(n_cached):
                 masks[t] = _load_cached_bool_mask(propagated_paths[t], hw)
             print(f"[info] Resuming robot-mask propagation from frame {n_cached} ({n_cached}/{n_frames} cached)")
-            predictor = _load_grounded_sam()
+            predictor = _load_sam3()
             rest = _propagate_robot_masks(
                 rgb[n_cached - 1 :],
                 predictor,
@@ -394,12 +413,12 @@ def _compute_propagated_robot_masks(
             masks[n_cached:] = rest[1:]
         else:
             seed_path = _robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold)
-            predictor: GroundedSAMPredictor | None = None
+            predictor: SAM3Predictor | None = None
             if cache_robot_masks and seed_path.is_file():
                 seed_mask = _load_cached_bool_mask(seed_path, hw)
                 print(f"[info] Loaded frame-0 robot mask from {seed_path}")
             else:
-                predictor = _load_grounded_sam()
+                predictor = _load_sam3()
                 image_bgr0 = cv2.cvtColor(rgb[0], cv2.COLOR_RGB2BGR)
                 print(f"[info] Segmenting '{robot_description}' on frame 0 ...")
                 t0 = time.perf_counter()
@@ -435,7 +454,7 @@ def _compute_propagated_robot_masks(
                     _save_cached_bool_mask(cache_paths[0], seed_mask)
             else:
                 if predictor is None:
-                    predictor = _load_grounded_sam()
+                    predictor = _load_sam3()
                 print(f"[info] Propagating frame-0 robot mask through {n_frames} frames ...")
                 t0 = time.perf_counter()
                 masks = _propagate_robot_masks(rgb, predictor, seed_mask, cache_paths=cache_paths)
@@ -767,6 +786,21 @@ def _generate_seed_poses(
     return poses
 
 
+def _pose_from_xyz_wxyz(xyz_wxyz: np.ndarray | tuple[float, ...]) -> np.ndarray:
+    """Build OpenCV T_world_cam from robot-base x y z qw qx qy qz."""
+    xyz_wxyz = np.asarray(xyz_wxyz, dtype=np.float64).reshape(-1)
+    assert xyz_wxyz.shape == (7,), f"seed pose must be x y z qw qx qy qz, got shape {xyz_wxyz.shape}"
+    t = xyz_wxyz[:3]
+    q = xyz_wxyz[3:]
+    q_norm = float(np.linalg.norm(q))
+    assert q_norm > 1e-8, f"seed quaternion is zero: {q}"
+    assert abs(q_norm - 1.0) < 1e-3, f"seed quaternion must be unit length, got norm={q_norm} q={q}"
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = quat2mat(q / q_norm)
+    T[:3, 3] = t
+    return T
+
+
 def _T_to_vec(T: np.ndarray) -> np.ndarray:
     """SE(3) 4x4 → 6D [tx, ty, tz, rx, ry, rz] with rotation-vector orientation."""
     assert T.shape == (4, 4), f"T must be 4x4, got {T.shape}"
@@ -827,6 +861,26 @@ def _world_points_to_camera(T_world_cam: np.ndarray, pts_world: np.ndarray) -> n
     R = T_world_cam[:3, :3]
     t = T_world_cam[:3, 3]
     return ((pts_world.astype(np.float64) - t) @ R).astype(np.float32)
+
+
+def _remove_radius_outliers(points: np.ndarray, nb_points: int, radius_m: float) -> np.ndarray:
+    """Drop points with fewer than `nb_points` neighbors inside `radius_m` (Open3D radius outlier)."""
+    import open3d as o3d
+
+    assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
+    assert points.shape[0] >= 1, "points must contain at least 1 point"
+    assert nb_points >= 1, f"nb_points must be >= 1, got {nb_points}"
+    assert radius_m > 0.0, f"radius_m must be > 0, got {radius_m}"
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(np.asarray(points, dtype=np.float64))
+    filtered, _ind = pcd.remove_radius_outlier(nb_points=nb_points, radius=radius_m)
+    out = np.asarray(filtered.points)
+    assert out.ndim == 2 and out.shape[1] == 3, f"filtered points must be (N, 3), got {out.shape}"
+    assert out.shape[0] >= 1, (
+        f"Radius outlier filter removed all points (n_in={points.shape[0]}, nb_points={nb_points}, "
+        f"radius_m={radius_m})"
+    )
+    return out.astype(np.float64, copy=False)
 
 
 def _subsample_pcd(
@@ -1533,6 +1587,7 @@ def _optimize_extrinsics(
     chamfer_device: str,
     seed_automatically: bool,
     seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
     gui_translation_step_m: float,
     gui_rotation_step_deg: float,
     n_seed_azimuth: int,
@@ -1554,7 +1609,7 @@ def _optimize_extrinsics(
     assert n_seed_radii >= 1, f"n_seed_radii must be >= 1, got {n_seed_radii}"
     assert cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {cma_sigma_pos}"
     assert cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {cma_sigma_rot}"
-    _validate_seed_mode(seed_automatically, seed_from_gui)
+    _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
     if seed_automatically:
         seed_Ts = _generate_seed_poses(n_seed_azimuth, n_seed_polar, n_seed_rolls, n_seed_radii)
         radii = np.linspace(_SEED_RADIUS_MIN_M, _SEED_RADIUS_MAX_M, n_seed_radii, dtype=np.float64)
@@ -1572,13 +1627,26 @@ def _optimize_extrinsics(
             vis,
         )
         _log_elapsed(f"Seed search finished, best={best_cost:.6f}", t0_seed)
-    else:
+    elif seed_from_gui:
         assert vis is not None, "GUI seed selection requires an ExtrinsicsVisualizer"
         best_T, best_cost, best_pcd_sims = vis.select_seed_from_gui(
             gui_translation_step_m,
             gui_rotation_step_deg,
         )
         print(f"[info] Manual seed selected: cost={best_cost:.6f} T_world_cam=\n{best_T}")
+    else:
+        assert seed_pose is not None, "seed_pose is required when not using --seed-automatically or --seed-from-gui"
+        best_T = _pose_from_xyz_wxyz(seed_pose)
+        t0_seed = time.perf_counter()
+        best_cost, best_pcd_sims, _, _ = _pose_cost(best_T, pcd_reals, pcd_sim_worlds, chamfer_device)
+        if vis is not None:
+            vis.set_best(best_pcd_sims, best_cost, best_T)
+            vis.record_seed_best(time.perf_counter() - t0_seed, best_cost)
+        q_wxyz = mat2quat(best_T[:3, :3])
+        print(
+            f"[info] Seed pose xyz={best_T[:3, 3].tolist()} wxyz={q_wxyz.tolist()} "
+            f"cost={best_cost:.6f} T_world_cam=\n{best_T}"
+        )
 
     x0 = _T_to_vec(best_T)
     cma_stds = [cma_sigma_pos, cma_sigma_pos, cma_sigma_pos, cma_sigma_rot, cma_sigma_rot, cma_sigma_rot]
@@ -1659,16 +1727,17 @@ def main(args: Args) -> None:
         args.robot_id.lower() in NAME_TO_ROBOT
     ), f"Unknown robot_id {args.robot_id!r}. Available: {sorted(NAME_TO_ROBOT)}"
     assert args.n_timesteps >= 1, f"n_timesteps must be >= 1, got {args.n_timesteps}"
-    assert args.n_pcd_samples >= 1, f"n_pcd_samples must be >= 1, got {args.n_pcd_samples}"
-    assert args.n_random_downsample_initial >= args.n_pcd_samples, (
+    assert args.n_pcd_samples_real >= 1, f"n_pcd_samples_real must be >= 1, got {args.n_pcd_samples_real}"
+    assert args.n_pcd_samples_sim >= 1, f"n_pcd_samples_sim must be >= 1, got {args.n_pcd_samples_sim}"
+    assert args.n_random_downsample_initial >= args.n_pcd_samples_real, (
         f"n_random_downsample_initial ({args.n_random_downsample_initial}) must be >= "
-        f"n_pcd_samples ({args.n_pcd_samples})"
+        f"n_pcd_samples_real ({args.n_pcd_samples_real})"
     )
     assert args.cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {args.cma_sigma_pos}"
     assert args.cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {args.cma_sigma_rot}"
     assert args.cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {args.cma_maxiter}"
     assert args.cma_popsize is None or args.cma_popsize >= 2, f"cma_popsize must be >= 2, got {args.cma_popsize}"
-    _validate_seed_mode(args.seed_automatically, args.seed_from_gui)
+    _validate_seed_mode(args.seed_automatically, args.seed_from_gui, args.seed_pose)
     assert args.gui_translation_step_m > 0.0, f"gui_translation_step_m must be > 0, got {args.gui_translation_step_m}"
     assert args.gui_rotation_step_deg > 0.0, f"gui_rotation_step_deg must be > 0, got {args.gui_rotation_step_deg}"
     assert args.n_seed_azimuth >= 1, f"n_seed_azimuth must be >= 1, got {args.n_seed_azimuth}"
@@ -1683,6 +1752,10 @@ def main(args: Args) -> None:
     assert args.mask_erode_px == 0 or (
         args.mask_erode_px >= 1 and args.mask_erode_px % 2 == 1
     ), f"mask_erode_px must be 0 or a positive odd int, got {args.mask_erode_px}"
+    assert (
+        args.radius_outlier_nb_points >= 1
+    ), f"radius_outlier_nb_points must be >= 1, got {args.radius_outlier_nb_points}"
+    assert args.radius_outlier_radius_m > 0.0, f"radius_outlier_radius_m must be > 0, got {args.radius_outlier_radius_m}"
     assert args.depth_intrinsics_source in (
         "rgb",
         "depth",
@@ -1777,7 +1850,13 @@ def main(args: Args) -> None:
         )
         demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
         pts = masked_depth_to_points(depth_m_sel[i], mask, K)
-        pts = _subsample_pcd(pts, args.n_pcd_samples, args.n_random_downsample_initial, chamfer_device, rng)
+        n_unproj = int(pts.shape[0])
+        pts = _remove_radius_outliers(pts, args.radius_outlier_nb_points, args.radius_outlier_radius_m)
+        print(
+            f"[info] pcd_real[{i}] radius-outlier: {n_unproj} -> {pts.shape[0]} "
+            f"(nb_points={args.radius_outlier_nb_points}, radius_m={args.radius_outlier_radius_m})"
+        )
+        pts = _subsample_pcd(pts, args.n_pcd_samples_real, args.n_random_downsample_initial, chamfer_device, rng)
         assert pts.shape[0] >= 1, f"No robot points at frame {frame_idx}"
         pcd_reals.append(pts)
         print(f"[info] pcd_real[{i}] n={pts.shape[0]}")
@@ -1795,7 +1874,7 @@ def main(args: Args) -> None:
     pcd_sim_worlds: list[np.ndarray] = []
     t0_sim = time.perf_counter()
     for i, q in enumerate(qpos_sel):
-        p_world = renderer.render_multiview_world(q, args.n_pcd_samples, chamfer_device)
+        p_world = renderer.render_multiview_world(q, args.n_pcd_samples_sim, chamfer_device)
         pcd_sim_worlds.append(p_world)
         print(f"[info] pcd_sim_world[{i}] n={p_world.shape[0]}")
     _log_elapsed(f"Rendered 6-view sim clouds for {len(pcd_sim_worlds)} timesteps", t0_sim)
@@ -1814,6 +1893,7 @@ def main(args: Args) -> None:
         chamfer_device,
         args.seed_automatically,
         args.seed_from_gui,
+        args.seed_pose,
         args.gui_translation_step_m,
         args.gui_rotation_step_deg,
         args.n_seed_azimuth,

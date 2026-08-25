@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 from transforms3d.axangles import axangle2mat
+from transforms3d.quaternions import mat2quat
 
 from examples.estimate_camera_extrinsics import (
     _CAPTURE_AXES,
@@ -13,25 +14,72 @@ from examples.estimate_camera_extrinsics import (
     _look_at_opencv,
     _look_at_with_roll,
     _n_consecutive_cached_masks,
+    _pose_from_xyz_wxyz,
     _propagate_robot_masks,
     _propagated_robot_mask_cache_path,
     _propagated_robot_mask_video_path,
+    _remove_radius_outliers,
     _step_pose_world,
     _transform_points,
     _validate_seed_mode,
     _world_points_to_camera,
 )
 
-
-@pytest.mark.parametrize(("seed_automatically", "seed_from_gui"), [(True, False), (False, True)])
-def test_exactly_one_seed_mode_is_valid(seed_automatically: bool, seed_from_gui: bool):
-    _validate_seed_mode(seed_automatically, seed_from_gui)
+_SEED_POSE = (0.80, 0.00, 0.50, 1.00, 0.00, 0.00, 0.00)
 
 
-@pytest.mark.parametrize(("seed_automatically", "seed_from_gui"), [(False, False), (True, True)])
-def test_zero_or_two_seed_modes_raise(seed_automatically: bool, seed_from_gui: bool):
+@pytest.mark.parametrize(
+    ("seed_automatically", "seed_from_gui", "seed_pose"),
+    [
+        (True, False, None),
+        (False, True, None),
+        (False, False, _SEED_POSE),
+    ],
+)
+def test_exactly_one_seed_mode_is_valid(
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
+):
+    _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
+
+
+@pytest.mark.parametrize(
+    ("seed_automatically", "seed_from_gui", "seed_pose"),
+    [
+        (False, False, None),
+        (True, True, None),
+        (True, False, _SEED_POSE),
+        (False, True, _SEED_POSE),
+        (True, True, _SEED_POSE),
+    ],
+)
+def test_zero_or_two_seed_modes_raise(
+    seed_automatically: bool,
+    seed_from_gui: bool,
+    seed_pose: tuple[float, float, float, float, float, float, float] | None,
+):
     with pytest.raises(AssertionError, match="Exactly one"):
-        _validate_seed_mode(seed_automatically, seed_from_gui)
+        _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
+
+
+def test_pose_from_xyz_wxyz_roundtrip():
+    T = np.eye(4, dtype=np.float64)
+    T[:3, 3] = [0.1, -0.2, 0.3]
+    T[:3, :3] = axangle2mat(np.array([0.0, 0.0, 1.0]), 0.4)
+    q = mat2quat(T[:3, :3])
+    T_back = _pose_from_xyz_wxyz(np.concatenate([T[:3, 3], q]))
+    assert np.allclose(T_back, T)
+
+
+def test_pose_from_xyz_wxyz_rejects_zero_quaternion():
+    with pytest.raises(AssertionError, match="zero"):
+        _pose_from_xyz_wxyz((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+
+
+def test_pose_from_xyz_wxyz_rejects_nonunit_quaternion():
+    with pytest.raises(AssertionError, match="unit"):
+        _pose_from_xyz_wxyz((0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0))
 
 
 def test_world_translation_ignores_camera_orientation():
@@ -86,6 +134,21 @@ def test_look_at_roll_pi_flips_camera_x_and_y():
     assert np.allclose(T[:3, 2], T0[:3, 2])
     assert np.allclose(T[:3, 0], -T0[:3, 0])
     assert np.allclose(T[:3, 1], -T0[:3, 1])
+
+
+def test_remove_radius_outliers_drops_isolated_points():
+    xs, ys, zs = np.mgrid[0:5, 0:5, 0:2]
+    cluster = np.stack([xs.ravel(), ys.ravel(), zs.ravel()], axis=1).astype(np.float64) * 0.01
+    isolated = np.array([[2.0, 0.0, 0.0], [2.0, 1.0, 0.0]], dtype=np.float64)
+    out = _remove_radius_outliers(np.vstack([cluster, isolated]), nb_points=10, radius_m=0.10)
+    assert out.shape[0] == 50
+    assert np.all(np.linalg.norm(out, axis=1) < 0.2)
+
+
+def test_remove_radius_outliers_rejects_all_isolated_points():
+    pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float64)
+    with pytest.raises(AssertionError, match="removed all"):
+        _remove_radius_outliers(pts, nb_points=10, radius_m=0.10)
 
 
 def test_world_points_to_camera_inverts_transform_points():
@@ -197,7 +260,7 @@ class _FakePropagatePredictor:
         height, width = image_bgr.shape[:2]
         mask = np.zeros((height, width), dtype=bool)
         mask[2 : 2 + t, 3 : 5 + t] = True
-        low_res = np.full((1, 256, 256), float(t), dtype=np.float32)
+        low_res = np.full((1, 288, 288), float(t), dtype=np.float32)
         return mask, 0.9, low_res
 
 
@@ -224,7 +287,7 @@ def test_propagate_robot_masks_feeds_union_then_logits():
     assert np.array_equal(out[1], expected1)
     assert np.array_equal(out[2], expected2)
     _, mask_input1, box1 = predictor.calls[1]
-    assert np.allclose(mask_input1, np.full((1, 256, 256), 1.0, dtype=np.float32))
+    assert np.allclose(mask_input1, np.full((1, 288, 288), 1.0, dtype=np.float32))
     assert np.allclose(box1, bbox_xyxy_from_mask(expected1))
 
 
@@ -292,7 +355,7 @@ def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, mon
         np.save(_propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3), mask)
 
     fake = _FakePropagatePredictor()
-    monkeypatch.setattr(ece, "_load_grounded_sam", lambda: fake)
+    monkeypatch.setattr(ece, "_load_sam3", lambda: fake)
     out = ece._compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
     assert np.array_equal(out[0], cached[0])
     assert np.array_equal(out[1], cached[1])
