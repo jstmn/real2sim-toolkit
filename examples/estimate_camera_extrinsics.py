@@ -191,8 +191,14 @@ class Args:
     cma_sigma_rot: float = 1.0
     """CMA-ES initial std for camera rotation-vector (radians)."""
 
-    cma_maxiter: int = 100
+    cma_maxiter: int = 250
     """Maximum CMA-ES generations."""
+
+    cma_early_stop_atol: float = 0.00001
+    """Stop CMA-ES if this generation's min cost (`gen_min`) changes by less than this for `cma_early_stop_patience` gens."""
+
+    cma_early_stop_patience: int = 5
+    """Consecutive generations whose `gen_min` range is < `cma_early_stop_atol` before early stop."""
 
     seed_automatically: bool = False
     """If set, choose the CMA-ES seed with the spherical-grid search."""
@@ -221,8 +227,8 @@ class Args:
     n_seed_rolls: int = 10
     """Number of evenly spaced rolls about the look-at axis (toward (0, 0, 0.5)) per seed position."""
 
-    cma_popsize: int = 10
-    """CMA-ES population size. If unset, the cma library default is used."""
+    cma_popsize: int = 25
+    """CMA-ES population size."""
 
     robot_description: str = "robot arm"
     """SAM 3 text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
@@ -1598,6 +1604,8 @@ def _optimize_extrinsics(
     cma_sigma_rot: float,
     cma_maxiter: int,
     cma_popsize: int | None,
+    cma_early_stop_atol: float,
+    cma_early_stop_patience: int,
     vis: ExtrinsicsVisualizer | None,
 ) -> tuple[np.ndarray, float]:
     """CMA-ES over 6D camera pose. Returns (best 4x4 T_world_cam, cost)."""
@@ -1609,6 +1617,8 @@ def _optimize_extrinsics(
     assert n_seed_radii >= 1, f"n_seed_radii must be >= 1, got {n_seed_radii}"
     assert cma_sigma_pos > 0, f"cma_sigma_pos must be > 0, got {cma_sigma_pos}"
     assert cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {cma_sigma_rot}"
+    assert cma_early_stop_atol > 0, f"cma_early_stop_atol must be > 0, got {cma_early_stop_atol}"
+    assert cma_early_stop_patience >= 1, f"cma_early_stop_patience must be >= 1, got {cma_early_stop_patience}"
     _validate_seed_mode(seed_automatically, seed_from_gui, seed_pose)
     if seed_automatically:
         seed_Ts = _generate_seed_poses(n_seed_azimuth, n_seed_polar, n_seed_rolls, n_seed_radii)
@@ -1656,10 +1666,12 @@ def _optimize_extrinsics(
     es = cma.CMAEvolutionStrategy(x0, 1.0, cma_opts)
     print(
         f"[info] CMA-ES x0={x0} sigma_pos={cma_sigma_pos} sigma_rot={cma_sigma_rot} "
-        f"popsize={es.popsize} maxiter={cma_maxiter}"
+        f"popsize={es.popsize} maxiter={cma_maxiter} "
+        f"early_stop_atol={cma_early_stop_atol} early_stop_patience={cma_early_stop_patience}"
     )
 
     generation = 0
+    recent_gen_mins: list[float] = []
     t0_opt = time.perf_counter()
     while not es.stop():
         generation += 1
@@ -1705,14 +1717,26 @@ def _optimize_extrinsics(
         dt_gen = time.perf_counter() - t0_gen
         t_other = dt_gen - (t_transform + t_chamfer + t_vis + t_cma)
         print(
-            f"[info] gen {generation} ({dt_gen:.1f}s): best={best_cost:.6f}  gen_min={pop_min:.6f}  "
+            f"[info] gen {generation} ({dt_gen:.3f}s): best={best_cost:.6f}  gen_min={pop_min:.6f}  "
             f"gen_mean={float(np.mean(costs)):.6f}"
         )
-        print(f"[info]   time_transform={t_transform:.1f}s")
-        print(f"[info]   time_chamfer={t_chamfer:.1f}s")
-        print(f"[info]   time_vis={t_vis:.1f}s")
-        print(f"[info]   time_cma={t_cma:.1f}s")
-        print(f"[info]   time_other={t_other:.1f}s")
+        print(f"[info]   time_transform={t_transform:.3f}s")
+        print(f"[info]   time_chamfer={t_chamfer:.3f}s")
+        print(f"[info]   time_vis={t_vis:.3f}s")
+        print(f"[info]   time_cma={t_cma:.3f}s")
+        print(f"[info]   time_other={t_other:.3f}s")
+        recent_gen_mins.append(pop_min)
+        if len(recent_gen_mins) > cma_early_stop_patience:
+            recent_gen_mins = recent_gen_mins[-cma_early_stop_patience:]
+        if len(recent_gen_mins) == cma_early_stop_patience:
+            gen_min_spread = max(recent_gen_mins) - min(recent_gen_mins)
+            if gen_min_spread < cma_early_stop_atol:
+                print(
+                    f"[info] CMA-ES early stop at gen {generation}: gen_min changed by < {cma_early_stop_atol} "
+                    f"over {cma_early_stop_patience} consecutive gens "
+                    f"(gen_min={pop_min:.6f} spread={gen_min_spread:.6f} best={best_cost:.6f})"
+                )
+                break
 
     assert best_T is not None, "CMA-ES produced no pose"
     _log_elapsed(f"CMA-ES finished ({generation} gens)", t0_opt)
@@ -1737,6 +1761,10 @@ def main(args: Args) -> None:
     assert args.cma_sigma_rot > 0, f"cma_sigma_rot must be > 0, got {args.cma_sigma_rot}"
     assert args.cma_maxiter >= 1, f"cma_maxiter must be >= 1, got {args.cma_maxiter}"
     assert args.cma_popsize is None or args.cma_popsize >= 2, f"cma_popsize must be >= 2, got {args.cma_popsize}"
+    assert args.cma_early_stop_atol > 0, f"cma_early_stop_atol must be > 0, got {args.cma_early_stop_atol}"
+    assert (
+        args.cma_early_stop_patience >= 1
+    ), f"cma_early_stop_patience must be >= 1, got {args.cma_early_stop_patience}"
     _validate_seed_mode(args.seed_automatically, args.seed_from_gui, args.seed_pose)
     assert args.gui_translation_step_m > 0.0, f"gui_translation_step_m must be > 0, got {args.gui_translation_step_m}"
     assert args.gui_rotation_step_deg > 0.0, f"gui_rotation_step_deg must be > 0, got {args.gui_rotation_step_deg}"
@@ -1904,6 +1932,8 @@ def main(args: Args) -> None:
         args.cma_sigma_rot,
         args.cma_maxiter,
         args.cma_popsize,
+        args.cma_early_stop_atol,
+        args.cma_early_stop_patience,
         vis,
     )
     t, q_wxyz = best_T[:3, 3], mat2quat(best_T[:3, :3])

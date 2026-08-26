@@ -97,7 +97,7 @@ uv run python examples/estimate_camera_extrinsics.py \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/demonstrations/0802/extrinsics.yaml \
+  --output-path data/demonstrations/0802/extrinsics_cam_1.yaml \
   --seed-from-gui \
   --visualize \
   --visualize-robot-masks
@@ -110,7 +110,7 @@ uv run python examples/estimate_camera_extrinsics.py \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/demonstrations/0802/extrinsics.yaml \
+  --output-path data/demonstrations/0802/extrinsics_cam_1.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 ```
