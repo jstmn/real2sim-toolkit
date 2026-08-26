@@ -162,7 +162,7 @@ uv run python examples/track_object.py \
     --camera cam_1 \
     --camera-model-id d435 \
     --object-description "mustard bottle" \
-    --extrinsics-path data/demonstrations/0802/extrinsics.yaml \
+    --extrinsics-path data/demonstrations/0802/extrinsics_cam_1.yaml \
     --visualize
 
 uv run python examples/track_object.py \
@@ -170,6 +170,7 @@ uv run python examples/track_object.py \
     --camera camera_north \
     --camera-model-id d435 \
     --object-description "blue cube" \
+    --extrinsics-path data/demonstrations/0802/extrinsics_cam_1.yaml \
     --visualize
 ```
 

@@ -32,7 +32,7 @@ from r2st.utils import (
         --camera cam_1 \
         --camera-model-id d435 \
         --object-description "mustard bottle" \
-        --extrinsics-path data/demonstrations/0802/extrinsics.yaml \
+        --extrinsics-path data/demonstrations/0802/extrinsics_cam_1.yaml \
         --visualize
 """
 

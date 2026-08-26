@@ -110,14 +110,7 @@ from r2st.utils import (
 )
 
 """
-# Example usage:
-uv run python examples/estimate_camera_extrinsics.py \
-    --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-    --robot-id xarm7__gripper --camera cam_1 --camera-model-id d435 \
-    --depth-intrinsics-source rgb \
-    --output-path data/demonstrations/0802/extrinsics.yaml \
-    --seed-automatically \
-    --visualize --visualize-robot-masks
+# See README.md for example usage
 """
 
 _SEED_RADIUS_MIN_M = 1.0
