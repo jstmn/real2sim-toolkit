@@ -21,6 +21,29 @@ DEPTH_INTRINSICS: dict[str, CameraIntrinsics] = {
         cx=318.35821533203125,
         cy=239.32760620117188,
     ),
+    # With align_depth.enable:=true the depth channel is resampled onto the COLOR grid, so
+    # the aligned depth's camera_info is identical to the colour one -- that is what these
+    # demos carry in d435_camera_info_depth.json. Nothing reads this entry while
+    # --depth-intrinsics-source is `rgb` (the reprojection is skipped entirely), but the
+    # key must exist because of the four-dict consistency assert below.
+    "d435_720p": CameraIntrinsics(
+        width=1280,
+        height=720,
+        fx=912.07177734375,
+        fy=911.8675537109375,
+        cx=642.824951171875,
+        cy=355.07000732421875,
+    ),
+    # ZED 2i (serial 33386243), left camera at HD720. The ZED SDK's depth is computed for the rectified left image,
+    # so the depth channel already lies on the colour grid: same K, identity depth-to-colour transform.
+    "zed2i_hd720": CameraIntrinsics(
+        width=1280,
+        height=720,
+        fx=522.732971,
+        fy=522.732971,
+        cx=640.685669,
+        cy=365.680359,
+    ),
 }
 
 COLOR_INTRINSICS: dict[str, CameraIntrinsics] = {
@@ -32,6 +55,29 @@ COLOR_INTRINSICS: dict[str, CameraIntrinsics] = {
         cx=321.8832702636719,
         cy=236.7133331298828,
     ),
+    # Same physical D435 (serial 841512071544) run at 1280x720, which is what the
+    # 30-demo Square session was recorded at. Read straight off
+    # /camera/d435/color/camera_info and saved into each demo's
+    # d435_camera_info_color.json -- not rescaled from the 640x480 row, because the
+    # sensor's crop/binning does not make that exact.
+    "d435_720p": CameraIntrinsics(
+        width=1280,
+        height=720,
+        fx=912.07177734375,
+        fy=911.8675537109375,
+        cx=642.824951171875,
+        cy=355.07000732421875,
+    ),
+    # ZED 2i (serial 33386243) left rectified image at HD720, factory calibration (self-calibration disabled), as
+    # reported by the ZED SDK's calibration_parameters.left_cam.
+    "zed2i_hd720": CameraIntrinsics(
+        width=1280,
+        height=720,
+        fx=522.732971,
+        fy=522.732971,
+        cx=640.685669,
+        cy=365.680359,
+    ),
 }
 
 DEPTH_TO_COLOR_ROTATION: dict[str, np.ndarray] = {
@@ -39,10 +85,19 @@ DEPTH_TO_COLOR_ROTATION: dict[str, np.ndarray] = {
         [[0.999749, 0.021574, 0.00599926], [-0.021599, 0.999758, 0.0041374], [-0.00590855, -0.00426594, 0.999973]],
         dtype=np.float64,
     ),
+    # Physical transform between the depth and colour sensors: a property of the module,
+    # not of the streaming resolution, so it is shared with the 640x480 entry.
+    "d435_720p": np.array(
+        [[0.999749, 0.021574, 0.00599926], [-0.021599, 0.999758, 0.0041374], [-0.00590855, -0.00426594, 0.999973]],
+        dtype=np.float64,
+    ),
+    "zed2i_hd720": np.eye(3, dtype=np.float64),
 }
 
 DEPTH_TO_COLOR_TRANSLATION: dict[str, np.ndarray] = {
     "d435": np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64),
+    "d435_720p": np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64),
+    "zed2i_hd720": np.zeros(3, dtype=np.float64),
 }
 
 assert (

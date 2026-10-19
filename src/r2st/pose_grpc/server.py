@@ -99,7 +99,17 @@ class PoseTrackingServicer(pose_tracking_pb2_grpc.PoseTrackingServicer):
 
 
 def main(args: Args) -> None:
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=args.max_workers))
+    # A 1280x720 register call carries colour (2.8 MB uint8) + depth (3.7 MB float32) +
+    # mask, about 7.4 MB, which blows past gRPC's 4 MB default and fails with
+    # RESOURCE_EXHAUSTED. 64 MB leaves room for larger frames without being unbounded.
+    _MAX_MSG = 64 * 1024 * 1024
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=args.max_workers),
+        options=[
+            ("grpc.max_receive_message_length", _MAX_MSG),
+            ("grpc.max_send_message_length", _MAX_MSG),
+        ],
+    )
     pose_tracking_pb2_grpc.add_PoseTrackingServicer_to_server(PoseTrackingServicer(args.debug_dir), server)
     server.add_insecure_port(f"[::]:{args.port}")
     server.start()

@@ -232,6 +232,11 @@ class Args:
     sam_score_threshold: float = 0.3
     """Keep a top-k SAM mask in the frame-0 union only if its confidence is strictly above this."""
 
+    per_frame_robot_masks: bool = False
+    """If set, segment the robot with the SAM 3 text prompt on every frame (union of the top --sam-kmax masks) instead
+    of propagating frame 0's mask. For recordings of separate arm poses (not a continuous trajectory), where the arm
+    jumps between frames and propagation stays on the static base."""
+
     cache_robot_masks: bool = True
     """If set, load/save propagated robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
 
@@ -462,6 +467,21 @@ def _compute_propagated_robot_masks(
         if cache_robot_masks:
             print(f"[info] Saved {n_frames} propagated robot masks")
     _save_propagated_mask_demo_overlays(rgb, masks, h5_path, camera, sam_kmax, sam_score_threshold)
+    return masks
+
+
+def _segment_robot_masks_per_frame(
+    rgb: np.ndarray, robot_description: str, sam_kmax: int, sam_score_threshold: float
+) -> np.ndarray:
+    """Return ``(T, H, W)`` robot masks, each from SAM 3 on its own frame (union of the top ``sam_kmax`` masks)."""
+    assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
+    predictor = _load_sam3()
+    masks = np.zeros(rgb.shape[:3], dtype=bool)
+    for t in tqdm(range(rgb.shape[0]), desc="Segment robot per frame"):
+        image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
+        ranked_masks, scores, _ = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, robot_description)
+        masks[t] = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
+        print(f"[info] frame {t}: {ranked_masks.shape[0]} masks, union of top {sam_kmax} = {int(masks[t].sum())} px")
     return masks
 
 
@@ -1844,16 +1864,24 @@ def main(args: Args) -> None:
     pcd_reals: list[np.ndarray] = []
     demo_frames: list[np.ndarray] = []
     t0_masks = time.perf_counter()
-    masks_all = _compute_propagated_robot_masks(
-        rgb_all,
-        args.h5_path,
-        args.camera,
-        args.robot_description,
-        args.sam_kmax,
-        args.sam_score_threshold,
-        args.cache_robot_masks,
-        args.visualize_robot_masks,
-    )
+    if args.per_frame_robot_masks:
+        masks_all = _segment_robot_masks_per_frame(
+            rgb_all, args.robot_description, args.sam_kmax, args.sam_score_threshold
+        )
+        _save_propagated_mask_demo_overlays(
+            rgb_all, masks_all, args.h5_path, args.camera, args.sam_kmax, args.sam_score_threshold
+        )
+    else:
+        masks_all = _compute_propagated_robot_masks(
+            rgb_all,
+            args.h5_path,
+            args.camera,
+            args.robot_description,
+            args.sam_kmax,
+            args.sam_score_threshold,
+            args.cache_robot_masks,
+            args.visualize_robot_masks,
+        )
     assert masks_all.shape == (
         n_frames,
         H,

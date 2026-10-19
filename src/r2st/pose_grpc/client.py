@@ -15,7 +15,16 @@ from r2st.pose_grpc import codec, pose_tracking_pb2, pose_tracking_pb2_grpc
 
 class FoundationPoseClient:
     def __init__(self, address: str = "localhost:50051"):
-        self._channel = grpc.insecure_channel(address)
+        # Must match the server's limit: 720p frames are ~7.4 MB per register call,
+        # over gRPC's 4 MB default (see server.py).
+        _MAX_MSG = 64 * 1024 * 1024
+        self._channel = grpc.insecure_channel(
+            address,
+            options=[
+                ("grpc.max_receive_message_length", _MAX_MSG),
+                ("grpc.max_send_message_length", _MAX_MSG),
+            ],
+        )
         self._stub = pose_tracking_pb2_grpc.PoseTrackingStub(self._channel)
 
     def register(
