@@ -44,6 +44,32 @@ DEPTH_INTRINSICS: dict[str, CameraIntrinsics] = {
         cx=640.685669,
         cy=365.680359,
     ),
+    # ZED / ZED 2i / ZED Mini at VGA. Depth is registered to the rectified left image, so these equal the colour K
+    # (the <cam>_camera_info_depth.json files panda_utils saves are identical to the colour ones).
+    "zed_vga": CameraIntrinsics(
+        width=672,
+        height=376,
+        fx=337.5408630371094,
+        fy=337.5408630371094,
+        cx=331.0454406738281,
+        cy=178.57284545898438,
+    ),
+    "zed2i_vga": CameraIntrinsics(
+        width=672,
+        height=376,
+        fx=261.0467834472656,
+        fy=261.0467834472656,
+        cx=335.6777648925781,
+        cy=190.3715362548828,
+    ),
+    "zedm_vga": CameraIntrinsics(
+        width=672,
+        height=376,
+        fx=364.70025634765625,
+        fy=364.70025634765625,
+        cx=338.702880859375,
+        cy=187.4025115966797,
+    ),
 }
 
 COLOR_INTRINSICS: dict[str, CameraIntrinsics] = {
@@ -78,6 +104,32 @@ COLOR_INTRINSICS: dict[str, CameraIntrinsics] = {
         cx=640.685669,
         cy=365.680359,
     ),
+    # Left rectified image at VGA, from the ROS camera_info that panda_utils' log_demonstration.py saves as
+    # <cam>_camera_info_color.json next to each trajectory (rectified, so all distortion coefficients are 0).
+    "zed_vga": CameraIntrinsics(
+        width=672,
+        height=376,
+        fx=337.5408630371094,
+        fy=337.5408630371094,
+        cx=331.0454406738281,
+        cy=178.57284545898438,
+    ),
+    "zed2i_vga": CameraIntrinsics(
+        width=672,
+        height=376,
+        fx=261.0467834472656,
+        fy=261.0467834472656,
+        cx=335.6777648925781,
+        cy=190.3715362548828,
+    ),
+    "zedm_vga": CameraIntrinsics(
+        width=672,
+        height=376,
+        fx=364.70025634765625,
+        fy=364.70025634765625,
+        cx=338.702880859375,
+        cy=187.4025115966797,
+    ),
 }
 
 DEPTH_TO_COLOR_ROTATION: dict[str, np.ndarray] = {
@@ -92,12 +144,18 @@ DEPTH_TO_COLOR_ROTATION: dict[str, np.ndarray] = {
         dtype=np.float64,
     ),
     "zed2i_hd720": np.eye(3, dtype=np.float64),
+    "zed_vga": np.eye(3, dtype=np.float64),
+    "zed2i_vga": np.eye(3, dtype=np.float64),
+    "zedm_vga": np.eye(3, dtype=np.float64),
 }
 
 DEPTH_TO_COLOR_TRANSLATION: dict[str, np.ndarray] = {
     "d435": np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64),
     "d435_720p": np.array([0.0146080, -0.00004137, 0.0008026], dtype=np.float64),
     "zed2i_hd720": np.zeros(3, dtype=np.float64),
+    "zed_vga": np.zeros(3, dtype=np.float64),
+    "zed2i_vga": np.zeros(3, dtype=np.float64),
+    "zedm_vga": np.zeros(3, dtype=np.float64),
 }
 
 assert (

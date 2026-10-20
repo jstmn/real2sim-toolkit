@@ -50,6 +50,25 @@ mkdir -p data
 gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 ```
 
+## Data format
+
+Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of every dataset belongs to frame `i`.
+`r2st.utils.validate_merged_camera_group` checks the required camera datasets.
+
+| Dataset | Shape | Dtype | Required | Notes |
+| --- | --- | --- | --- | --- |
+| `obs/qpos` | `(T, D)` | float64 | yes | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0 |
+| `obs/sensor_data/<cam>/rgb` | `(T, H, W, 3)` | uint8 | yes | RGB |
+| `obs/sensor_data/<cam>/depth` | `(T, H, W)` | uint16 | yes | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K |
+| `obs/sensor_data/<cam>/timestamp_ms` | `(T,)` | float64 | yes | Time of frame `i` (Unix epoch, ms) |
+| `obs/sensor_data/<cam>/rgb_timestamp_ms` | `(T,)` | float64 | yes | Capture time of the RGB image used for frame `i` (Unix epoch, ms) |
+| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)` | float64 | no | Capture time of the depth image used for frame `i` (Unix epoch, ms) |
+| `obs/qvel` | `(T, D)` | float64 | no | Joint velocities, same order as `obs/qpos` |
+| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)` | int64 | no | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
+
+`<cam>` is the value you pass as `--camera` to the examples.
+
+
 ## Examples
 
 ### Example 1: Segment an object with SAM 3.
@@ -182,6 +201,11 @@ uv run python examples/track_object.py \
 | `--camera-model-id` | Device |
 | --- | --- |
 | `d435` | Intel RealSense D435 |
+| `d435_720p` | Intel RealSense D435 at 1280x720 |
+| `zed2i_hd720` | Stereolabs ZED 2i at HD720 (1280x720) |
+| `zed_vga` | Stereolabs ZED at VGA (672x376) |
+| `zed2i_vga` | Stereolabs ZED 2i at VGA (672x376) |
+| `zedm_vga` | Stereolabs ZED Mini at VGA (672x376) |
 
 ## Pose tracking (gRPC)
 

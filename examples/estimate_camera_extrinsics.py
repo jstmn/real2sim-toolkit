@@ -1796,7 +1796,9 @@ def main(args: Args) -> None:
     assert (
         args.radius_outlier_nb_points >= 1
     ), f"radius_outlier_nb_points must be >= 1, got {args.radius_outlier_nb_points}"
-    assert args.radius_outlier_radius_m > 0.0, f"radius_outlier_radius_m must be > 0, got {args.radius_outlier_radius_m}"
+    assert (
+        args.radius_outlier_radius_m > 0.0
+    ), f"radius_outlier_radius_m must be > 0, got {args.radius_outlier_radius_m}"
     assert args.depth_intrinsics_source in (
         "rgb",
         "depth",

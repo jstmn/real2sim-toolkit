@@ -348,8 +348,8 @@ def bilateral_filter_depth_kernel(
         return
     out[h, w] = 0.0
     # Warp treats `0.0` as a compile-time constant; `float(0.0)` / `int(0)` make them mutable in dynamic loops.
-    mean_depth = float(0.0)
-    num_valid = int(0)
+    mean_depth = float(0.0)  # noqa: UP018
+    num_valid = int(0)  # noqa: UP018, RUF046
     for u in range(w - radius, w + radius + 1):
         if u < 0 or u >= W:
             continue
@@ -365,8 +365,8 @@ def bilateral_filter_depth_kernel(
     mean_depth /= float(num_valid)
 
     depthCenter = depth[h, w]
-    sum_weight = float(0.0)
-    weighted_sum = float(0.0)
+    sum_weight = float(0.0)  # noqa: UP018
+    weighted_sum = float(0.0)  # noqa: UP018
     for u in range(w - radius, w + radius + 1):
         if u < 0 or u >= W:
             continue
@@ -419,8 +419,8 @@ def erode_depth_kernel(
     if d_ori < 0.001 or d_ori >= zfar:
         out[h, w] = 0.0
     # Warp treats `0.0` as a compile-time constant; `float(0.0)` makes them mutable in dynamic loops.
-    bad_cnt = float(0.0)
-    total = float(0.0)
+    bad_cnt = float(0.0)  # noqa: UP018
+    total = float(0.0)  # noqa: UP018
     for u in range(w - radius, w + radius + 1):
         if u < 0 or u >= W:
             continue

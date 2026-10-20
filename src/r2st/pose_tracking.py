@@ -277,8 +277,7 @@ class FoundationPoseTracker:
         n_valid = int(((depth_m >= 0.001) & self._initial_mask).sum())
         assert n_mask >= 1, "Cannot register an empty mask"
         assert n_valid >= 4, (
-            f"Need >= 4 valid masked depth pixels for FoundationPose.register, got {n_valid} "
-            f"(mask_pixels={n_mask})"
+            f"Need >= 4 valid masked depth pixels for FoundationPose.register, got {n_valid} " f"(mask_pixels={n_mask})"
         )
         pose_cam = self.est.register(
             K=K,
@@ -290,8 +289,7 @@ class FoundationPoseTracker:
         pose_cam = np.asarray(pose_cam, dtype=np.float64)
         assert pose_cam.shape == (4, 4), f"Expected 4x4 pose, got {pose_cam.shape}"
         assert self.est.pose_last is not None, (
-            "FoundationPose.register did not init tracking pose. "
-            f"mask_pixels={n_mask} valid_depth={n_valid}"
+            "FoundationPose.register did not init tracking pose. " f"mask_pixels={n_mask} valid_depth={n_valid}"
         )
         self.last_pose_cam = pose_cam
 
