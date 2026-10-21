@@ -28,6 +28,9 @@ Notes:
     Frame 0's SAM 3 union may also be read from the older
     `robot-mask__<camera>__idx=0__...npy` seed cache. After the last frame, a dimmed-mask video is written to
     `robot-mask-propagated__<camera>__kmax=<k>__score_threshold=<t>.mp4`.
+    With --per-frame-robot-masks, masks are cached per frame as
+    `robot-mask-per-frame__<camera>__prompt=<p>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy` and only uncached
+    frames are segmented.
 
 
 
@@ -68,6 +71,7 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
+import subprocess
 import threading
 import time
 from typing import Any, Literal
@@ -101,6 +105,7 @@ from r2st.geometry import (
     one_sided_squared_nn_distance,
     reproject_depth_to_color_frame,
 )
+from r2st.types import CameraIntrinsics
 from r2st.utils import (
     ImageUtils,
     MeshUtils,
@@ -138,6 +143,7 @@ _CAPTURE_FAR_M = 5.0
 _CAPTURE_CAMERA_NAME = "multiview_cam"
 _CAPTURE_UP_WHEN_PARALLEL = np.array([1.0, 0.0, 0.0], dtype=np.float64)
 _MASK_VIDEO_FPS = 15.0
+_MIN_ROBOT_MASK_PIXELS = 400
 _BEST_AXES_LENGTH = 0.08
 _BEST_AXES_RADIUS = 0.004
 _BEST_ORIGIN_RADIUS = 0.008
@@ -169,10 +175,10 @@ class Args:
     n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
 
-    n_pcd_samples_real: int = 4096
+    n_pcd_samples_real: int = 2048
     """Number of FPS points kept from each measured robot cloud."""
 
-    n_pcd_samples_sim: int = 4096
+    n_pcd_samples_sim: int = 2048
     """Number of FPS points kept from each fused 6-view sim robot cloud."""
 
     n_random_downsample_initial: int = 16384
@@ -224,7 +230,8 @@ class Args:
     """CMA-ES population size."""
 
     robot_description: str = "robot arm"
-    """SAM 3 text prompt used to mask the robot on frame 0. Later frames propagate that mask."""
+    """SAM 3 text prompt used to mask the robot: on frame 0 only (later frames propagate that mask), or on every frame
+    with --per-frame-robot-masks."""
 
     sam_kmax: int = 5
     """Union at most this many highest-confidence SAM masks into the frame-0 robot mask."""
@@ -238,10 +245,19 @@ class Args:
     jumps between frames and propagation stays on the static base."""
 
     cache_robot_masks: bool = True
-    """If set, load/save propagated robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy."""
+    """If set, load/save robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy,
+    or <h5_stem>/robot-mask-per-frame__<camera>__prompt=<p>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy with
+    --per-frame-robot-masks."""
 
     mask_erode_px: int = 9
     """Erode the robot mask with an elliptical kernel of this size (pixels) before unprojecting. 0 skips erosion."""
+
+    min_mask_valid_depth_frac: float = 0.5
+    """Only sample frames where at least this fraction of the eroded robot mask has valid depth. When the arm is too
+    close to the camera, most of its mask has no depth and the few valid pixels are wrong."""
+
+    max_point_distance_m: float = 2.0
+    """Drop measured robot points farther than this (meters, Euclidean) from the camera center."""
 
     radius_outlier_nb_points: int = 10
     """Keep a measured point only if this many points lie within radius_outlier_radius_m of it."""
@@ -308,6 +324,39 @@ def _propagated_robot_mask_video_path(
         / h5_path.stem
         / f"robot-mask-propagated__{camera}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
     )
+
+
+def _per_frame_robot_mask_stem(camera: str, robot_description: str) -> str:
+    assert "/" not in robot_description, f"robot_description must not contain '/', got {robot_description!r}"
+    prompt = robot_description.replace(" ", "_")
+    return f"robot-mask-per-frame__{camera}__prompt={prompt}"
+
+
+def _per_frame_robot_mask_cache_path(
+    h5_path: pathlib.Path,
+    camera: str,
+    robot_description: str,
+    frame_idx: int,
+    kmax: int,
+    score_threshold: float,
+) -> pathlib.Path:
+    stem = _per_frame_robot_mask_stem(camera, robot_description)
+    return (
+        h5_path.parent
+        / h5_path.stem
+        / f"{stem}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
+    )
+
+
+def _per_frame_robot_mask_video_path(
+    h5_path: pathlib.Path,
+    camera: str,
+    robot_description: str,
+    kmax: int,
+    score_threshold: float,
+) -> pathlib.Path:
+    stem = _per_frame_robot_mask_stem(camera, robot_description)
+    return h5_path.parent / h5_path.stem / f"{stem}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
 
 
 def _load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int]) -> np.ndarray:
@@ -435,7 +484,11 @@ def _compute_propagated_robot_masks(
                         f"[info]   rank={rank} score={scores[rank]:.4f} phrase={phrases[rank]!r} "
                         f"pixels={int(ranked_masks[rank].sum())}"
                     )
-                seed_mask = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
+                seed_mask, kept = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
+                print(
+                    f"[info] Unioned {kept.size}/{min(sam_kmax, ranked_masks.shape[0])} masks with score > "
+                    f"{sam_score_threshold} (kept ranks={kept.tolist()}, scores={scores[kept].tolist()})"
+                )
                 if visualize_robot_masks:
                     _dump_top_sam_masks(
                         image_bgr0,
@@ -466,56 +519,104 @@ def _compute_propagated_robot_masks(
         assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
         if cache_robot_masks:
             print(f"[info] Saved {n_frames} propagated robot masks")
-    _save_propagated_mask_demo_overlays(rgb, masks, h5_path, camera, sam_kmax, sam_score_threshold)
+    _save_robot_mask_demo_overlays(
+        rgb,
+        masks,
+        propagated_paths,
+        _propagated_robot_mask_video_path(h5_path, camera, sam_kmax, sam_score_threshold),
+    )
     return masks
 
 
 def _segment_robot_masks_per_frame(
-    rgb: np.ndarray, robot_description: str, sam_kmax: int, sam_score_threshold: float
+    rgb: np.ndarray,
+    frame_indices: np.ndarray,
+    robot_description: str,
+    sam_kmax: int,
+    sam_score_threshold: float,
+    cache_paths: list[pathlib.Path] | None,
 ) -> np.ndarray:
-    """Return ``(T, H, W)`` robot masks, each from SAM 3 on its own frame (union of the top ``sam_kmax`` masks)."""
+    """Return ``(len(frame_indices), H, W)`` robot masks for ``rgb[frame_indices]``, each from SAM 3 on its own frame
+    (union of the top ``sam_kmax`` masks).
+
+    If ``cache_paths`` (one per entry of ``frame_indices``) is given, frames with an existing cache file are loaded and
+    only the rest are segmented.
+    """
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
+    assert frame_indices.ndim == 1, f"frame_indices must be 1D, got {frame_indices.shape}"
+    n_frames, height, width, _ = rgb.shape
+    n_sel = frame_indices.shape[0]
+    masks = np.zeros((n_sel, height, width), dtype=bool)
+    todo = list(range(n_sel))
+    if cache_paths is not None:
+        assert len(cache_paths) == n_sel, f"cache_paths length {len(cache_paths)} != n frames {n_sel}"
+        todo = [i for i in range(n_sel) if not cache_paths[i].is_file()]
+        for i in sorted(set(range(n_sel)) - set(todo)):
+            masks[i] = _load_cached_bool_mask(cache_paths[i], (height, width))
+        print(f"[info] Loaded {n_sel - len(todo)}/{n_sel} per-frame robot masks from cache")
+    if len(todo) == 0:
+        return masks
     predictor = _load_sam3()
-    masks = np.zeros(rgb.shape[:3], dtype=bool)
-    for t in tqdm(range(rgb.shape[0]), desc="Segment robot per frame"):
+    for i in todo:
+        t = int(frame_indices[i])
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
         ranked_masks, scores, _ = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, robot_description)
-        masks[t] = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
-        print(f"[info] frame {t}: {ranked_masks.shape[0]} masks, union of top {sam_kmax} = {int(masks[t].sum())} px")
+        masks[i], kept = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
+        if cache_paths is not None:
+            _save_cached_bool_mask(cache_paths[i], masks[i])
+        print(
+            f"[info] frame {t}/{n_frames}: {int(masks[i].sum())} px from {kept.size}/{ranked_masks.shape[0]} masks "
+            f"(scores={np.round(scores[kept], 2).tolist()})"
+        )
     return masks
 
 
-def _save_propagated_mask_demo_overlays(
+def _save_robot_mask_demo_overlays(
     rgb: np.ndarray,
     masks: np.ndarray,
-    h5_path: pathlib.Path,
-    camera: str,
-    kmax: int,
-    score_threshold: float,
+    mask_paths: list[pathlib.Path],
+    video_path: pathlib.Path,
 ) -> None:
-    """Write a dimmed-mask demo PNG for every trajectory frame and an mp4 of those overlays."""
+    """Write a dimmed-mask demo PNG next to every frame's mask path and an mp4 of those overlays."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
-    video_path = _propagated_robot_mask_video_path(h5_path, camera, kmax, score_threshold)
+    assert len(mask_paths) == n_frames, f"mask_paths length {len(mask_paths)} != n_frames {n_frames}"
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    writer = cv2.VideoWriter(
-        str(video_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        _MASK_VIDEO_FPS,
-        (width, height),
+    # H.264 via ffmpeg: OpenCV's "mp4v" (MPEG-4 Part 2) does not play in VS Code or browsers.
+    writer = subprocess.Popen(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{width}x{height}",
+            "-r",
+            str(_MASK_VIDEO_FPS),
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(video_path),
+        ],
+        stdin=subprocess.PIPE,
     )
-    assert writer.isOpened(), f"Failed to open video writer at {video_path}"
     for t in range(n_frames):
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
-        overlay_path = _propagated_robot_mask_cache_path(h5_path, camera, t, kmax, score_threshold).with_suffix(
-            ".demo.png"
-        )
+        overlay_path = mask_paths[t].with_suffix(".demo.png")
         demo = ImageUtils.demo_overlay(image_bgr, masks[t])
         assert overlay_path.name.endswith(".demo.png"), f"demo overlay path must end with .demo.png, got {overlay_path}"
         assert cv2.imwrite(str(overlay_path), demo), f"Failed to write {overlay_path}"
-        writer.write(demo)
-    writer.release()
+        writer.stdin.write(demo.tobytes())
+    writer.stdin.close()
+    assert writer.wait() == 0, f"ffmpeg failed writing {video_path}"
     print(f"[info] Saved {n_frames} robot-mask demo overlays and video to {video_path}")
 
 
@@ -524,8 +625,11 @@ def _union_top_sam_masks(
     scores: np.ndarray,
     kmax: int,
     score_threshold: float,
-) -> np.ndarray:
-    """OR-union of the first `kmax` ranked masks whose score is strictly above `score_threshold`."""
+) -> tuple[np.ndarray, np.ndarray]:
+    """OR-union of the first `kmax` ranked masks whose score is strictly above `score_threshold`.
+
+    Returns the `(H, W)` union and the kept ranks.
+    """
     assert masks.ndim == 3, f"masks must be (N, H, W), got {masks.shape}"
     assert scores.shape == (masks.shape[0],), f"scores {scores.shape} != n_masks {masks.shape[0]}"
     assert kmax >= 1, f"kmax must be >= 1, got {kmax}"
@@ -534,11 +638,7 @@ def _union_top_sam_masks(
     n_keep = int(keep.sum())
     assert n_keep >= 1, f"No SAM masks in top {n} with score > {score_threshold} " f"(scores={scores[:n].tolist()})"
     union = np.any(masks[:n][keep], axis=0)
-    print(
-        f"[info] Unioned {n_keep}/{n} masks with score > {score_threshold} "
-        f"(kept ranks={np.flatnonzero(keep).tolist()}, scores={scores[:n][keep].tolist()})"
-    )
-    return union
+    return union, np.flatnonzero(keep)
 
 
 def _erode_mask(mask: np.ndarray, kernel_px: int) -> np.ndarray:
@@ -587,6 +687,76 @@ def _dump_top_sam_masks(
             continue
         prefix = f"{camera}__robot_mask__{int(frame_idx)}__rank={rank}__score={scores[rank]:.3f}"
         ImageUtils.save_masked_debug(image_bgr, mask, out_dir, prefix)
+
+
+def _frame_depth_m(
+    depth_raw: np.ndarray,
+    color_intrinsics: CameraIntrinsics,
+    depth_reprojection: tuple[CameraIntrinsics, np.ndarray, np.ndarray] | None,
+) -> np.ndarray:
+    """One frame's uint16 mm depth as float32 meters in the color frame. ``depth_reprojection`` is
+    ``(depth_intrinsics, R_dc, t_dc)`` for native depth, or None when depth already uses the color intrinsics."""
+    depth_m = depth_mm_to_meters(depth_raw)
+    if depth_reprojection is None:
+        return depth_m
+    depth_intrinsics, R_dc, t_dc = depth_reprojection
+    return reproject_depth_to_color_frame(depth_m, depth_intrinsics, color_intrinsics, R_dc, t_dc)
+
+
+def _mask_valid_depth_fraction(mask: np.ndarray, depth_m: np.ndarray, max_depth_m: float) -> float:
+    """Fraction of ``mask`` pixels whose depth is finite and in ``[MIN_DEPTH_M, max_depth_m]``."""
+    assert mask.dtype == bool and mask.any(), "mask must be a non-empty bool array"
+    assert mask.shape == depth_m.shape, f"mask {mask.shape} != depth {depth_m.shape}"
+    z = depth_m[mask]
+    return float(np.mean(np.isfinite(z) & (z >= MIN_DEPTH_M) & (z <= max_depth_m)))
+
+
+def _index_ranges_text(indices: np.ndarray) -> str:
+    """Compact text for sorted ints, e.g. [3, 4, 5, 9] -> '3-5, 9'."""
+    if indices.size == 0:
+        return "none"
+    breaks = np.flatnonzero(np.diff(indices) != 1)
+    starts = np.concatenate([[indices[0]], indices[breaks + 1]])
+    ends = np.concatenate([indices[breaks], [indices[-1]]])
+    return ", ".join(f"{a}" if a == b else f"{a}-{b}" for a, b in zip(starts.tolist(), ends.tolist()))
+
+
+def _save_sampled_frame_inputs(
+    h5_path: pathlib.Path,
+    camera: str,
+    sample_idx: int,
+    frame_idx: int,
+    rgb: np.ndarray,
+    depth_m: np.ndarray,
+    mask: np.ndarray,
+) -> pathlib.Path:
+    """Write the RGB, depth (meters, .npy + colormap .png), and eroded mask overlay that a sampled frame unprojects.
+
+    Returns the output directory.
+    """
+    assert rgb.ndim == 3 and rgb.shape[2] == 3, f"rgb must be HxWx3, got {rgb.shape}"
+    assert depth_m.shape == rgb.shape[:2], f"depth {depth_m.shape} != rgb {rgb.shape[:2]}"
+    assert mask.shape == rgb.shape[:2], f"mask {mask.shape} != rgb {rgb.shape[:2]}"
+    out_dir = h5_path.parent / h5_path.stem / "sampled_inputs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    prefix = out_dir / f"{camera}__sample={sample_idx}__idx={frame_idx}"
+    rgb_path = prefix.with_name(prefix.name + "__rgb.png")
+    depth_npy_path = prefix.with_name(prefix.name + "__depth_m.npy")
+    depth_png_path = prefix.with_name(prefix.name + "__depth.png")
+    overlay_path = prefix.with_name(prefix.name + "__mask_overlay.png")
+    image_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+    assert cv2.imwrite(str(rgb_path), image_bgr), f"Failed to write {rgb_path}"
+    np.save(depth_npy_path, depth_m)
+    finite = np.isfinite(depth_m) & (depth_m > 0)
+    assert finite.any(), f"frame {frame_idx}: depth has no finite positive values"
+    depth_max = float(np.percentile(depth_m[finite], 99))
+    depth_u8 = np.zeros(depth_m.shape, dtype=np.uint8)
+    depth_u8[finite] = (255.0 * np.clip(depth_m[finite] / depth_max, 0.0, 1.0)).astype(np.uint8)
+    depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
+    depth_color[~finite] = 0
+    assert cv2.imwrite(str(depth_png_path), depth_color), f"Failed to write {depth_png_path}"
+    assert cv2.imwrite(str(overlay_path), ImageUtils.demo_overlay(image_bgr, mask)), f"Failed to write {overlay_path}"
+    return out_dir
 
 
 def _load_demo(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1440,7 +1610,13 @@ class ExtrinsicsVisualizer:
         t = self._timestep
         snap_i = self._snapshot_index()
         pop_Ts: list[np.ndarray] | None = None
-        if T is None and self._iteration == 0:
+        if T is None and self._iteration == 0 and self._manual_seed is not None and self._manual_seed.cost is not None:
+            # The GUI seed is the CMA-ES start, so iteration 0 shows it (and keeps it when the timestep changes)
+            T = self._manual_seed.T_world_cam.copy()
+            pcd_sims = self._manual_seed.pcd_sims
+            cost = self._manual_seed.cost
+            pop_Ts = []
+        elif T is None and self._iteration == 0:
             T = self._T_init
             pcd_sims = None
             cost = None
@@ -1794,6 +1970,12 @@ def main(args: Args) -> None:
         args.mask_erode_px >= 1 and args.mask_erode_px % 2 == 1
     ), f"mask_erode_px must be 0 or a positive odd int, got {args.mask_erode_px}"
     assert (
+        0.0 < args.min_mask_valid_depth_frac <= 1.0
+    ), f"min_mask_valid_depth_frac must be in (0, 1], got {args.min_mask_valid_depth_frac}"
+    assert (
+        args.max_point_distance_m > MIN_DEPTH_M
+    ), f"max_point_distance_m must be > {MIN_DEPTH_M}, got {args.max_point_distance_m}"
+    assert (
         args.radius_outlier_nb_points >= 1
     ), f"radius_outlier_nb_points must be >= 1, got {args.radius_outlier_nb_points}"
     assert (
@@ -1815,14 +1997,7 @@ def main(args: Args) -> None:
 
     n_frames = rgb_all.shape[0]
     assert args.n_timesteps <= n_frames, f"n_timesteps={args.n_timesteps} > n_frames={n_frames}"
-    fps_idx = farthest_point_sample_naive(qpos_all.astype(np.float64), args.n_timesteps, distance="circular")
-    fps_idx = np.asarray(fps_idx, dtype=np.int64)
-    print(f"[info] FPS circular joint samples at RGB-D frames {fps_idx.tolist()}")
-
-    rgb_sel = rgb_all[fps_idx]
-    depth_raw_sel = depth_raw_all[fps_idx]
-    qpos_sel = qpos_all[fps_idx]
-    H, W = int(rgb_sel.shape[1]), int(rgb_sel.shape[2])
+    H, W = int(rgb_all.shape[1]), int(rgb_all.shape[2])
     assert (H, W) == (color_intrinsics.height, color_intrinsics.width), (
         f"{args.camera} rgb is {H}x{W} but {args.camera_model_id} color intrinsics are "
         f"{color_intrinsics.height}x{color_intrinsics.width}"
@@ -1830,48 +2005,42 @@ def main(args: Args) -> None:
     K = color_intrinsics.intrinsic_matrix.astype(np.float64)
     print(f"[info] Color K ({args.camera_model_id}):\n{K}")
     print(f"[info] Depth channel uses {args.depth_intrinsics_source} intrinsics")
-
-    depth_m_sel = depth_mm_to_meters(depth_raw_sel)
+    depth_reprojection: tuple[CameraIntrinsics, np.ndarray, np.ndarray] | None = None
     if args.depth_intrinsics_source == "depth":
         depth_cam_intrinsics = get_depth_intrinsics(args.camera_model_id)
-        assert depth_raw_sel.shape[1:] == (depth_cam_intrinsics.height, depth_cam_intrinsics.width), (
-            f"{args.camera} depth is {depth_raw_sel.shape[1]}x{depth_raw_sel.shape[2]} but "
+        assert depth_raw_all.shape[1:] == (depth_cam_intrinsics.height, depth_cam_intrinsics.width), (
+            f"{args.camera} depth is {depth_raw_all.shape[1]}x{depth_raw_all.shape[2]} but "
             f"{args.camera_model_id} depth intrinsics are "
             f"{depth_cam_intrinsics.height}x{depth_cam_intrinsics.width}"
         )
-        print(f"[info] Reprojecting native depth into the color frame ({args.n_timesteps} sampled frames) ...")
-        t0 = time.perf_counter()
         R_dc, t_dc = get_depth_to_color_extrinsics(args.camera_model_id)
-        depth_m_sel = np.stack(
-            [
-                reproject_depth_to_color_frame(
-                    depth_m_sel[i],
-                    depth_cam_intrinsics,
-                    color_intrinsics,
-                    R_dc,
-                    t_dc,
-                )
-                for i in range(args.n_timesteps)
-            ],
-            axis=0,
-        )
-        _log_elapsed("Reprojected depth into the color frame", t0)
-    assert depth_m_sel.shape == (
-        args.n_timesteps,
-        H,
-        W,
-    ), f"depth_m_sel shape {depth_m_sel.shape} != ({args.n_timesteps}, {H}, {W})"
+        depth_reprojection = (depth_cam_intrinsics, R_dc, t_dc)
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
-    pcd_reals: list[np.ndarray] = []
-    demo_frames: list[np.ndarray] = []
     t0_masks = time.perf_counter()
     if args.per_frame_robot_masks:
+        # Every frame is segmented (and cached) so that frames without usable depth can be excluded before sampling
+        per_frame_paths = [
+            _per_frame_robot_mask_cache_path(
+                args.h5_path, args.camera, args.robot_description, t, args.sam_kmax, args.sam_score_threshold
+            )
+            for t in range(n_frames)
+        ]
         masks_all = _segment_robot_masks_per_frame(
-            rgb_all, args.robot_description, args.sam_kmax, args.sam_score_threshold
+            rgb_all,
+            np.arange(n_frames),
+            args.robot_description,
+            args.sam_kmax,
+            args.sam_score_threshold,
+            per_frame_paths if args.cache_robot_masks else None,
         )
-        _save_propagated_mask_demo_overlays(
-            rgb_all, masks_all, args.h5_path, args.camera, args.sam_kmax, args.sam_score_threshold
+        _save_robot_mask_demo_overlays(
+            rgb_all,
+            masks_all,
+            per_frame_paths,
+            _per_frame_robot_mask_video_path(
+                args.h5_path, args.camera, args.robot_description, args.sam_kmax, args.sam_score_threshold
+            ),
         )
     else:
         masks_all = _compute_propagated_robot_masks(
@@ -1884,36 +2053,94 @@ def main(args: Args) -> None:
             args.cache_robot_masks,
             args.visualize_robot_masks,
         )
-    assert masks_all.shape == (
-        n_frames,
+    assert masks_all.shape == (n_frames, H, W), f"masks_all {masks_all.shape} != ({n_frames}, {H}, {W})"
+    mask_pixels = masks_all.reshape(n_frames, -1).sum(axis=1)
+    lost = np.flatnonzero(mask_pixels <= _MIN_ROBOT_MASK_PIXELS)
+    assert lost.size == 0, (
+        f"Robot mask has <= {_MIN_ROBOT_MASK_PIXELS} pixels at {lost.size}/{n_frames} frames "
+        f"(lost tracking or bad segmentation). First frames: {[(int(t), int(mask_pixels[t])) for t in lost[:10]]}"
+    )
+    _log_elapsed(f"Built robot masks for {n_frames} frames", t0_masks)
+
+    # When the arm is too close to the camera, most of its mask has no depth and the few valid pixels are wrong
+    t0 = time.perf_counter()
+    valid_depth_frac = np.array(
+        [
+            _mask_valid_depth_fraction(
+                _erode_mask(masks_all[t], args.mask_erode_px),
+                _frame_depth_m(depth_raw_all[t], color_intrinsics, depth_reprojection),
+                args.max_point_distance_m,
+            )
+            for t in range(n_frames)
+        ]
+    )
+    candidates = np.flatnonzero(valid_depth_frac >= args.min_mask_valid_depth_frac)
+    excluded = np.flatnonzero(valid_depth_frac < args.min_mask_valid_depth_frac)
+    _log_elapsed(
+        f"Excluded {excluded.size}/{n_frames} frames with < {args.min_mask_valid_depth_frac:.0%} of the eroded robot "
+        f"mask on valid depth: {_index_ranges_text(excluded)}",
+        t0,
+    )
+    assert candidates.size >= args.n_timesteps, (
+        f"Only {candidates.size} frames have >= {args.min_mask_valid_depth_frac:.0%} of the robot mask on valid depth, "
+        f"need n_timesteps={args.n_timesteps}"
+    )
+    fps_local = farthest_point_sample_naive(
+        qpos_all[candidates].astype(np.float64), args.n_timesteps, distance="circular"
+    )
+    fps_idx = candidates[np.asarray(fps_local, dtype=np.int64)]
+    print(
+        f"[info] FPS circular joint samples (over {candidates.size} usable frames) at RGB-D frames {fps_idx.tolist()}"
+    )
+
+    rgb_sel = rgb_all[fps_idx]
+    qpos_sel = qpos_all[fps_idx]
+    depth_m_sel = np.stack(
+        [_frame_depth_m(depth_raw_all[t], color_intrinsics, depth_reprojection) for t in fps_idx], axis=0
+    )
+    assert depth_m_sel.shape == (
+        args.n_timesteps,
         H,
         W,
-    ), f"masks_all {masks_all.shape} != ({n_frames}, {H}, {W})"
+    ), f"depth_m_sel shape {depth_m_sel.shape} != ({args.n_timesteps}, {H}, {W})"
+    masks_sel = masks_all[fps_idx]
+    pcd_reals: list[np.ndarray] = []
+    demo_frames: list[np.ndarray] = []
     for i, frame_idx in enumerate(fps_idx):
         frame_idx = int(frame_idx)
-        mask = masks_all[frame_idx]
+        mask = masks_sel[i]
         assert mask.any(), f"Empty robot mask at frame {frame_idx} for prompt {args.robot_description!r}"
         n_mask = int(mask.sum())
         mask = _erode_mask(mask, args.mask_erode_px)
-        print(
-            f"[info] Frame {frame_idx} mask pixels: {n_mask} -> {int(mask.sum())} / {mask.size} "
-            f"(erode_px={args.mask_erode_px})"
+        assert valid_depth_frac[frame_idx] >= args.min_mask_valid_depth_frac, (
+            f"frame {frame_idx}: {valid_depth_frac[frame_idx]:.2f} of the mask on valid depth "
+            f"< {args.min_mask_valid_depth_frac}"
         )
         demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
-        pts = masked_depth_to_points(depth_m_sel[i], mask, K)
+        inputs_dir = _save_sampled_frame_inputs(
+            args.h5_path, args.camera, i, frame_idx, rgb_sel[i], depth_m_sel[i], mask
+        )
+        pts = masked_depth_to_points(depth_m_sel[i], mask, K, max_depth_m=args.max_point_distance_m)
+        n_depth = int(pts.shape[0])
+        pts = pts[np.linalg.norm(pts, axis=1) <= args.max_point_distance_m]
+        assert pts.shape[0] >= 1, (
+            f"No robot points within {args.max_point_distance_m} m of the camera at frame {frame_idx} "
+            f"(had {n_depth} before the distance filter)"
+        )
         n_unproj = int(pts.shape[0])
         pts = _remove_radius_outliers(pts, args.radius_outlier_nb_points, args.radius_outlier_radius_m)
-        print(
-            f"[info] pcd_real[{i}] radius-outlier: {n_unproj} -> {pts.shape[0]} "
-            f"(nb_points={args.radius_outlier_nb_points}, radius_m={args.radius_outlier_radius_m})"
-        )
+        n_inliers = int(pts.shape[0])
         pts = _subsample_pcd(pts, args.n_pcd_samples_real, args.n_random_downsample_initial, chamfer_device, rng)
         assert pts.shape[0] >= 1, f"No robot points at frame {frame_idx}"
         pcd_reals.append(pts)
-        print(f"[info] pcd_real[{i}] n={pts.shape[0]}")
+        print(
+            f"[info] pcd_real[{i}] frame {frame_idx}: mask {n_mask} -> {int(mask.sum())} px eroded "
+            f"({valid_depth_frac[frame_idx]:.0%} valid depth) | points {n_depth} -> {n_unproj} within "
+            f"{args.max_point_distance_m} m -> {n_inliers} radius inliers -> {pts.shape[0]} sampled"
+        )
+    print(f"[info] Saved sampled-frame RGB / depth / mask images to {inputs_dir}")
     assert len(demo_frames) == args.n_timesteps, f"demo_frames {len(demo_frames)} != n_timesteps {args.n_timesteps}"
     demo_sel = np.stack(demo_frames, axis=0)
-    _log_elapsed(f"Built robot masks for {n_frames} frames; used {args.n_timesteps} sampled frames", t0_masks)
 
     print(f"[info] Loading Jrl2 robot '{args.robot_id}' ...")
     t0 = time.perf_counter()

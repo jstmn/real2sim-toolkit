@@ -205,7 +205,10 @@ class SAM3Predictor:
             assert masks_t.shape[1] == 1, f"Expected (N, 1, H, W) masks, got {tuple(masks_t.shape)}"
             masks_t = masks_t[:, 0]
         assert masks_t.ndim == 3, f"Expected (N, H, W) masks, got {tuple(masks_t.shape)}"
-        assert masks_t.shape[0] >= 1, f"SAM 3 returned no masks for {object_name!r}"
+        if masks_t.shape[0] == 0:
+            failed_path = Path("/tmp") / f"sam3_no_masks__{object_name.replace(' ', '_')}.png"
+            assert cv2.imwrite(str(failed_path), image), f"Failed to write {failed_path}"
+        assert masks_t.shape[0] >= 1, f"SAM 3 returned no masks for {object_name!r} (saved input to {failed_path})"
         assert masks_t.shape[1:] == (height, width), f"Mask size {tuple(masks_t.shape[1:])} != image {(height, width)}"
         assert scores_t.shape == (masks_t.shape[0],), f"scores {tuple(scores_t.shape)} != n_masks {masks_t.shape[0]}"
         order = torch.argsort(scores_t, descending=True)

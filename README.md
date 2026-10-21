@@ -102,7 +102,10 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 
 
 ### Example 4: Estimate camera extrinsics and save results to a yaml file.
-This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
+This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)). 
+
+Usage notes: 
+* The primary cause of a bad optimization result is the existence of points in the robot pointcloud that are not in fact on the robot. This can happen when the robot mask is too large, in which case points from the background are included in the pointcloud. The loss function has a squared error on distance to the simulated pointcloud, so such a point will have a large influence on the optimization result. To handle this, manually inspect the robot pointcloud at frame that's included in the optimization, by opening viser and adjusting the 'timestep' slider. The number of frames that's included is set with `--n-timesteps 10`. If you encounter a bad frame, then remove it from the optimization by decreasing `--n-timesteps`.
 
 ![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
 
@@ -132,6 +135,22 @@ uv run python examples/estimate_camera_extrinsics.py \
   --output-path data/demonstrations/0802/extrinsics_cam_1.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
+
+
+uv run python examples/estimate_camera_extrinsics.py \
+  --h5-path data/Oct20_2026_datacollect/ExtrinsicsCalibration__10-20-2026__16-02-39/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed2i \
+  --camera-model-id zed2i_vga \
+  --depth-intrinsics-source rgb \
+  --per-frame-robot-masks \
+  --robot-description "robot arm" \
+  --n-timesteps 10 \
+  --output-path data/Oct20_2026_datacollect/extrinsics_zed2i.yaml \
+  --seed-from-gui \
+  --visualize \
+  --visualize-robot-masks
+
 ```
 
 Exactly one seed mode is required:
