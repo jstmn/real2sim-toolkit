@@ -154,7 +154,7 @@ class _FakeSAM3Predictor:
         self.scores = scores
         self.phrases = phrases
 
-    def get_ranked_sam_masks(self, image_bgr, object_name):
+    def get_ranked_sam_masks(self, image_bgr, object_name, allow_no_masks=False):
         assert image_bgr.ndim == 3
         assert len(object_name) > 0
         return self.masks, self.scores, self.phrases

@@ -183,10 +183,13 @@ class SAM3Predictor:
             sam_where = "CPU"
         print(colored(f"[info] SAM 3 is using {sam_where}", "yellow"))
 
-    def get_ranked_sam_masks(self, image: np.ndarray, object_name: str) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    def get_ranked_sam_masks(
+        self, image: np.ndarray, object_name: str, allow_no_masks: bool = False
+    ) -> tuple[np.ndarray, np.ndarray, list[str]]:
         """Return all SAM 3 masks for `object_name`, sorted by confidence descending.
 
-        Returns `(N, H, W)` bool, `(N,)` scores, and a phrase list (the text prompt, once per mask).
+        Returns `(N, H, W)` bool, `(N,)` scores, and a phrase list (the text prompt, once per mask). N == 0 raises
+        unless `allow_no_masks`.
         """
         assert self._processor is not None, "SAM 3 predictor not loaded"
         assert image.ndim == 3 and image.shape[2] == 3, f"Image must be HxWx3, got {image.shape}"
@@ -205,10 +208,12 @@ class SAM3Predictor:
             assert masks_t.shape[1] == 1, f"Expected (N, 1, H, W) masks, got {tuple(masks_t.shape)}"
             masks_t = masks_t[:, 0]
         assert masks_t.ndim == 3, f"Expected (N, H, W) masks, got {tuple(masks_t.shape)}"
-        if masks_t.shape[0] == 0:
+        if masks_t.shape[0] == 0 and not allow_no_masks:
             failed_path = Path("/tmp") / f"sam3_no_masks__{object_name.replace(' ', '_')}.png"
             assert cv2.imwrite(str(failed_path), image), f"Failed to write {failed_path}"
-        assert masks_t.shape[0] >= 1, f"SAM 3 returned no masks for {object_name!r} (saved input to {failed_path})"
+        assert (
+            allow_no_masks or masks_t.shape[0] >= 1
+        ), f"SAM 3 returned no masks for {object_name!r} (saved input to {failed_path})"
         assert masks_t.shape[1:] == (height, width), f"Mask size {tuple(masks_t.shape[1:])} != image {(height, width)}"
         assert scores_t.shape == (masks_t.shape[0],), f"scores {tuple(scores_t.shape)} != n_masks {masks_t.shape[0]}"
         order = torch.argsort(scores_t, descending=True)

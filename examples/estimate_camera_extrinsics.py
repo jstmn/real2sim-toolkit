@@ -362,12 +362,12 @@ def _per_frame_robot_mask_video_path(
     return h5_path.parent / h5_path.stem / f"{stem}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
 
 
-def _load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int]) -> np.ndarray:
+def _load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int], allow_empty: bool = False) -> np.ndarray:
     mask = np.load(path)
     assert isinstance(mask, np.ndarray), f"{path}: expected ndarray, got {type(mask)}"
     assert mask.shape == hw, f"{path}: mask shape {mask.shape} != {hw}"
     assert mask.dtype == bool, f"{path}: mask dtype must be bool, got {mask.dtype}"
-    assert mask.any(), f"{path}: cached robot mask is empty"
+    assert allow_empty or mask.any(), f"{path}: cached robot mask is empty"
     return mask
 
 
@@ -381,9 +381,9 @@ def _n_consecutive_cached_masks(paths: list[pathlib.Path]) -> int:
     return n
 
 
-def _save_cached_bool_mask(path: pathlib.Path, mask: np.ndarray) -> None:
+def _save_cached_bool_mask(path: pathlib.Path, mask: np.ndarray, allow_empty: bool = False) -> None:
     assert mask.dtype == bool, f"{path}: mask dtype must be bool, got {mask.dtype}"
-    assert mask.any(), f"{path}: cannot cache an empty robot mask"
+    assert allow_empty or mask.any(), f"{path}: cannot cache an empty robot mask"
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, mask)
 
@@ -540,10 +540,11 @@ def _segment_robot_masks_per_frame(
     cache_paths: list[pathlib.Path] | None,
 ) -> np.ndarray:
     """Return ``(len(frame_indices), H, W)`` robot masks for ``rgb[frame_indices]``, each from SAM 3 on its own frame
-    (union of the top ``sam_kmax`` masks).
+    (union of the top ``sam_kmax`` masks). A frame where none of the top ``sam_kmax`` SAM 3 masks scores above
+    ``sam_score_threshold`` (including no masks at all) gets an empty mask.
 
     If ``cache_paths`` (one per entry of ``frame_indices``) is given, frames with an existing cache file are loaded and
-    only the rest are segmented.
+    only the rest are segmented. Empty masks are cached too.
     """
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     assert frame_indices.ndim == 1, f"frame_indices must be 1D, got {frame_indices.shape}"
@@ -555,7 +556,7 @@ def _segment_robot_masks_per_frame(
         assert len(cache_paths) == n_sel, f"cache_paths length {len(cache_paths)} != n frames {n_sel}"
         todo = [i for i in range(n_sel) if not cache_paths[i].is_file()]
         for i in sorted(set(range(n_sel)) - set(todo)):
-            masks[i] = _load_cached_bool_mask(cache_paths[i], (height, width))
+            masks[i] = _load_cached_bool_mask(cache_paths[i], (height, width), allow_empty=True)
         print(f"[info] Loaded {n_sel - len(todo)}/{n_sel} per-frame robot masks from cache")
     if len(todo) == 0:
         return masks
@@ -563,7 +564,18 @@ def _segment_robot_masks_per_frame(
     for i in todo:
         t = int(frame_indices[i])
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
-        ranked_masks, scores, _ = ImageUtils.get_sam_masks_ranked(predictor, image_bgr, robot_description)
+        ranked_masks, scores, _ = ImageUtils.get_sam_masks_ranked(
+            predictor, image_bgr, robot_description, allow_no_masks=True
+        )
+        if not np.any(scores[:sam_kmax] > sam_score_threshold):
+            # The robot is not found in every frame (e.g. arm out of view). main() ignores frames with an empty mask
+            if cache_paths is not None:
+                _save_cached_bool_mask(cache_paths[i], masks[i], allow_empty=True)
+            print(
+                f"[warn] frame {t}/{n_frames}: no SAM 3 mask with score > {sam_score_threshold} "
+                f"(scores={np.round(scores[:sam_kmax], 2).tolist()}), frame will be ignored"
+            )
+            continue
         masks[i], kept = _union_top_sam_masks(ranked_masks, scores, sam_kmax, sam_score_threshold)
         if cache_paths is not None:
             _save_cached_bool_mask(cache_paths[i], masks[i])
@@ -580,7 +592,8 @@ def _save_robot_mask_demo_overlays(
     mask_paths: list[pathlib.Path],
     video_path: pathlib.Path,
 ) -> None:
-    """Write a dimmed-mask demo PNG next to every frame's mask path and an mp4 of those overlays."""
+    """Write a dimmed-mask demo PNG next to every frame's mask path and an mp4 of those overlays. Frames with an
+    empty mask are fully dimmed."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
@@ -590,7 +603,7 @@ def _save_robot_mask_demo_overlays(
     for t in range(n_frames):
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
         overlay_path = mask_paths[t].with_suffix(".demo.png")
-        demo = ImageUtils.demo_overlay(image_bgr, masks[t])
+        demo = ImageUtils.demo_overlay(image_bgr, masks[t]) if masks[t].any() else image_bgr // 4
         assert overlay_path.name.endswith(".demo.png"), f"demo overlay path must end with .demo.png, got {overlay_path}"
         assert cv2.imwrite(str(overlay_path), demo), f"Failed to write {overlay_path}"
         writer.write(demo)
@@ -2041,7 +2054,12 @@ def main(args: Args) -> None:
         )
     assert masks_all.shape == (n_frames, H, W), f"masks_all {masks_all.shape} != ({n_frames}, {H}, {W})"
     mask_pixels = masks_all.reshape(n_frames, -1).sum(axis=1)
-    lost = np.flatnonzero(mask_pixels <= _MIN_ROBOT_MASK_PIXELS)
+    # Per-frame SAM 3 leaves the mask empty where it finds no robot. Those frames are ignored like --ignore-timesteps
+    no_mask = np.flatnonzero(mask_pixels == 0)
+    assert args.per_frame_robot_masks or no_mask.size == 0, f"Propagated robot mask is empty at frames {no_mask}"
+    print(f"[info] Ignoring {no_mask.size} frames where SAM 3 found no robot: {_index_ranges_text(no_mask)}")
+    has_mask = np.flatnonzero(mask_pixels > 0)
+    lost = has_mask[mask_pixels[has_mask] <= _MIN_ROBOT_MASK_PIXELS]
     assert lost.size == 0, (
         f"Robot mask has <= {_MIN_ROBOT_MASK_PIXELS} pixels at {lost.size}/{n_frames} frames "
         f"(lost tracking or bad segmentation). First frames: {[(int(t), int(mask_pixels[t])) for t in lost[:10]]}"
@@ -2050,21 +2068,18 @@ def main(args: Args) -> None:
 
     # When the arm is too close to the camera, most of its mask has no depth and the few valid pixels are wrong
     t0 = time.perf_counter()
-    valid_depth_frac = np.array(
-        [
-            _mask_valid_depth_fraction(
-                _erode_mask(masks_all[t], args.mask_erode_px),
-                _frame_depth_m(depth_raw_all[t], color_intrinsics, depth_reprojection),
-                args.max_point_distance_m,
-            )
-            for t in range(n_frames)
-        ]
-    )
-    candidates = np.flatnonzero(valid_depth_frac >= args.min_mask_valid_depth_frac)
-    excluded = np.flatnonzero(valid_depth_frac < args.min_mask_valid_depth_frac)
+    valid_depth_frac = np.full(n_frames, np.nan)
+    for t in has_mask:
+        valid_depth_frac[t] = _mask_valid_depth_fraction(
+            _erode_mask(masks_all[t], args.mask_erode_px),
+            _frame_depth_m(depth_raw_all[t], color_intrinsics, depth_reprojection),
+            args.max_point_distance_m,
+        )
+    candidates = has_mask[valid_depth_frac[has_mask] >= args.min_mask_valid_depth_frac]
+    excluded = has_mask[valid_depth_frac[has_mask] < args.min_mask_valid_depth_frac]
     _log_elapsed(
-        f"Excluded {excluded.size}/{n_frames} frames with < {args.min_mask_valid_depth_frac:.0%} of the eroded robot "
-        f"mask on valid depth: {_index_ranges_text(excluded)}",
+        f"Excluded {excluded.size}/{has_mask.size} masked frames with < {args.min_mask_valid_depth_frac:.0%} of the "
+        f"eroded robot mask on valid depth: {_index_ranges_text(excluded)}",
         t0,
     )
     candidates = np.setdiff1d(candidates, ignore_timesteps)
@@ -2072,7 +2087,7 @@ def main(args: Args) -> None:
         f"[info] Ignoring {ignore_timesteps.size} frames from --ignore-timesteps: {_index_ranges_text(np.sort(ignore_timesteps))}"
     )
     assert candidates.size >= args.n_timesteps, (
-        f"Only {candidates.size} frames have >= {args.min_mask_valid_depth_frac:.0%} of the robot mask on valid depth "
+        f"Only {candidates.size} frames have a robot mask with >= {args.min_mask_valid_depth_frac:.0%} on valid depth "
         f"and are not in ignore_timesteps, need n_timesteps={args.n_timesteps}"
     )
     fps_local = farthest_point_sample_naive(
@@ -2187,6 +2202,7 @@ def main(args: Args) -> None:
         "h5_path": str(args.h5_path),
         "n_timesteps": args.n_timesteps,
         "ignore_timesteps": list(args.ignore_timesteps),
+        "frames_without_robot_mask": no_mask.tolist(),
         "sampled_frame_indices": fps_idx.tolist(),
         "cost": float(best_cost),
         "translation": t.tolist(),

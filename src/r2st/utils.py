@@ -293,19 +293,20 @@ class ImageUtils:
 
     @staticmethod
     def get_sam_masks_ranked(
-        predictor, image_bgr: np.ndarray, object_name: str
+        predictor, image_bgr: np.ndarray, object_name: str, allow_no_masks: bool = False
     ) -> tuple[np.ndarray, np.ndarray, list[str]]:
         """Run SAM 3 and return all masks sorted by confidence descending.
 
-        Returns `(N, H, W)` bool, `(N,)` scores, and a phrase list (the text prompt, once per mask).
+        Returns `(N, H, W)` bool, `(N,)` scores, and a phrase list (the text prompt, once per mask). N == 0 raises
+        unless `allow_no_masks`.
         """
         assert image_bgr.ndim == 3 and image_bgr.shape[2] == 3, f"Image must be HxWx3, got {image_bgr.shape}"
         assert len(object_name) > 0, "object_name must not be empty"
         assert predictor._processor is not None, "SAM 3 predictor not loaded"
-        masks, scores, phrases = predictor.get_ranked_sam_masks(image_bgr, object_name)
+        masks, scores, phrases = predictor.get_ranked_sam_masks(image_bgr, object_name, allow_no_masks=allow_no_masks)
         assert isinstance(masks, np.ndarray) and masks.dtype == bool, f"Expected bool ndarray masks, got {type(masks)}"
         assert masks.ndim == 3, f"Expected (N, H, W) masks, got {masks.shape}"
-        assert masks.shape[0] >= 1, "SAM 3 returned no masks"
+        assert allow_no_masks or masks.shape[0] >= 1, "SAM 3 returned no masks"
         assert masks.shape[1:] == image_bgr.shape[:2], f"Mask shape {masks.shape[1:]} != image {image_bgr.shape[:2]}"
         assert scores.shape == (masks.shape[0],), f"scores {scores.shape} != n_masks {masks.shape[0]}"
         assert len(phrases) == masks.shape[0], f"phrases {len(phrases)} != n_masks {masks.shape[0]}"
