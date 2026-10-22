@@ -195,10 +195,12 @@ class FoundationPoseTracker:
         scorer=None,
         refiner=None,
         glctx=None,
+        cutie_model=None,
     ):
-        """`scorer`/`refiner`/`glctx` may be passed in to reuse already-loaded model weights and
+        """`scorer`/`refiner`/`glctx`/`cutie_model` may be passed in to reuse already-loaded model weights and
         CUDA context across multiple trackers (e.g. a long-lived server re-registering on a new
-        mesh per video); if omitted, fresh ones are constructed as before."""
+        mesh per video); if omitted, fresh ones are constructed as before. `cutie_model` must be passed after the
+        first tracker in a process: Cutie's loader works only once per process (r2st.cutie_tracker.load_cutie_model)."""
         assert use_2d_tracker or not use_kalman_filter, (
             "use_kalman_filter requires use_2d_tracker=True: the filter fuses the 2D tracker's "
             "image-plane measurement with FoundationPose's own pose estimate each frame."
@@ -235,7 +237,7 @@ class FoundationPoseTracker:
         if use_2d_tracker:
             from r2st.cutie_tracker import CutieTracker
 
-            self._tracker_2d = CutieTracker()
+            self._tracker_2d = CutieTracker(model=cutie_model)
 
         self._kf = None
         if use_kalman_filter:

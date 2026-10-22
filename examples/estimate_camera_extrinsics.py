@@ -71,7 +71,6 @@ from __future__ import annotations
 
 import dataclasses
 import pathlib
-import subprocess
 import threading
 import time
 from typing import Any, Literal
@@ -107,6 +106,7 @@ from r2st.geometry import (
 )
 from r2st.types import CameraIntrinsics
 from r2st.utils import (
+    H264VideoWriter,
     ImageUtils,
     MeshUtils,
     farthest_point_sample_naive,
@@ -174,6 +174,9 @@ class Args:
 
     n_timesteps: int = 5
     """Number of furthest-apart joint configurations used in the chamfer cost."""
+
+    ignore_timesteps: tuple[int, ...] = ()
+    """Demo frame indices to never sample, e.g. `--ignore-timesteps 12 40 41`."""
 
     n_pcd_samples_real: int = 2048
     """Number of FPS points kept from each measured robot cloud."""
@@ -583,40 +586,15 @@ def _save_robot_mask_demo_overlays(
     assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
     assert len(mask_paths) == n_frames, f"mask_paths length {len(mask_paths)} != n_frames {n_frames}"
     video_path.parent.mkdir(parents=True, exist_ok=True)
-    # H.264 via ffmpeg: OpenCV's "mp4v" (MPEG-4 Part 2) does not play in VS Code or browsers.
-    writer = subprocess.Popen(
-        [
-            "ffmpeg",
-            "-y",
-            "-loglevel",
-            "error",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-s",
-            f"{width}x{height}",
-            "-r",
-            str(_MASK_VIDEO_FPS),
-            "-i",
-            "-",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            str(video_path),
-        ],
-        stdin=subprocess.PIPE,
-    )
+    writer = H264VideoWriter(video_path, _MASK_VIDEO_FPS, width, height)
     for t in range(n_frames):
         image_bgr = cv2.cvtColor(rgb[t], cv2.COLOR_RGB2BGR)
         overlay_path = mask_paths[t].with_suffix(".demo.png")
         demo = ImageUtils.demo_overlay(image_bgr, masks[t])
         assert overlay_path.name.endswith(".demo.png"), f"demo overlay path must end with .demo.png, got {overlay_path}"
         assert cv2.imwrite(str(overlay_path), demo), f"Failed to write {overlay_path}"
-        writer.stdin.write(demo.tobytes())
-    writer.stdin.close()
-    assert writer.wait() == 0, f"ffmpeg failed writing {video_path}"
+        writer.write(demo)
+    writer.close()
     print(f"[info] Saved {n_frames} robot-mask demo overlays and video to {video_path}")
 
 
@@ -1339,13 +1317,16 @@ class ExtrinsicsVisualizer:
         self._load_robot_meshes()
         self._cost_md = self._server.gui.add_markdown("best cost: —")
         self._pose_md = self._server.gui.add_markdown("camera pose: —")
-        timestep_slider = self._server.gui.add_slider(
-            "timestep (sampled)", min=0, max=max(len(pcd_reals) - 1, 0), step=1, initial_value=0
+        # Sampled frames are sparse and in FPS order, so pick by demo frame index (sorted) rather than sample position
+        sample_by_frame = {str(int(frame)): i for i, frame in enumerate(fps_idx)}
+        assert len(sample_by_frame) == len(fps_idx), f"fps_idx has duplicate frames: {fps_idx.tolist()}"
+        timestep_dropdown = self._server.gui.add_dropdown(
+            "timestep index", sorted(sample_by_frame, key=int), initial_value=str(int(fps_idx[0]))
         )
 
-        @timestep_slider.on_update
+        @timestep_dropdown.on_update
         def _on_timestep(_) -> None:
-            self._timestep = int(timestep_slider.value)
+            self._timestep = sample_by_frame[timestep_dropdown.value]
             self._apply()
 
         # Viser sets step to min(step, max-min). max==min makes step 0 and the client sends NaN.
@@ -1640,9 +1621,7 @@ class ExtrinsicsVisualizer:
             self._cost_md.content = f"**iter {self._iteration} best cost:** `{cost:.6f}`"
         elif self._iteration == 0:
             self._cost_md.content = "**iter 0 (init)**"
-        self._pose_md.content = (
-            f"**sampled t={t}  demo frame={demo_frame}**\n\n{_pose_translation_rotation_text(self._T)}"
-        )
+        self._pose_md.content = f"**timestep index={demo_frame}**\n\n{_pose_translation_rotation_text(self._T)}"
         self._real_handle.points = np.ascontiguousarray(_transform_points(self._T, self._pcd_reals[t]))
         if pcd_sims is None or pcd_sims[t].shape[0] == 0:
             sim_world = np.zeros((1, 3), dtype=np.float32)
@@ -1997,6 +1976,13 @@ def main(args: Args) -> None:
 
     n_frames = rgb_all.shape[0]
     assert args.n_timesteps <= n_frames, f"n_timesteps={args.n_timesteps} > n_frames={n_frames}"
+    ignore_timesteps = np.asarray(args.ignore_timesteps, dtype=np.int64)
+    assert (
+        np.unique(ignore_timesteps).size == ignore_timesteps.size
+    ), f"Duplicate ignore_timesteps: {args.ignore_timesteps}"
+    assert np.all(
+        (ignore_timesteps >= 0) & (ignore_timesteps < n_frames)
+    ), f"ignore_timesteps {args.ignore_timesteps} must be in [0, {n_frames})"
     H, W = int(rgb_all.shape[1]), int(rgb_all.shape[2])
     assert (H, W) == (color_intrinsics.height, color_intrinsics.width), (
         f"{args.camera} rgb is {H}x{W} but {args.camera_model_id} color intrinsics are "
@@ -2081,9 +2067,13 @@ def main(args: Args) -> None:
         f"mask on valid depth: {_index_ranges_text(excluded)}",
         t0,
     )
+    candidates = np.setdiff1d(candidates, ignore_timesteps)
+    print(
+        f"[info] Ignoring {ignore_timesteps.size} frames from --ignore-timesteps: {_index_ranges_text(np.sort(ignore_timesteps))}"
+    )
     assert candidates.size >= args.n_timesteps, (
-        f"Only {candidates.size} frames have >= {args.min_mask_valid_depth_frac:.0%} of the robot mask on valid depth, "
-        f"need n_timesteps={args.n_timesteps}"
+        f"Only {candidates.size} frames have >= {args.min_mask_valid_depth_frac:.0%} of the robot mask on valid depth "
+        f"and are not in ignore_timesteps, need n_timesteps={args.n_timesteps}"
     )
     fps_local = farthest_point_sample_naive(
         qpos_all[candidates].astype(np.float64), args.n_timesteps, distance="circular"
@@ -2196,6 +2186,7 @@ def main(args: Args) -> None:
         "child_frame": f"{args.camera}_optical",
         "h5_path": str(args.h5_path),
         "n_timesteps": args.n_timesteps,
+        "ignore_timesteps": list(args.ignore_timesteps),
         "sampled_frame_indices": fps_idx.tolist(),
         "cost": float(best_cost),
         "translation": t.tolist(),

@@ -19,6 +19,7 @@ from r2st.geometry import (
 from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
 from r2st.utils import (
+    H264VideoWriter,
     ImageUtils,
     MeshUtils,
     TrackingVisualizer,
@@ -273,17 +274,11 @@ def main(args: Args) -> None:
         video_path = asset_dir / f"{object_slug}__track.mp4"
         print(f"[info] Writing tracking video ({num_frames} frames) to {video_path} ...")
         t0 = time.perf_counter()
-        writer = cv2.VideoWriter(
-            str(video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            15.0,
-            (W, H),
-        )
-        assert writer.isOpened(), f"Failed to open video writer at {video_path}"
+        writer = H264VideoWriter(video_path, 15.0, W, H)
         for i in tqdm(range(num_frames), desc="write video"):
             overlay = _draw_pose_axes(rgb_all[i], poses[i], K)
             writer.write(cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-        writer.release()
+        writer.close()
         _log_elapsed(f"Saved tracking video to {video_path}", t0)
 
     print("Tracking complete!")

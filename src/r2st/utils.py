@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -162,6 +163,51 @@ def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str)
     assert (
         depth.shape[1:] == rgb.shape[1:3]
     ), f"{h5_path}:{group_path}: depth resolution {depth.shape[1:]} != rgb resolution {rgb.shape[1:3]}"
+
+
+class H264VideoWriter:
+    """Stream BGR uint8 frames to an H.264 mp4 through ffmpeg. OpenCV's "mp4v" (MPEG-4 Part 2) does not play in
+    VS Code / Cursor, browsers, or stock Ubuntu players."""
+
+    def __init__(self, video_path: str | Path, fps: float, width: int, height: int) -> None:
+        assert fps > 0, f"fps must be > 0, got {fps}"
+        assert width > 0 and height > 0, f"width/height must be > 0, got {width}x{height}"
+        assert width % 2 == 0 and height % 2 == 0, f"yuv420p H.264 needs even width/height, got {width}x{height}"
+        self.video_path = Path(video_path)
+        self._shape = (height, width, 3)
+        self._process = subprocess.Popen(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "bgr24",
+                "-s",
+                f"{width}x{height}",
+                "-r",
+                str(fps),
+                "-i",
+                "-",
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                str(self.video_path),
+            ],
+            stdin=subprocess.PIPE,
+        )
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        assert frame_bgr.shape == self._shape, f"frame {frame_bgr.shape} != {self._shape}"
+        assert frame_bgr.dtype == np.uint8, f"frame dtype must be uint8, got {frame_bgr.dtype}"
+        self._process.stdin.write(np.ascontiguousarray(frame_bgr).tobytes())
+
+    def close(self) -> None:
+        self._process.stdin.close()
+        assert self._process.wait() == 0, f"ffmpeg failed writing {self.video_path}"
 
 
 class ImageUtils:

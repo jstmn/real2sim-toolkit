@@ -26,6 +26,7 @@ import grpc
 import numpy as np
 import tyro
 
+from r2st.cutie_tracker import load_cutie_model
 from r2st.pose_grpc import codec, pose_tracking_pb2, pose_tracking_pb2_grpc
 from r2st.pose_tracking import FoundationPoseTracker, _load_foundationpose_deps
 
@@ -46,10 +47,12 @@ class PoseTrackingServicer(pose_tracking_pb2_grpc.PoseTrackingServicer):
     def __init__(self, debug_dir: str):
         self._debug_dir = debug_dir
         dr, _, PoseRefinePredictor, ScorePredictor, _, _ = _load_foundationpose_deps()
-        print("[pose_server] Loading FoundationPose scorer/refiner/rasterizer (once) ...")
+        print("[pose_server] Loading FoundationPose scorer/refiner/rasterizer and Cutie (once) ...")
         self._scorer = ScorePredictor()
         self._refiner = PoseRefinePredictor()
         self._glctx = dr.RasterizeCudaContext()
+        # Cutie's loader works only once per process, and every Register makes a new tracker.
+        self._cutie_model = load_cutie_model()
         print("[pose_server] Ready.")
 
         self._lock = threading.Lock()
@@ -80,6 +83,7 @@ class PoseTrackingServicer(pose_tracking_pb2_grpc.PoseTrackingServicer):
                 scorer=self._scorer,
                 refiner=self._refiner,
                 glctx=self._glctx,
+                cutie_model=self._cutie_model,
             )
             pose_cam = tracker.register(color_rgb, depth_m, mask, K, iteration=request.iteration)
             self._tracker = tracker

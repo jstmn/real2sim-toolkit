@@ -39,6 +39,13 @@ def _load_cutie_deps():
     return InferenceCore, get_default_model
 
 
+def load_cutie_model():
+    """Cutie's network. Cutie's loader initializes Hydra, which works only once per process, so a long-lived process
+    (the pose server, which registers a new object per episode) loads it once and passes it to every CutieTracker."""
+    _, get_default_model = _load_cutie_deps()
+    return get_default_model()
+
+
 def _mask_to_bbox_xywh(mask: np.ndarray, erosion_size: int) -> tuple[int, int, int, int] | None:
     """Return (x, y, w, h) around mask's nonzero pixels, or None if the mask is empty."""
     kernel = np.ones((erosion_size, erosion_size), np.uint8)
@@ -55,13 +62,15 @@ def _mask_to_bbox_xywh(mask: np.ndarray, erosion_size: int) -> tuple[int, int, i
 class CutieTracker:
     """Wraps Cutie's InferenceCore to track a single object's 2D bbox across frames."""
 
-    def __init__(self, segment_threshold: float = 0.1, erosion_size: int = 5):
+    def __init__(self, model=None, segment_threshold: float = 0.1, erosion_size: int = 5):
+        """`model` may be passed in to reuse a network from `load_cutie_model()`; if omitted, it is loaded here, which
+        works once per process. Each tracker has its own InferenceCore, so its memory starts empty."""
         assert 0 < segment_threshold < 1, f"segment_threshold must be in (0, 1), got {segment_threshold}"
         assert erosion_size >= 1, f"erosion_size must be >= 1, got {erosion_size}"
-        InferenceCore, get_default_model = _load_cutie_deps()
+        InferenceCore, _ = _load_cutie_deps()
         self.segment_threshold = segment_threshold
         self.erosion_size = erosion_size
-        self._model = get_default_model()
+        self._model = model if model is not None else load_cutie_model()
         self._processor = InferenceCore(self._model, cfg=self._model.cfg)
         self._processor.max_internal_size = -1
 

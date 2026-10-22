@@ -9,7 +9,7 @@ import tyro
 from tqdm import tqdm
 
 from r2st.core import SAM3Predictor, bbox_xyxy_from_mask, binary_mask_to_sam_mask_input
-from r2st.utils import ImageUtils, validate_merged_camera_group
+from r2st.utils import H264VideoWriter, ImageUtils, validate_merged_camera_group
 
 """
 # Example usage:
@@ -117,13 +117,7 @@ def _save_outputs(
     assert masks.shape == (n_frames, height, width), f"masks {masks.shape} != {(n_frames, height, width)}"
     output_dir.mkdir(parents=True, exist_ok=True)
     video_path = output_dir / f"mask-propagated__{camera}__{object_slug}.mp4"
-    writer = cv2.VideoWriter(
-        str(video_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
-        _MASK_VIDEO_FPS,
-        (width, height),
-    )
-    assert writer.isOpened(), f"Failed to open video writer at {video_path}"
+    writer = H264VideoWriter(video_path, _MASK_VIDEO_FPS, width, height)
     for t in range(n_frames):
         prefix = f"mask-propagated__{camera}__{object_slug}__idx={t}"
         np.save(output_dir / f"{prefix}.npy", masks[t])
@@ -133,7 +127,7 @@ def _save_outputs(
         assert overlay_path.name.endswith(".demo.png"), f"demo overlay path must end with .demo.png, got {overlay_path}"
         assert cv2.imwrite(str(overlay_path), demo), f"Failed to write {overlay_path}"
         writer.write(demo)
-    writer.release()
+    writer.close()
     assert video_path.is_file() and video_path.stat().st_size > 0, f"Failed to write {video_path}"
     print(f"[info] Saved {n_frames} masks, demo overlays, and video to {video_path}")
     return video_path
