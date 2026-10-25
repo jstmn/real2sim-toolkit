@@ -149,6 +149,7 @@ uv run python examples/estimate_camera_extrinsics_rgb.py \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
+  --depth-intrinsics-source rgb \
   --n-timesteps 5 \
   --output-path data/grail_xarm_july_2/extrinsics_cam_1__rgb.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
@@ -254,12 +255,16 @@ If you change `src/r2st/pose_grpc/pose_tracking.proto`, regenerate the Python bi
 `src/r2st/pose_grpc/`:
 
 ```bash
-uv run python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. pose_tracking.proto
+uvx --from "grpcio-tools==1.68.1" python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. pose_tracking.proto
+sed -i 's/^import pose_tracking_pb2 as pose__tracking__pb2$/from r2st.pose_grpc import pose_tracking_pb2 as pose__tracking__pb2/' pose_tracking_pb2_grpc.py
 ```
 
-then re-apply the `from r2st.pose_grpc import ...` fix noted at the top of
-`pose_tracking_pb2_grpc.py` (protoc emits a bare top-level import that breaks once the file is
-imported as a package).
+The `sed` re-applies the `from r2st.pose_grpc import ...` fix at the top of `pose_tracking_pb2_grpc.py`
+(protoc emits a bare top-level import that breaks once the file is imported as a package).
+
+Use grpcio-tools 1.68.1, not this repo's newer `grpcio-tools` dev dependency. Mpc-4-Manipulation imports this package and
+pins `protobuf<6` (protobuf 5.29 / grpcio 1.82), and protobuf refuses to load stubs whose gencode is newer than its
+runtime. Stubs from 1.68.1 (protobuf 5.28 gencode) load under both that env and this one.
 
 ## Third party models used
 

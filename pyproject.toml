@@ -24,7 +24,6 @@ dependencies = [
     "pycocotools>=2.0.11",
     "pyg-lib>=0.6.0",
     "pyyaml>=6.0.3",
-    "pyzmq>=27.2.0",
     "requests>=2.34.2",
     "sam3",
     "termcolor>=3.3.0",
@@ -61,7 +60,6 @@ dev = [
     "timm>=1.0.28",
     "addict>=2.4.0",
     "yapf>=0.43.0",
-    "grpcio-tools>=1.83.0",
 ]
 
 [tool.pytest.ini_options]
