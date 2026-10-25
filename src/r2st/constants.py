@@ -1,4 +1,5 @@
-"""Measured camera calibration, keyed by camera_model_id (e.g. 'd435').
+"""Measured camera calibration, keyed by camera_model_id (e.g. 'd435'), and measured workspace bounds, keyed by
+workspace_id (e.g. 'vention-franka-table').
 
 Values are hardware readouts, not guessed defaults.
 """
@@ -7,10 +8,37 @@ from __future__ import annotations
 
 import numpy as np
 
-from r2st.types import CameraIntrinsics
+from r2st.types import CameraIntrinsics, WorkspaceBounds
 
 MIN_DEPTH_M = 0.01
 MAX_DEPTH_M = 2.0
+
+
+def cm_to_m(cm: float) -> float:
+    return cm / 100.0
+
+
+# Robot-base frame
+WORKSPACE_BOUNDS: dict[str, WorkspaceBounds] = {
+    # The bounds of the vention table. This is larger than the robot's reachable workspace. See
+    # https://docs.google.com/drawings/d/1Mvzcg4S3asflx9s8VEFmOry6SM-qBRHE3Jz-pSo5bjY/edit?usp=sharing for details
+    "vention-franka-table": WorkspaceBounds(
+        min_x_m=cm_to_m(-21),
+        max_x_m=cm_to_m(99),
+        min_y_m=cm_to_m(-38.25),
+        max_y_m=cm_to_m(42.75),
+        min_z_m=cm_to_m(-1.0),
+        max_z_m=cm_to_m(75.0),
+    ),
+}
+
+
+def get_workspace_bounds(workspace_id: str) -> WorkspaceBounds:
+    assert (
+        workspace_id in WORKSPACE_BOUNDS
+    ), f"Unknown workspace_id {workspace_id!r}. Available: {sorted(WORKSPACE_BOUNDS)}"
+    return WORKSPACE_BOUNDS[workspace_id]
+
 
 DEPTH_INTRINSICS: dict[str, CameraIntrinsics] = {
     "d435": CameraIntrinsics(

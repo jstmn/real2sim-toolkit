@@ -10,6 +10,7 @@ seed poses, the CMA-ES loop, and the Viser view. Each script supplies a cost fun
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import pathlib
 import threading
 import time
@@ -20,6 +21,7 @@ import cv2
 import h5py
 import numpy as np
 import sapien
+import yaml
 from tqdm import tqdm
 from transforms3d.axangles import axangle2mat, mat2axangle
 from transforms3d.quaternions import mat2quat, quat2mat
@@ -28,6 +30,7 @@ from r2st.constants import (
     MIN_DEPTH_M,
     get_depth_intrinsics,
     get_depth_to_color_extrinsics,
+    get_workspace_bounds,
 )
 from r2st.core import (
     SAM3Predictor,
@@ -40,7 +43,7 @@ from r2st.geometry import (
     masked_depth_to_points,
     reproject_depth_to_color_frame,
 )
-from r2st.types import CameraIntrinsics
+from r2st.types import CameraIntrinsics, WorkspaceBounds
 from r2st.utils import (
     H264VideoWriter,
     ImageUtils,
@@ -66,6 +69,12 @@ BEST_ORIGIN_RADIUS = 0.008
 POP_AXES_LENGTH = 0.045
 POP_AXES_RADIUS = 0.0025
 POP_ORIGIN_RADIUS = 0.005
+# Padding on every side of the workspace bounds except the bottom. The arm reaches past the table edge toward a camera,
+# and the prior extrinsics are approximate.
+WORKSPACE_PADDING_M = 0.30
+# Padding below the workspace bounds. Small, so the floor below the table stays background, but under the prior
+# extrinsics the table surface measures a few cm below its true height (median -2.5 cm, 1st percentile -4.5 cm).
+WORKSPACE_BOTTOM_PADDING_M = 0.05
 
 
 def log_elapsed(label: str, t0: float) -> None:
@@ -87,11 +96,12 @@ def robot_mask_cache_path(
     frame_idx: int,
     kmax: int,
     score_threshold: float,
+    workspace_tag: str | None,
 ) -> pathlib.Path:
     return (
         h5_path.parent
         / h5_path.stem
-        / f"robot-mask__{camera}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
+        / f"robot-mask__{camera}{_tag_part(workspace_tag)}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
     )
 
 
@@ -101,11 +111,12 @@ def propagated_robot_mask_cache_path(
     frame_idx: int,
     kmax: int,
     score_threshold: float,
+    workspace_tag: str | None,
 ) -> pathlib.Path:
     return (
         h5_path.parent
         / h5_path.stem
-        / f"robot-mask-propagated__{camera}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
+        / f"robot-mask-propagated__{camera}{_tag_part(workspace_tag)}__idx={int(frame_idx)}__kmax={int(kmax)}__score_threshold={score_threshold}.npy"
     )
 
 
@@ -114,18 +125,24 @@ def propagated_robot_mask_video_path(
     camera: str,
     kmax: int,
     score_threshold: float,
+    workspace_tag: str | None,
 ) -> pathlib.Path:
     return (
         h5_path.parent
         / h5_path.stem
-        / f"robot-mask-propagated__{camera}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
+        / f"robot-mask-propagated__{camera}{_tag_part(workspace_tag)}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
     )
 
 
-def _per_frame_robot_mask_stem(camera: str, robot_description: str) -> str:
+def _tag_part(workspace_tag: str | None) -> str:
+    """Cache-name infix for masks segmented on workspace-filtered RGB (see ``workspace_mask_tag``)."""
+    return "" if workspace_tag is None else f"__{workspace_tag}"
+
+
+def _per_frame_robot_mask_stem(camera: str, robot_description: str, workspace_tag: str | None) -> str:
     assert "/" not in robot_description, f"robot_description must not contain '/', got {robot_description!r}"
     prompt = robot_description.replace(" ", "_")
-    return f"robot-mask-per-frame__{camera}__prompt={prompt}"
+    return f"robot-mask-per-frame__{camera}{_tag_part(workspace_tag)}__prompt={prompt}"
 
 
 def per_frame_robot_mask_cache_path(
@@ -135,8 +152,9 @@ def per_frame_robot_mask_cache_path(
     frame_idx: int,
     kmax: int,
     score_threshold: float,
+    workspace_tag: str | None,
 ) -> pathlib.Path:
-    stem = _per_frame_robot_mask_stem(camera, robot_description)
+    stem = _per_frame_robot_mask_stem(camera, robot_description, workspace_tag)
     return (
         h5_path.parent
         / h5_path.stem
@@ -150,8 +168,9 @@ def per_frame_robot_mask_video_path(
     robot_description: str,
     kmax: int,
     score_threshold: float,
+    workspace_tag: str | None,
 ) -> pathlib.Path:
-    stem = _per_frame_robot_mask_stem(camera, robot_description)
+    stem = _per_frame_robot_mask_stem(camera, robot_description, workspace_tag)
     return h5_path.parent / h5_path.stem / f"{stem}__kmax={int(kmax)}__score_threshold={score_threshold}.mp4"
 
 
@@ -231,14 +250,17 @@ def compute_propagated_robot_masks(
     sam_score_threshold: float,
     cache_robot_masks: bool,
     visualize_robot_masks: bool,
+    workspace_tag: str | None,
 ) -> np.ndarray:
-    """Return ``(T, H, W)`` robot masks. Frame 0 is SAM 3; later frames are SAM 3-propagated."""
+    """Return ``(T, H, W)`` robot masks. Frame 0 is SAM 3; later frames are SAM 3-propagated. ``workspace_tag`` names
+    the cache files of masks segmented on workspace-filtered ``rgb`` (None for unfiltered RGB)."""
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"rgb must be (T, H, W, 3), got {rgb.shape}"
     n_frames, height, width, _ = rgb.shape
     assert n_frames >= 1, f"rgb must contain at least 1 frame, got {rgb.shape}"
     hw = (height, width)
     propagated_paths = [
-        propagated_robot_mask_cache_path(h5_path, camera, t, sam_kmax, sam_score_threshold) for t in range(n_frames)
+        propagated_robot_mask_cache_path(h5_path, camera, t, sam_kmax, sam_score_threshold, workspace_tag)
+        for t in range(n_frames)
     ]
     n_cached = n_consecutive_cached_masks(propagated_paths) if cache_robot_masks else 0
     if n_cached == n_frames:
@@ -261,7 +283,7 @@ def compute_propagated_robot_masks(
             assert rest.shape[0] == n_frames - n_cached + 1, f"rest frames {rest.shape[0]} != {n_frames - n_cached + 1}"
             masks[n_cached:] = rest[1:]
         else:
-            seed_path = robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold)
+            seed_path = robot_mask_cache_path(h5_path, camera, 0, sam_kmax, sam_score_threshold, workspace_tag)
             predictor: SAM3Predictor | None = None
             if cache_robot_masks and seed_path.is_file():
                 seed_mask = load_cached_bool_mask(seed_path, hw)
@@ -319,7 +341,7 @@ def compute_propagated_robot_masks(
         rgb,
         masks,
         propagated_paths,
-        propagated_robot_mask_video_path(h5_path, camera, sam_kmax, sam_score_threshold),
+        propagated_robot_mask_video_path(h5_path, camera, sam_kmax, sam_score_threshold, workspace_tag),
     )
     return masks
 
@@ -829,33 +851,54 @@ def compute_robot_masks(
     per_frame_robot_masks: bool,
     cache_robot_masks: bool,
     visualize_robot_masks: bool,
+    workspace_masks: np.ndarray | None,
+    workspace_tag: str | None,
 ) -> np.ndarray:
     """``(T, H, W)`` robot masks for every frame. With ``per_frame_robot_masks``, SAM 3 runs on every frame (empty mask
-    where it finds no robot) and a demo overlay video is written. Otherwise frame 0's SAM 3 mask is propagated."""
+    where it finds no robot) and a demo overlay video is written. Otherwise frame 0's SAM 3 mask is propagated.
+
+    With ``workspace_masks`` (``(T, H, W)`` bool from ``compute_workspace_masks``), SAM 3 sees the RGB with pixels
+    outside the workspace blacked out, its masks are cut to the workspace, and the cache names carry ``workspace_tag``.
+    """
     n_frames, height, width, _ = rgb_all.shape
+    assert (workspace_masks is None) == (workspace_tag is None), "workspace_masks and workspace_tag go together"
+    rgb_sam = rgb_all
+    if workspace_masks is not None:
+        assert workspace_masks.shape == (
+            n_frames,
+            height,
+            width,
+        ), f"workspace_masks {workspace_masks.shape} != {(n_frames, height, width)}"
+        rgb_sam = np.where(workspace_masks[..., None], rgb_all, 0).astype(np.uint8)
     if per_frame_robot_masks:
         # Every frame is segmented (and cached) so that unusable frames can be excluded before sampling
         per_frame_paths = [
-            per_frame_robot_mask_cache_path(h5_path, camera, robot_description, t, sam_kmax, sam_score_threshold)
+            per_frame_robot_mask_cache_path(
+                h5_path, camera, robot_description, t, sam_kmax, sam_score_threshold, workspace_tag
+            )
             for t in range(n_frames)
         ]
         masks_all = segment_robot_masks_per_frame(
-            rgb_all,
+            rgb_sam,
             np.arange(n_frames),
             robot_description,
             sam_kmax,
             sam_score_threshold,
             per_frame_paths if cache_robot_masks else None,
         )
+        if workspace_masks is not None:
+            masks_all &= workspace_masks
         save_robot_mask_demo_overlays(
-            rgb_all,
+            rgb_sam,
             masks_all,
             per_frame_paths,
-            per_frame_robot_mask_video_path(h5_path, camera, robot_description, sam_kmax, sam_score_threshold),
+            per_frame_robot_mask_video_path(
+                h5_path, camera, robot_description, sam_kmax, sam_score_threshold, workspace_tag
+            ),
         )
     else:
         masks_all = compute_propagated_robot_masks(
-            rgb_all,
+            rgb_sam,
             h5_path,
             camera,
             robot_description,
@@ -863,9 +906,94 @@ def compute_robot_masks(
             sam_score_threshold,
             cache_robot_masks,
             visualize_robot_masks,
+            workspace_tag,
         )
+        if workspace_masks is not None:
+            masks_all &= workspace_masks
     assert masks_all.shape == (n_frames, height, width), f"masks_all {masks_all.shape} != {(n_frames, height, width)}"
     return masks_all
+
+
+def load_extrinsics_yaml(path: pathlib.Path, camera: str) -> np.ndarray:
+    """4x4 robot-base T camera from an extrinsics YAML written by the estimate_camera_extrinsics scripts."""
+    assert path.is_file(), f"Extrinsics YAML not found: {path}"
+    data = yaml.safe_load(path.read_text())
+    assert data["camera"] == camera, f"{path} is for camera {data['camera']!r}, not {camera!r}"
+    assert data["parent_frame"] == "robot_base", f"{path}: parent_frame must be robot_base, got {data['parent_frame']}"
+    T = np.asarray(data["matrix"], dtype=np.float64)
+    assert T.shape == (4, 4), f"{path}: matrix must be 4x4, got {T.shape}"
+    assert np.allclose(T[3], [0.0, 0.0, 0.0, 1.0]), f"{path}: matrix last row must be [0, 0, 0, 1], got {T[3]}"
+    return T
+
+
+def workspace_mask_tag(workspace_id: str, prior_extrinsics_path: pathlib.Path) -> str:
+    """Cache-name tag for masks segmented on RGB filtered with ``padded_workspace_bounds(workspace_id)`` and that prior
+    extrinsics YAML. The YAML's content hash is included so that editing the prior does not reuse stale masks."""
+    digest = hashlib.sha1(prior_extrinsics_path.read_bytes()).hexdigest()[:8]
+    return (
+        f"workspace={workspace_id}-pad={WORKSPACE_PADDING_M}-bottompad={WORKSPACE_BOTTOM_PADDING_M}"
+        f"__prior={prior_extrinsics_path.stem}-{digest}"
+    )
+
+
+def padded_workspace_bounds(workspace_id: str) -> WorkspaceBounds:
+    """The ``workspace_id`` bounds padded by ``WORKSPACE_PADDING_M`` on every side but the bottom, which is padded by
+    ``WORKSPACE_BOTTOM_PADDING_M``."""
+    bounds = get_workspace_bounds(workspace_id)
+    return dataclasses.replace(bounds.padded(WORKSPACE_PADDING_M), min_z_m=bounds.min_z_m - WORKSPACE_BOTTOM_PADDING_M)
+
+
+def in_workspace_pixels(
+    depth_m: np.ndarray, K: np.ndarray, T_world_cam: np.ndarray, bounds: WorkspaceBounds
+) -> np.ndarray:
+    """``(H, W)`` bool: False where a pixel's depth puts it outside ``bounds`` (robot-base frame) seen from
+    ``T_world_cam``. Pixels without valid depth are kept (True): the arm often has no depth when close to the camera."""
+    assert depth_m.ndim == 2, f"depth_m must be HxW, got {depth_m.shape}"
+    assert K.shape == (3, 3), f"K must be 3x3, got {K.shape}"
+    assert T_world_cam.shape == (4, 4), f"T_world_cam must be 4x4, got {T_world_cam.shape}"
+    height, width = depth_m.shape
+    vs, us = np.mgrid[0:height, 0:width]
+    valid = np.isfinite(depth_m) & (depth_m >= MIN_DEPTH_M)
+    z = depth_m[valid].astype(np.float64)
+    pts_cam = np.stack([(us[valid] - K[0, 2]) * z / K[0, 0], (vs[valid] - K[1, 2]) * z / K[1, 1], z], axis=-1)
+    keep = np.ones((height, width), dtype=bool)
+    keep[valid] = bounds.contains(pts_cam @ T_world_cam[:3, :3].T + T_world_cam[:3, 3])
+    return keep
+
+
+def compute_workspace_masks(
+    workspace_id: str | None,
+    prior_extrinsics_path: pathlib.Path | None,
+    camera: str,
+    depth_raw_all: np.ndarray,
+    color_intrinsics: CameraIntrinsics,
+    depth_reprojection: tuple[CameraIntrinsics, np.ndarray, np.ndarray] | None,
+) -> tuple[np.ndarray | None, str | None]:
+    """``(workspace_masks, workspace_tag)`` for ``compute_robot_masks``: ``in_workspace_pixels`` of every frame against
+    ``padded_workspace_bounds(workspace_id)``, seen from the prior extrinsics. ``(None, None)`` when neither is given;
+    giving only one is an error."""
+    assert (workspace_id is None) == (
+        prior_extrinsics_path is None
+    ), "--workspace-id and --workspace-prior-extrinsics must be given together"
+    if workspace_id is None:
+        return None, None
+    bounds = padded_workspace_bounds(workspace_id)
+    T_world_cam = load_extrinsics_yaml(prior_extrinsics_path, camera)
+    K = color_intrinsics.intrinsic_matrix.astype(np.float64)
+    t0 = time.perf_counter()
+    workspace_masks = np.stack(
+        [
+            in_workspace_pixels(frame_depth_m(depth_raw, color_intrinsics, depth_reprojection), K, T_world_cam, bounds)
+            for depth_raw in depth_raw_all
+        ],
+        axis=0,
+    )
+    log_elapsed(
+        f"Workspace filter '{workspace_id}' (+{WORKSPACE_PADDING_M} m, bottom +{WORKSPACE_BOTTOM_PADDING_M} m) from {prior_extrinsics_path}: "
+        f"{1.0 - workspace_masks.mean():.0%} of pixels outside",
+        t0,
+    )
+    return workspace_masks, workspace_mask_tag(workspace_id, prior_extrinsics_path)
 
 
 def frames_with_robot_mask(masks_all: np.ndarray, per_frame_robot_masks: bool) -> tuple[np.ndarray, np.ndarray]:

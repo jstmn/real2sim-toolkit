@@ -330,14 +330,14 @@ def test_compute_propagated_robot_masks_loads_full_cache(tmp_path):
         mask = np.zeros((height, width), dtype=bool)
         mask[1:3, 1 + t : 4 + t] = True
         expected.append(mask)
-        path = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3)
+        path = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None)
         np.save(path, mask)
-    out = compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
+    out = compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False, None)
     assert np.array_equal(out, np.stack(expected, axis=0))
     for t in range(n_frames):
-        overlay = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3).with_suffix(".demo.png")
+        overlay = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None).with_suffix(".demo.png")
         assert overlay.is_file(), f"missing demo overlay {overlay}"
-    video_path = propagated_robot_mask_video_path(h5_path, "cam_1", 5, 0.3)
+    video_path = propagated_robot_mask_video_path(h5_path, "cam_1", 5, 0.3, None)
     assert video_path.is_file(), f"missing robot-mask video {video_path}"
     assert video_path.stat().st_size > 0, f"empty robot-mask video {video_path}"
 
@@ -354,17 +354,71 @@ def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, mon
         mask = np.zeros((height, width), dtype=bool)
         mask[1:3, 1 + t : 4 + t] = True
         cached.append(mask)
-        np.save(propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3), mask)
+        np.save(propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None), mask)
 
     fake = _FakePropagatePredictor()
     monkeypatch.setattr(ece, "load_sam3", lambda: fake)
-    out = ece.compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False)
+    out = ece.compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False, None)
     assert np.array_equal(out[0], cached[0])
     assert np.array_equal(out[1], cached[1])
     assert len(fake.calls) == 1
     expected2 = np.zeros((height, width), dtype=bool)
     expected2[2:3, 3:6] = True
     assert np.array_equal(out[2], expected2)
-    path2 = propagated_robot_mask_cache_path(h5_path, "cam_1", 2, 5, 0.3)
+    path2 = propagated_robot_mask_cache_path(h5_path, "cam_1", 2, 5, 0.3, None)
     assert path2.is_file()
     assert np.array_equal(np.load(path2), expected2)
+
+
+def test_in_workspace_pixels_drops_points_outside_bounds_and_keeps_missing_depth():
+    from r2st.extrinsics import in_workspace_pixels
+    from r2st.types import WorkspaceBounds
+
+    K = np.array([[100.0, 0.0, 2.0], [0.0, 100.0, 1.0], [0.0, 0.0, 1.0]])
+    depth_m = np.full((3, 5), 1.0)
+    depth_m[0, 0] = 3.0  # behind the workspace
+    depth_m[2, 4] = np.nan  # no depth
+    depth_m[1, 2] = 0.0  # no depth
+    # Camera at the origin looking along +z, so camera points are robot-base points
+    bounds = WorkspaceBounds(min_x_m=-1.0, max_x_m=1.0, min_y_m=-1.0, max_y_m=1.0, min_z_m=0.5, max_z_m=1.5)
+    keep = in_workspace_pixels(depth_m, K, np.eye(4), bounds)
+    expected = np.ones((3, 5), dtype=bool)
+    expected[0, 0] = False
+    assert np.array_equal(keep, expected)
+
+
+def test_workspace_mask_tag_changes_with_prior_content(tmp_path):
+    from r2st.extrinsics import workspace_mask_tag
+
+    prior = tmp_path / "extrinsics_cam.yaml"
+    prior.write_text("matrix: [1]\n")
+    tag_a = workspace_mask_tag("vention-franka-table", prior)
+    assert tag_a.startswith("workspace=vention-franka-table-pad=0.3-bottompad=0.05__prior=extrinsics_cam-")
+    prior.write_text("matrix: [2]\n")
+    assert workspace_mask_tag("vention-franka-table", prior) != tag_a
+
+
+def test_workspace_bounds_padded_contains():
+    from r2st.constants import get_workspace_bounds
+
+    bounds = get_workspace_bounds("vention-franka-table")
+    padded = bounds.padded(0.10)
+    pts = np.array([[0.0, 0.0, 0.3], [1.05, 0.0, 0.3], [1.2, 0.0, 0.3]])
+    assert bounds.contains(pts).tolist() == [True, False, False]
+    assert padded.contains(pts).tolist() == [True, True, False]
+
+
+def test_padded_workspace_bounds_pads_the_bottom_less():
+    from r2st.constants import get_workspace_bounds
+    from r2st.extrinsics import (
+        WORKSPACE_BOTTOM_PADDING_M,
+        WORKSPACE_PADDING_M,
+        padded_workspace_bounds,
+    )
+
+    bounds = get_workspace_bounds("vention-franka-table")
+    padded = padded_workspace_bounds("vention-franka-table")
+    assert padded.min_z_m == pytest.approx(-0.06)
+    assert padded.min_z_m == bounds.min_z_m - WORKSPACE_BOTTOM_PADDING_M
+    assert padded.max_z_m == bounds.max_z_m + WORKSPACE_PADDING_M
+    assert padded.min_y_m == bounds.min_y_m - WORKSPACE_PADDING_M

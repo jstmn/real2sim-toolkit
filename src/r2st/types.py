@@ -86,6 +86,25 @@ class WorkspaceBounds:
             (self.max_z_m + self.min_z_m) / 2,
         )
 
+    def padded(self, margin_m: float) -> "WorkspaceBounds":
+        """These bounds grown by `margin_m` on every side."""
+        assert margin_m >= 0.0, f"margin_m must be >= 0, got {margin_m}"
+        return WorkspaceBounds(
+            min_x_m=self.min_x_m - margin_m,
+            max_x_m=self.max_x_m + margin_m,
+            min_y_m=self.min_y_m - margin_m,
+            max_y_m=self.max_y_m + margin_m,
+            min_z_m=self.min_z_m - margin_m,
+            max_z_m=self.max_z_m + margin_m,
+        )
+
+    def contains(self, points: np.ndarray) -> np.ndarray:
+        """`(N,)` bool: which of the `(N, 3)` points lie inside the bounds (inclusive)."""
+        assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
+        lo = np.array([self.min_x_m, self.min_y_m, self.min_z_m])
+        hi = np.array([self.max_x_m, self.max_y_m, self.max_z_m])
+        return np.all((points >= lo) & (points <= hi), axis=1)
+
 
 @dataclass
 class CameraImage:

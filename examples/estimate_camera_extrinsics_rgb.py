@@ -93,6 +93,7 @@ from r2st.extrinsics import (
     T_to_sapien_pose,
     build_real_pcd,
     compute_robot_masks,
+    compute_workspace_masks,
     depth_reprojection_for,
     erode_mask,
     expand_demo_qpos_to_joint_names,
@@ -206,6 +207,15 @@ class Args:
     """If set, segment the robot with the SAM 3 text prompt on every frame (union of the top --sam-kmax masks) instead
     of propagating frame 0's mask. For recordings of separate arm poses (not a continuous trajectory), where the arm
     jumps between frames and propagation stays on the static base."""
+
+    workspace_id: str | None = None
+    """Workspace bounds id from r2st.constants.WORKSPACE_BOUNDS (robot-base frame), e.g. 'vention-franka-table'. With
+    --workspace-prior-extrinsics, pixels whose depth lands outside these bounds (padded by 30 cm, 5 cm below) are blacked out
+    before SAM 3, and the SAM masks are cut to the workspace. Pixels without depth are kept. Masks are cached under
+    names that include the workspace id and the prior YAML."""
+
+    workspace_prior_extrinsics: pathlib.Path | None = None
+    """Approximate extrinsics YAML for --workspace-id, e.g. a previous run's --output-path for this camera."""
 
     cache_robot_masks: bool = True
     """If set, load/save robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy,
@@ -542,6 +552,14 @@ def main(args: Args) -> None:
 
     args.output_path.parent.mkdir(parents=True, exist_ok=True)
     t0_masks = time.perf_counter()
+    workspace_masks, workspace_tag = compute_workspace_masks(
+        args.workspace_id,
+        args.workspace_prior_extrinsics,
+        args.camera,
+        depth_raw_all,
+        color_intrinsics,
+        depth_reprojection,
+    )
     masks_all = compute_robot_masks(
         rgb_all,
         args.h5_path,
@@ -552,6 +570,8 @@ def main(args: Args) -> None:
         args.per_frame_robot_masks,
         args.cache_robot_masks,
         args.visualize_robot_masks,
+        workspace_masks,
+        workspace_tag,
     )
     has_mask, no_mask = frames_with_robot_mask(masks_all, args.per_frame_robot_masks)
     log_elapsed(f"Built robot masks for {n_frames} frames", t0_masks)
@@ -643,6 +663,10 @@ def main(args: Args) -> None:
         "child_frame": f"{args.camera}_optical",
         "h5_path": str(args.h5_path),
         "n_timesteps": args.n_timesteps,
+        "workspace_id": args.workspace_id,
+        "workspace_prior_extrinsics": (
+            None if args.workspace_prior_extrinsics is None else str(args.workspace_prior_extrinsics)
+        ),
         "frames_without_robot_mask": no_mask.tolist(),
         "sampled_frame_indices": fps_idx.tolist(),
         "cost": float(best_cost),
