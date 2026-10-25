@@ -46,8 +46,10 @@ cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
 ### OPTIONAL
 # Download saved demonstrations (used by Examples 2, 4, and 5). You need to be logged into Google Cloud Platform to do this. Run `gcloud auth login` to do so.
-mkdir -p data
-gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
+# data/grail_xarm_july_2/README.md describes that dataset.
+mkdir -p data/demonstrations
+gcloud storage cp --recursive gs://r2st-public/grail_xarm_july_2 data/
+gcloud storage cp gs://r2st-public/demonstrations/raise_cube_0_merged.h5 data/demonstrations/
 ```
 
 ## Data format
@@ -55,23 +57,27 @@ gcloud storage cp --recursive gs://r2st-public/demonstrations/ data/
 Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of every dataset belongs to frame `i`.
 `r2st.utils.validate_merged_camera_group` checks the required camera datasets.
 
-| Dataset | Shape | Dtype | Required | Notes |
-| --- | --- | --- | --- | --- |
-| `obs/qpos` | `(T, D)` | float64 | yes | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0 |
-| `obs/sensor_data/<cam>/rgb` | `(T, H, W, 3)` | uint8 | yes | RGB |
-| `obs/sensor_data/<cam>/depth` | `(T, H, W)` | uint16 | yes | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K |
-| `obs/sensor_data/<cam>/timestamp_ms` | `(T,)` | float64 | yes | Time of frame `i` (Unix epoch, ms) |
-| `obs/sensor_data/<cam>/rgb_timestamp_ms` | `(T,)` | float64 | yes | Capture time of the RGB image used for frame `i` (Unix epoch, ms) |
-| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)` | float64 | no | Capture time of the depth image used for frame `i` (Unix epoch, ms) |
-| `obs/qvel` | `(T, D)` | float64 | no | Joint velocities, same order as `obs/qpos` |
-| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)` | int64 | no | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
+
+| Dataset                                    | Shape          | Dtype   | Required | Notes                                                                                             |
+| -------------------------------------------- | ---------------- | --------- | ---------- | --------------------------------------------------------------------------------------------------- |
+| `obs/qpos`                                 | `(T, D)`       | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0                |
+| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                                               |
+| `obs/sensor_data/<cam>/depth`              | `(T, H, W)`    | uint16  | yes      | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K                         |
+| `obs/sensor_data/<cam>/timestamp_ms`       | `(T,)`         | float64 | yes      | Time of frame `i` (Unix epoch, ms)                                                                |
+| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)                                 |
+| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms)                               |
+| `obs/qvel`                                 | `(T, D)`       | float64 | no       | Joint velocities, same order as `obs/qpos`                                                        |
+| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)`         | int64   | no       | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
 
 `<cam>` is the value you pass as `--camera` to the examples.
 
+`data/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this format
+(`data/grail_xarm_july_2/merge_camera_streams.py`).
 
 ## Examples
 
 ### Example 1: Segment an object with SAM 3.
+
 This is the smoke test for text-prompted masking. It writes a dimmed overlay, a masked crop, and a bool `.npy` mask. The first run downloads the gated SAM 3 checkpoint from Hugging Face (see Installation).
 
 ```bash
@@ -79,19 +85,19 @@ uv run python examples/generate_mask.py --image data/red_T_block_1.png --object-
 uv run python examples/generate_mask.py --image data/raise_cube_0__camera_base__t=0.rgb.png --object-description "blue cube"
 ```
 
-
 ### Example 2: Track a mask through a demonstration.
+
 SAM 3 segments the prompt on **frame 0** (union of the top `--sam-kmax` masks whose score is above `--sam-score-threshold`). That union is propagated through later RGB frames with SAM 3 `mask_input` plus the previous mask's bbox. Writes per-frame `.npy` masks, dimmed overlays, and an mp4 under `<h5_dir>/<h5_stem>/`.
 
 ```bash
 uv run python examples/generate_masks_across_trajectory.py \
-    --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --object-description "white robot arm"
 ```
 
-
 ### Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
+
 Exactly one of `--object-description` or `--object-description-from-vlm` is required.
 
 ```bash
@@ -100,11 +106,12 @@ uv run python examples/generate_mesh.py --images data/red_T_block_1.png --object
 uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --object-description-from-vlm --visualize
 ```
 
-
 ### Example 4: Estimate camera extrinsics and save results to a yaml file.
-This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)). 
 
-Usage notes: 
+This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
+
+Usage notes:
+
 * The primary cause of a bad optimization result is the existence of points in the robot pointcloud that are not in fact on the robot. This can happen when the robot mask is too large, in which case points from the background are included in the pointcloud. The loss function has a squared error on distance to the simulated pointcloud, so such a point will have a large influence on the optimization result. The first way to handle this is to ensure that frame isn't included: `--ignore-timesteps <bad frame index>`. A second approach is to reduce the maximum allowed point distance: `--max-point-distance-m 1.3` such that these points are filtered out.
 
 ![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
@@ -113,29 +120,39 @@ Usage notes:
 
 # Seed CMA-ES with the GUI.
 uv run python examples/estimate_camera_extrinsics.py \
-  --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/demonstrations/0802/extrinsics_cam_1.yaml \
+  --output-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
   --seed-from-gui \
   --visualize \
   --visualize-robot-masks
 
 # You can also seed CMA-ES with a specific pose.
 uv run python examples/estimate_camera_extrinsics.py \
-  --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/demonstrations/0802/extrinsics_cam_1.yaml \
+  --output-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 
+# You can also seed CMA-ES with a specific pose.
+uv run python examples/estimate_camera_extrinsics_rgb.py \
+  --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --robot-id xarm7__gripper \
+  --camera cam_1 \
+  --camera-model-id d435 \
+  --n-timesteps 5 \
+  --output-path data/grail_xarm_july_2/extrinsics_cam_1__rgb.yaml \
+  --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
+  --visualize
 ```
 
 Exactly one seed mode is required:
@@ -149,16 +166,17 @@ Exactly one seed mode is required:
 
 `--robot-id` is a Jrl2 robot name. The following are supported:
 
-| `--robot-id` | End effector |
-| --- | --- |
-| `panda` | Franka hand (fingers are part of the base description) |
-| `panda_zed_wrist_cam__panda_gripper` | Franka hand + DROID ZED Mini wrist camera |
-| `ur5` | none |
-| `ur10` | none |
-| `xarm7` | none |
-| `xarm7__gripper` | UFACTORY parallel-jaw gripper |
-| `xarm7__bio_gripper` | UFACTORY BIO gripper |
-| `xarm7__vacuum_gripper` | UFACTORY vacuum gripper |
+
+| `--robot-id`                         | End effector                                           |
+| -------------------------------------- | -------------------------------------------------------- |
+| `panda`                              | Franka hand (fingers are part of the base description) |
+| `panda_zed_wrist_cam__panda_gripper` | Franka hand + DROID ZED Mini wrist camera              |
+| `ur5`                                | none                                                   |
+| `ur10`                               | none                                                   |
+| `xarm7`                              | none                                                   |
+| `xarm7__gripper`                     | UFACTORY parallel-jaw gripper                          |
+| `xarm7__bio_gripper`                 | UFACTORY BIO gripper                                   |
+| `xarm7__vacuum_gripper`              | UFACTORY vacuum gripper                                |
 
 Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
 are pinned at 0 (closed gripper).
@@ -168,9 +186,10 @@ propagated through the rest of the trajectory with SAM 3 `mask_input` plus the p
 so contact with an object does not expand the robot mask.
 
 ### Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
+
 demonstration, then track that object through the demonstration:**
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
-Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv. 
+Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
 FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-path` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
 
@@ -182,11 +201,11 @@ cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
 # Track the object in the camera optical frame.
 uv run python examples/track_object.py \
-    --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --camera-model-id d435 \
     --object-description "mustard bottle" \
-    --extrinsics-path data/demonstrations/0802/extrinsics_cam_1.yaml \
+    --extrinsics-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 
 uv run python examples/track_object.py \
@@ -194,7 +213,7 @@ uv run python examples/track_object.py \
     --camera camera_north \
     --camera-model-id d435 \
     --object-description "blue cube" \
-    --extrinsics-path data/demonstrations/0802/extrinsics_cam_1.yaml \
+    --extrinsics-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 ```
 
@@ -203,14 +222,15 @@ uv run python examples/track_object.py \
 `--camera-model-id` selects measured intrinsics (and depth-to-color extrinsics) from `r2st.constants`.
 `--depth-intrinsics-source rgb|depth` is required and says which of those K's the h5 depth channel uses (`rgb` = already color-aligned).
 
-| `--camera-model-id` | Device |
-| --- | --- |
-| `d435` | Intel RealSense D435 |
-| `d435_720p` | Intel RealSense D435 at 1280x720 |
-| `zed2i_hd720` | Stereolabs ZED 2i at HD720 (1280x720) |
-| `zed_vga` | Stereolabs ZED at VGA (672x376) |
-| `zed2i_vga` | Stereolabs ZED 2i at VGA (672x376) |
-| `zedm_vga` | Stereolabs ZED Mini at VGA (672x376) |
+
+| `--camera-model-id` | Device                                |
+| --------------------- | --------------------------------------- |
+| `d435`              | Intel RealSense D435                  |
+| `d435_720p`         | Intel RealSense D435 at 1280x720      |
+| `zed2i_hd720`       | Stereolabs ZED 2i at HD720 (1280x720) |
+| `zed_vga`           | Stereolabs ZED at VGA (672x376)       |
+| `zed2i_vga`         | Stereolabs ZED 2i at VGA (672x376)    |
+| `zedm_vga`          | Stereolabs ZED Mini at VGA (672x376)  |
 
 ## Pose tracking (gRPC)
 
@@ -249,8 +269,6 @@ imported as a package).
   re-anchor FoundationPose's translation each frame, with a 6-DoF Kalman filter (`use_kalman_filter=True`)
   fusing that measurement (ported from
   [FoundationPose++](https://github.com/lidingsheng/FoundationPose-plus-plus))
-
-
 
 ## Common issues
 

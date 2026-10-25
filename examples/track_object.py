@@ -29,11 +29,11 @@ from r2st.utils import (
 """
 # Example usage (FoundationPose gRPC server must already be running in the container):
     uv run python examples/track_object.py \
-        --h5-path data/demonstrations/0802/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+        --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
         --camera cam_1 \
         --camera-model-id d435 \
         --object-description "mustard bottle" \
-        --extrinsics-path data/demonstrations/0802/extrinsics_cam_1.yaml \
+        --extrinsics-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
         --visualize
 """
 
@@ -41,7 +41,7 @@ from r2st.utils import (
 @dataclasses.dataclass
 class Args:
     h5_path: pathlib.Path
-    """Path to a merged sensor-data h5 file (see examples/merge_camera_streams.py)."""
+    """Path to a merged sensor-data h5 file (see data/grail_xarm_july_2/merge_camera_streams.py)."""
 
     camera: str
     """Camera name to read from within the h5 file, e.g. 'cam_1'."""

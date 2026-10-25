@@ -155,7 +155,7 @@ _POP_ORIGIN_RADIUS = 0.005
 @dataclasses.dataclass
 class Args:
     h5_path: pathlib.Path
-    """Path to a merged sensor-data h5 file (see examples/merge_camera_streams.py)."""
+    """Path to a merged sensor-data h5 file (see data/grail_xarm_july_2/merge_camera_streams.py)."""
 
     robot_id: str
     """Jrl2 robot name, e.g. 'xarm7__gripper'. See the README `{robot}__{eef}` table."""
@@ -756,7 +756,7 @@ def _load_demo(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarr
         validate_merged_camera_group(f, h5_path, camera)
         assert (
             "obs/qpos" in f
-        ), f"{h5_path}: missing 'obs/qpos' (re-merge the demo with examples/merge_camera_streams.py)"
+        ), f"{h5_path}: missing 'obs/qpos' (re-merge the demo with data/grail_xarm_july_2/merge_camera_streams.py)"
         group = f[f"obs/sensor_data/{camera}"]
         rgb = group["rgb"][:]
         depth = group["depth"][:]
