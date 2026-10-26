@@ -2,6 +2,7 @@ import pathlib
 
 import numpy as np
 import pytest
+import yaml
 from transforms3d.axangles import axangle2mat
 from transforms3d.quaternions import mat2quat
 
@@ -34,6 +35,7 @@ from r2st.extrinsics import (
     validate_seed_mode,
     workspace_filtered_rgb_dir,
     world_points_to_camera,
+    write_extrinsics_yaml,
 )
 
 _SEED_POSE = (0.80, 0.00, 0.50, 1.00, 0.00, 0.00, 0.00)
@@ -470,3 +472,12 @@ def test_frames_with_robot_mask_skips_empty_and_tiny_per_frame_masks():
     masks[1, :25, :25] = True
     with pytest.raises(AssertionError, match="lost tracking"):
         frames_with_robot_mask(masks, per_frame_robot_masks=False)
+
+
+def test_write_extrinsics_yaml_backs_up_previous_file(tmp_path):
+    out = tmp_path / "extrinsics_cam.yaml"
+    write_extrinsics_yaml(out, {"cost": 1.0})
+    assert not (tmp_path / "extrinsics_cam.backup.yaml").exists()
+    write_extrinsics_yaml(out, {"cost": 2.0})
+    assert yaml.safe_load((tmp_path / "extrinsics_cam.backup.yaml").read_text()) == {"cost": 1.0}
+    assert yaml.safe_load(out.read_text()) == {"cost": 2.0}

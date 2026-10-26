@@ -13,6 +13,7 @@ import dataclasses
 import datetime
 import hashlib
 import pathlib
+import shutil
 import threading
 import time
 from collections.abc import Callable
@@ -199,6 +200,17 @@ def optimization_frames_dir(h5_path: pathlib.Path) -> pathlib.Path:
     assert not frames_dir.exists(), f"{frames_dir} already exists"
     frames_dir.mkdir(parents=True)
     return frames_dir
+
+
+def write_extrinsics_yaml(output_path: pathlib.Path, payload: dict[str, Any]) -> None:
+    """Write ``payload`` to ``output_path``. An existing file there is first copied to ``<stem>.backup.yaml``, replacing
+    any older backup."""
+    assert output_path.suffix == ".yaml", f"output_path must end in .yaml, got {output_path}"
+    if output_path.exists():
+        backup_path = output_path.with_suffix(".backup.yaml")
+        shutil.copy2(output_path, backup_path)
+        print(f"[info] Backed up previous extrinsics to {colored(str(backup_path), 'blue')}")
+    output_path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
 
 def load_cached_bool_mask(path: pathlib.Path, hw: tuple[int, int], allow_empty: bool = False) -> np.ndarray:

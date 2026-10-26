@@ -83,7 +83,6 @@ from typing import Literal
 import cv2
 import numpy as np
 import tyro
-import yaml
 from jrl2.robots import NAME_TO_ROBOT, get_robot_by_name
 from termcolor import colored
 from transforms3d.quaternions import mat2quat
@@ -107,6 +106,7 @@ from r2st.extrinsics import (
     optimization_frames_dir,
     optimize_extrinsics,
     validate_seed_mode,
+    write_extrinsics_yaml,
 )
 from r2st.types import CameraIntrinsics
 from r2st.utils import ImageUtils, farthest_point_sample_naive
@@ -676,7 +676,7 @@ def main(args: Args) -> None:
         "quaternion_wxyz": q_wxyz.tolist(),
         "matrix": best_T.tolist(),
     }
-    args.output_path.write_text(yaml.safe_dump(payload, sort_keys=False))
+    write_extrinsics_yaml(args.output_path, payload)
     print(f"✅ Estimated camera extrinsics written to {colored(str(args.output_path), 'blue')}")
     print(f"[info] cost={best_cost:.4f} px")
     print(f"[info] translation={t}")
