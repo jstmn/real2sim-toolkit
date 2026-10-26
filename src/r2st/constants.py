@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from r2st.types import CameraIntrinsics, WorkspaceBounds
+from r2st.types import CameraIntrinsics, VerticalCylinder, WorkspaceBounds
 
 MIN_DEPTH_M = 0.01
 MAX_DEPTH_M = 2.0
@@ -17,6 +17,9 @@ MAX_DEPTH_M = 2.0
 def cm_to_m(cm: float) -> float:
     return cm / 100.0
 
+
+# Radius of the region excluded around each external camera's vertical mount
+CAMERA_MOUNT_RADIUS_M = cm_to_m(20)
 
 # Robot-base frame
 WORKSPACE_BOUNDS: dict[str, WorkspaceBounds] = {
@@ -29,6 +32,15 @@ WORKSPACE_BOUNDS: dict[str, WorkspaceBounds] = {
         max_y_m=cm_to_m(42.75),
         min_z_m=cm_to_m(-1.0),
         max_z_m=cm_to_m(75.0),
+        # Vertical mounts for the external cameras
+        excluded=(
+            VerticalCylinder(
+                x_m=cm_to_m(104), y_m=cm_to_m(37.75), radius_m=CAMERA_MOUNT_RADIUS_M, min_z_m=cm_to_m(-2), max_z_m=2.0
+            ),
+            VerticalCylinder(
+                x_m=cm_to_m(104), y_m=cm_to_m(-32.85), radius_m=CAMERA_MOUNT_RADIUS_M, min_z_m=cm_to_m(-2), max_z_m=2.0
+            ),
+        ),
     ),
 }
 

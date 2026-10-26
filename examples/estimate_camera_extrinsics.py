@@ -22,15 +22,16 @@ Notes:
     simulated pointclouds in the robot-base frame, a camera frustum at the estimated pose, and a
     plot of lowest population cost vs CMA-ES iteration.
 3. if --visualize-robot-masks is set, debug PNGs are written for the frame-0 SAM masks that enter the union.
-4. If --cache-robot-masks is set (default), each propagated mask is written as soon as it is computed to
-   `<h5_dir>/<h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
-    A later run loads a consecutive prefix of those files and resumes SAM from the last cached frame.
-    Frame 0's SAM 3 union may also be read from the older
-    `robot-mask__<camera>__idx=0__...npy` seed cache. After the last frame, a dimmed-mask video is written to
-    `robot-mask-propagated__<camera>__kmax=<k>__score_threshold=<t>.mp4`.
-    With --per-frame-robot-masks, masks are cached per frame as
-    `robot-mask-per-frame__<camera>__prompt=<p>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy` and only uncached
-    frames are segmented.
+4. If --cache-robot-masks is set (default), masks are cached under
+   `<h5_dir>/<h5_stem>/<filtering>/<propagated_mask|per_frame_mask>/<params>/`. <filtering> is `default`, or
+    `workspace_filtered__pad=<m>__bottompad=<m>__mountradius=<m>` with --workspace-id. <params> names the camera,
+    workspace, prior extrinsics and SAM settings. Each holds one bool mask per frame in `npy/`, a dimmed-mask overlay per frame in
+    `rgb/`, and `masks.mp4` of the overlays. Propagated masks are written as soon as they are computed; a later run
+    loads a consecutive prefix of them and resumes SAM from the last cached frame. With --per-frame-robot-masks only
+    uncached frames are segmented.
+    With --workspace-id, each frame is written to
+    `<filtering>/blacked_out_rgb/<camera>__<workspace>__<prior>/` as original RGB | depth | blacked-out RGB (SAM input)
+    (`rgb_depth/<frame>.png` and `rgb_depth.mp4`).
 
 
 The pseudo-code is as follows:
@@ -78,6 +79,7 @@ import numpy as np
 import tyro
 import yaml
 from jrl2.robots import NAME_TO_ROBOT, get_robot_by_name
+from termcolor import colored
 from transforms3d.quaternions import mat2quat
 
 from r2st.constants import MIN_DEPTH_M, get_color_intrinsics
@@ -91,6 +93,7 @@ from r2st.extrinsics import (
     build_real_pcd,
     compute_robot_masks,
     compute_workspace_masks,
+    depth_colormap,
     depth_reprojection_for,
     erode_mask,
     expand_demo_qpos_to_joint_names,
@@ -101,6 +104,7 @@ from r2st.extrinsics import (
     log_elapsed,
     look_at_opencv,
     mask_valid_depth_fraction,
+    optimization_frames_dir,
     optimize_extrinsics,
     transform_points,
     validate_seed_mode,
@@ -140,7 +144,7 @@ _CAPTURE_UP_WHEN_PARALLEL = np.array([1.0, 0.0, 0.0], dtype=np.float64)
 @dataclasses.dataclass
 class Args:
     h5_path: pathlib.Path
-    """Path to a merged sensor-data h5 file (see data/grail_xarm_july_2/merge_camera_streams.py)."""
+    """Path to a merged sensor-data h5 file (see data/demonstrations/grail_xarm_july_2/merge_camera_streams.py)."""
 
     robot_id: str
     """Jrl2 robot name, e.g. 'xarm7__gripper'. See the README `{robot}__{eef}` table."""
@@ -166,7 +170,7 @@ class Args:
     n_pcd_samples_real: int = 2048
     """Number of FPS points kept from each measured robot cloud."""
 
-    n_pcd_samples_sim: int = 2048
+    n_pcd_samples_sim: int = 4096
     """Number of FPS points kept from each fused 6-view sim robot cloud."""
 
     n_random_downsample_initial: int = 16384
@@ -234,17 +238,15 @@ class Args:
 
     workspace_id: str | None = None
     """Workspace bounds id from r2st.constants.WORKSPACE_BOUNDS (robot-base frame), e.g. 'vention-franka-table'. With
-    --workspace-prior-extrinsics, pixels whose depth lands outside these bounds (padded by 30 cm, 5 cm below) are blacked out
-    before SAM 3, and the SAM masks are cut to the workspace. Pixels without depth are kept. Masks are cached under
-    names that include the workspace id and the prior YAML."""
+    --workspace-prior-extrinsics, pixels whose depth lands outside these bounds (padded by WORKSPACE_PADDING_M,
+    WORKSPACE_BOTTOM_PADDING_M below) or that have no depth are blacked out before SAM 3, and the SAM masks are cut to
+    the workspace. Masks are cached under names that include the workspace id and the prior YAML."""
 
     workspace_prior_extrinsics: pathlib.Path | None = None
     """Approximate extrinsics YAML for --workspace-id, e.g. a previous run's --output-path for this camera."""
 
     cache_robot_masks: bool = True
-    """If set, load/save robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy,
-    or <h5_stem>/robot-mask-per-frame__<camera>__prompt=<p>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy with
-    --per-frame-robot-masks."""
+    """If set, load/save robot masks under <h5_stem>/.../<params>/npy/ (see note 4)."""
 
     mask_erode_px: int = 9
     """Erode the robot mask with an elliptical kernel of this size (pixels) before unprojecting. 0 skips erosion."""
@@ -270,24 +272,19 @@ class Args:
 
 
 def _save_sampled_frame_inputs(
-    h5_path: pathlib.Path,
+    frames_dir: pathlib.Path,
     camera: str,
     sample_idx: int,
     frame_idx: int,
     rgb: np.ndarray,
     depth_m: np.ndarray,
     mask: np.ndarray,
-) -> pathlib.Path:
-    """Write the RGB, depth (meters, .npy + colormap .png), and eroded mask overlay that a sampled frame unprojects.
-
-    Returns the output directory.
-    """
+) -> None:
+    """Write the RGB, depth (meters, .npy + colormap .png), and eroded mask overlay that a sampled frame unprojects."""
     assert rgb.ndim == 3 and rgb.shape[2] == 3, f"rgb must be HxWx3, got {rgb.shape}"
     assert depth_m.shape == rgb.shape[:2], f"depth {depth_m.shape} != rgb {rgb.shape[:2]}"
     assert mask.shape == rgb.shape[:2], f"mask {mask.shape} != rgb {rgb.shape[:2]}"
-    out_dir = h5_path.parent / h5_path.stem / "sampled_inputs"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = out_dir / f"{camera}__sample={sample_idx}__idx={frame_idx}"
+    prefix = frames_dir / f"{camera}__sample={sample_idx}__idx={frame_idx}"
     rgb_path = prefix.with_name(prefix.name + "__rgb.png")
     depth_npy_path = prefix.with_name(prefix.name + "__depth_m.npy")
     depth_png_path = prefix.with_name(prefix.name + "__depth.png")
@@ -295,16 +292,8 @@ def _save_sampled_frame_inputs(
     image_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     assert cv2.imwrite(str(rgb_path), image_bgr), f"Failed to write {rgb_path}"
     np.save(depth_npy_path, depth_m)
-    finite = np.isfinite(depth_m) & (depth_m > 0)
-    assert finite.any(), f"frame {frame_idx}: depth has no finite positive values"
-    depth_max = float(np.percentile(depth_m[finite], 99))
-    depth_u8 = np.zeros(depth_m.shape, dtype=np.uint8)
-    depth_u8[finite] = (255.0 * np.clip(depth_m[finite] / depth_max, 0.0, 1.0)).astype(np.uint8)
-    depth_color = cv2.applyColorMap(depth_u8, cv2.COLORMAP_TURBO)
-    depth_color[~finite] = 0
-    assert cv2.imwrite(str(depth_png_path), depth_color), f"Failed to write {depth_png_path}"
+    assert cv2.imwrite(str(depth_png_path), depth_colormap(depth_m)), f"Failed to write {depth_png_path}"
     assert cv2.imwrite(str(overlay_path), ImageUtils.demo_overlay(image_bgr, mask)), f"Failed to write {overlay_path}"
-    return out_dir
 
 
 def _axis_aligned_capture_poses(lookat: np.ndarray, distance_m: float) -> list[np.ndarray]:
@@ -548,7 +537,9 @@ def main(args: Args) -> None:
     workspace_masks, workspace_tag = compute_workspace_masks(
         args.workspace_id,
         args.workspace_prior_extrinsics,
+        args.h5_path,
         args.camera,
+        rgb_all,
         depth_raw_all,
         color_intrinsics,
         depth_reprojection,
@@ -613,6 +604,7 @@ def main(args: Args) -> None:
     ), f"depth_m_sel shape {depth_m_sel.shape} != ({args.n_timesteps}, {H}, {W})"
     masks_sel = masks_all[fps_idx]
     pcd_reals: list[np.ndarray] = []
+    frames_dir = optimization_frames_dir(args.h5_path)
     demo_frames: list[np.ndarray] = []
     for i, frame_idx in enumerate(fps_idx):
         frame_idx = int(frame_idx)
@@ -625,9 +617,7 @@ def main(args: Args) -> None:
             f"< {args.min_mask_valid_depth_frac}"
         )
         demo_frames.append(ImageUtils.demo_overlay(rgb_sel[i], mask))
-        inputs_dir = _save_sampled_frame_inputs(
-            args.h5_path, args.camera, i, frame_idx, rgb_sel[i], depth_m_sel[i], mask
-        )
+        _save_sampled_frame_inputs(frames_dir, args.camera, i, frame_idx, rgb_sel[i], depth_m_sel[i], mask)
         pts, (n_depth, n_unproj, n_inliers) = build_real_pcd(
             depth_m_sel[i],
             mask,
@@ -650,7 +640,7 @@ def main(args: Args) -> None:
             f"({valid_depth_frac[frame_idx]:.0%} valid depth) | points {n_depth} -> {n_unproj} within "
             f"{args.max_point_distance_m} m -> {n_inliers} radius inliers -> {pts.shape[0]} sampled"
         )
-    print(f"[info] Saved sampled-frame RGB / depth / mask images to {inputs_dir}")
+    print(f"[info] Saved sampled-frame RGB / depth / mask images to {colored(str(frames_dir), 'blue')}")
     assert len(demo_frames) == args.n_timesteps, f"demo_frames {len(demo_frames)} != n_timesteps {args.n_timesteps}"
     demo_sel = np.stack(demo_frames, axis=0)
 
@@ -720,7 +710,7 @@ def main(args: Args) -> None:
         "matrix": best_T.tolist(),
     }
     args.output_path.write_text(yaml.safe_dump(payload, sort_keys=False))
-    print(f"✅ Estimated camera extrinsics written to {args.output_path}")
+    print(f"✅ Estimated camera extrinsics written to {colored(str(args.output_path), 'blue')}")
     print(f"[info] cost={best_cost:.6f}")
     print(f"[info] translation={t}")
     print(f"[info] quaternion_wxyz={q_wxyz}")

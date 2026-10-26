@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -60,19 +60,46 @@ class CameraExtrinsics:
             self.matrix = np.ascontiguousarray(self.matrix)
 
 
+@dataclass(frozen=True)
+class VerticalCylinder:
+    """Vertical cylinder centered at `(x_m, y_m)` spanning `[min_z_m, max_z_m]`."""
+
+    x_m: float
+    y_m: float
+    radius_m: float
+    min_z_m: float
+    max_z_m: float
+
+    def __post_init__(self) -> None:
+        assert self.radius_m > 0.0, f"radius_m must be > 0, got {self.radius_m}"
+        assert self.min_z_m < self.max_z_m, f"min_z_m {self.min_z_m} must be < max_z_m {self.max_z_m}"
+
+    def contains(self, points: np.ndarray) -> np.ndarray:
+        """`(N,)` bool: which of the `(N, 3)` points lie inside the cylinder (inclusive)."""
+        assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
+        r_sq = (points[:, 0] - self.x_m) ** 2 + (points[:, 1] - self.y_m) ** 2
+        return (r_sq <= self.radius_m**2) & (points[:, 2] >= self.min_z_m) & (points[:, 2] <= self.max_z_m)
+
+
 @dataclass
 class WorkspaceBounds:
+    """Axis-aligned box minus `excluded` regions (e.g. camera mounts standing inside the box)."""
+
     min_x_m: float
     max_x_m: float
     min_y_m: float
     max_y_m: float
     min_z_m: float
     max_z_m: float
+    excluded: tuple[VerticalCylinder, ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
         assert self.min_x_m < self.max_x_m
         assert self.min_y_m < self.max_y_m
         assert self.min_z_m < self.max_z_m
+        assert all(
+            isinstance(c, VerticalCylinder) for c in self.excluded
+        ), f"excluded must hold VerticalCylinders, got {self.excluded}"
 
     @property
     def extents(self) -> tuple[float, float, float]:
@@ -87,7 +114,7 @@ class WorkspaceBounds:
         )
 
     def padded(self, margin_m: float) -> "WorkspaceBounds":
-        """These bounds grown by `margin_m` on every side."""
+        """These bounds grown by `margin_m` on every side. `excluded` regions are kept as is."""
         assert margin_m >= 0.0, f"margin_m must be >= 0, got {margin_m}"
         return WorkspaceBounds(
             min_x_m=self.min_x_m - margin_m,
@@ -96,14 +123,19 @@ class WorkspaceBounds:
             max_y_m=self.max_y_m + margin_m,
             min_z_m=self.min_z_m - margin_m,
             max_z_m=self.max_z_m + margin_m,
+            excluded=self.excluded,
         )
 
     def contains(self, points: np.ndarray) -> np.ndarray:
-        """`(N,)` bool: which of the `(N, 3)` points lie inside the bounds (inclusive)."""
+        """`(N,)` bool: which of the `(N, 3)` points lie inside the box (inclusive) and outside every `excluded`
+        region."""
         assert points.ndim == 2 and points.shape[1] == 3, f"points must be (N, 3), got {points.shape}"
         lo = np.array([self.min_x_m, self.min_y_m, self.min_z_m])
         hi = np.array([self.max_x_m, self.max_y_m, self.max_z_m])
-        return np.all((points >= lo) & (points <= hi), axis=1)
+        inside = np.all((points >= lo) & (points <= hi), axis=1)
+        for region in self.excluded:
+            inside &= ~region.contains(points)
+        return inside
 
 
 @dataclass

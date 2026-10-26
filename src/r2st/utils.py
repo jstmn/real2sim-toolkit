@@ -124,7 +124,7 @@ MERGED_CAMERA_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
 
 
 def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
-    """Assert `f` matches the merged sensor-data layout from `data/grail_xarm_july_2/merge_camera_streams.py`:
+    """Assert `f` matches the merged sensor-data layout from `data/demonstrations/grail_xarm_july_2/merge_camera_streams.py`:
     `obs/sensor_data/{camera}/[rgb, depth, timestamp_ms, rgb_timestamp_ms]`.
 
     `depth` is uint16 millimeters already aligned to `rgb` (same H×W, same rays).

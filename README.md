@@ -45,11 +45,8 @@ cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
 
 ### OPTIONAL
-# Download saved demonstrations (used by Examples 2, 4, and 5). You need to be logged into Google Cloud Platform to do this. Run `gcloud auth login` to do so.
-# data/grail_xarm_july_2/README.md describes that dataset.
-mkdir -p data/demonstrations
-gcloud storage cp --recursive gs://r2st-public/grail_xarm_july_2 data/
-gcloud storage cp gs://r2st-public/demonstrations/raise_cube_0_merged.h5 data/demonstrations/
+# Download saved demonstrations (~12 GB, used by Examples 2, 4, and 5). Requires the gcloud CLI (https://cloud.google.com/sdk/docs/install) and `gcloud auth login`
+gcloud storage cp --recursive gs://r2st-public/demonstrations data/
 ```
 
 ## Data format
@@ -71,8 +68,8 @@ Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of eve
 
 `<cam>` is the value you pass as `--camera` to the examples.
 
-`data/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this format
-(`data/grail_xarm_july_2/merge_camera_streams.py`).
+`data/demonstrations/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this format
+(`data/demonstrations/grail_xarm_july_2/merge_camera_streams.py`).
 
 ## Examples
 
@@ -91,7 +88,7 @@ SAM 3 segments the prompt on **frame 0** (union of the top `--sam-kmax` masks wh
 
 ```bash
 uv run python examples/generate_masks_across_trajectory.py \
-    --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --object-description "white robot arm"
 ```
@@ -108,7 +105,9 @@ uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base_
 
 ### Example 4: Estimate camera extrinsics and save results to a yaml file.
 
-This script runs the CMA-ES optimization procedure to estimate the extrinsics of a specified camera given RGBD images, joint angles, and the urdf of the robot (urdf from [Jrl2](https://github.com/jstmn/Jrl2)).
+translation=`[0.77785084, -0.49700028, 0.33626095]`
+
+quaternion_wxyz=`[0.37184729, -0.89248569, -0.22639716, 0.11808135]`
 
 Usage notes:
 
@@ -120,38 +119,38 @@ Usage notes:
 
 # Seed CMA-ES with the GUI.
 uv run python examples/estimate_camera_extrinsics.py \
-  --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
+  --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
   --seed-from-gui \
   --visualize \
   --visualize-robot-masks
 
 # You can also seed CMA-ES with a specific pose.
 uv run python examples/estimate_camera_extrinsics.py \
-  --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
+  --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 
 # You can also seed CMA-ES with a specific pose.
 uv run python examples/estimate_camera_extrinsics_rgb.py \
-  --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+  --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
   --n-timesteps 5 \
-  --output-path data/grail_xarm_july_2/extrinsics_cam_1__rgb.yaml \
+  --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1__rgb.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 ```
@@ -202,11 +201,11 @@ cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
 # Track the object in the camera optical frame.
 uv run python examples/track_object.py \
-    --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --camera-model-id d435 \
     --object-description "mustard bottle" \
-    --extrinsics-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
+    --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 
 uv run python examples/track_object.py \
@@ -214,7 +213,7 @@ uv run python examples/track_object.py \
     --camera camera_north \
     --camera-model-id d435 \
     --object-description "blue cube" \
-    --extrinsics-path data/grail_xarm_july_2/extrinsics_cam_1.yaml \
+    --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 ```
 
@@ -292,3 +291,5 @@ Error inside the container: `CUDA initialization: ... Error 804: forward compati
 `gcloud storage cp` fails with `Reauthentication failed`: run `gcloud auth login`.
 
 `docker build` fails with `docker-credential-pass: executable file not found in $PATH`: `credsStore` in `~/.docker/config.json` is `pass`, but the helper is not on `PATH`. Put `$HOME/.local/bin` on `PATH` (a literal `~/.local/bin` in PATH is not expanded) and retry.
+
+`estimate_camera_extrinsics*.py` fails with `AssertionError: SAM 3 propagation produced an empty mask`: propagation lost the robot partway through the demo. Pass `--per-frame-robot-masks` to segment each frame independently.

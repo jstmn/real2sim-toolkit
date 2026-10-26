@@ -1,3 +1,5 @@
+import pathlib
+
 import numpy as np
 import pytest
 from transforms3d.axangles import axangle2mat
@@ -8,22 +10,29 @@ from examples.estimate_camera_extrinsics import (
     _CAPTURE_DISTANCE_M,
     _axis_aligned_capture_poses,
 )
+from r2st.constants import CAMERA_MOUNT_RADIUS_M
 from r2st.extrinsics import (
     SEED_LOOKAT_TARGET,
     SEED_UP,
+    WORKSPACE_BOTTOM_PADDING_M,
+    WORKSPACE_PADDING_M,
     compute_propagated_robot_masks,
     expand_demo_qpos_to_joint_names,
     look_at_opencv,
     look_at_with_roll,
     n_consecutive_cached_masks,
+    per_frame_robot_mask_cache_path,
+    per_frame_robot_mask_video_path,
     pose_from_xyz_wxyz,
     propagate_robot_masks,
     propagated_robot_mask_cache_path,
     propagated_robot_mask_video_path,
     remove_radius_outliers,
+    robot_mask_overlay_path,
     step_pose_world,
     transform_points,
     validate_seed_mode,
+    workspace_filtered_rgb_dir,
     world_points_to_camera,
 )
 
@@ -319,23 +328,41 @@ def test_n_consecutive_cached_masks_stops_at_first_gap(tmp_path):
     assert n_consecutive_cached_masks([tmp_path / "missing.npy"]) == 0
 
 
+def test_robot_mask_cache_layout():
+    h5_path = pathlib.Path("/d/traj_0.h5")
+    prop = pathlib.Path("/d/traj_0/default/propagated_mask/cam_1__kmax=5__score_threshold=0.3")
+    npy = propagated_robot_mask_cache_path(h5_path, "cam_1", 42, 5, 0.3, None)
+    assert npy == prop / "npy/00042.npy"
+    assert robot_mask_overlay_path(npy) == prop / "rgb/00042.png"
+    assert propagated_robot_mask_video_path(h5_path, "cam_1", 5, 0.3, None) == prop / "masks.mp4"
+    per_frame = pathlib.Path(
+        f"/d/traj_0/workspace_filtered__pad={WORKSPACE_PADDING_M}__bottompad={WORKSPACE_BOTTOM_PADDING_M}"
+        f"__mountradius={CAMERA_MOUNT_RADIUS_M}"
+        "/per_frame_mask/cam_1__ws__prompt=robot_arm__kmax=5__score_threshold=0.3"
+    )
+    assert (
+        per_frame_robot_mask_cache_path(h5_path, "cam_1", "robot arm", 7, 5, 0.3, "ws") == per_frame / "npy/00007.npy"
+    )
+    assert per_frame_robot_mask_video_path(h5_path, "cam_1", "robot arm", 5, 0.3, "ws") == per_frame / "masks.mp4"
+    assert workspace_filtered_rgb_dir(h5_path, "cam_1", "ws") == per_frame.parent.parent / "blacked_out_rgb/cam_1__ws"
+
+
 def test_compute_propagated_robot_masks_loads_full_cache(tmp_path):
     n_frames, height, width = 3, 8, 10
     rgb = np.zeros((n_frames, height, width, 3), dtype=np.uint8)
     h5_path = tmp_path / "merged_sensor_data.h5"
-    cache_dir = tmp_path / "merged_sensor_data"
-    cache_dir.mkdir()
     expected = []
     for t in range(n_frames):
         mask = np.zeros((height, width), dtype=bool)
         mask[1:3, 1 + t : 4 + t] = True
         expected.append(mask)
         path = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None)
+        path.parent.mkdir(parents=True, exist_ok=True)
         np.save(path, mask)
     out = compute_propagated_robot_masks(rgb, h5_path, "cam_1", "robot arm", 5, 0.3, True, False, None)
     assert np.array_equal(out, np.stack(expected, axis=0))
     for t in range(n_frames):
-        overlay = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None).with_suffix(".demo.png")
+        overlay = robot_mask_overlay_path(propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None))
         assert overlay.is_file(), f"missing demo overlay {overlay}"
     video_path = propagated_robot_mask_video_path(h5_path, "cam_1", 5, 0.3, None)
     assert video_path.is_file(), f"missing robot-mask video {video_path}"
@@ -348,13 +375,14 @@ def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, mon
     n_frames, height, width = 3, 8, 10
     rgb = np.zeros((n_frames, height, width, 3), dtype=np.uint8)
     h5_path = tmp_path / "merged_sensor_data.h5"
-    (tmp_path / "merged_sensor_data").mkdir()
     cached = []
     for t in range(2):
         mask = np.zeros((height, width), dtype=bool)
         mask[1:3, 1 + t : 4 + t] = True
         cached.append(mask)
-        np.save(propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None), mask)
+        path = propagated_robot_mask_cache_path(h5_path, "cam_1", t, 5, 0.3, None)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.save(path, mask)
 
     fake = _FakePropagatePredictor()
     monkeypatch.setattr(ece, "load_sam3", lambda: fake)
@@ -370,7 +398,7 @@ def test_compute_propagated_robot_masks_resumes_from_partial_cache(tmp_path, mon
     assert np.array_equal(np.load(path2), expected2)
 
 
-def test_in_workspace_pixels_drops_points_outside_bounds_and_keeps_missing_depth():
+def test_in_workspace_pixels_drops_points_outside_bounds_and_missing_depth():
     from r2st.extrinsics import in_workspace_pixels
     from r2st.types import WorkspaceBounds
 
@@ -384,6 +412,8 @@ def test_in_workspace_pixels_drops_points_outside_bounds_and_keeps_missing_depth
     keep = in_workspace_pixels(depth_m, K, np.eye(4), bounds)
     expected = np.ones((3, 5), dtype=bool)
     expected[0, 0] = False
+    expected[2, 4] = False
+    expected[1, 2] = False
     assert np.array_equal(keep, expected)
 
 
@@ -393,7 +423,8 @@ def test_workspace_mask_tag_changes_with_prior_content(tmp_path):
     prior = tmp_path / "extrinsics_cam.yaml"
     prior.write_text("matrix: [1]\n")
     tag_a = workspace_mask_tag("vention-franka-table", prior)
-    assert tag_a.startswith("workspace=vention-franka-table-pad=0.3-bottompad=0.05__prior=extrinsics_cam-")
+    assert tag_a.startswith("workspace=vention-franka-table-")
+    assert "__prior=extrinsics_cam-" in tag_a
     prior.write_text("matrix: [2]\n")
     assert workspace_mask_tag("vention-franka-table", prior) != tag_a
 
@@ -422,3 +453,20 @@ def test_padded_workspace_bounds_pads_the_bottom_less():
     assert padded.min_z_m == bounds.min_z_m - WORKSPACE_BOTTOM_PADDING_M
     assert padded.max_z_m == bounds.max_z_m + WORKSPACE_PADDING_M
     assert padded.min_y_m == bounds.min_y_m - WORKSPACE_PADDING_M
+
+
+def test_frames_with_robot_mask_skips_empty_and_tiny_per_frame_masks():
+    from r2st.extrinsics import MIN_ROBOT_MASK_PIXELS, frames_with_robot_mask
+
+    masks = np.zeros((4, 40, 40), dtype=bool)
+    masks[0, :25, :25] = True  # 625 px
+    masks[2].flat[:MIN_ROBOT_MASK_PIXELS] = True  # tiny
+    masks[3, :30, :30] = True
+    has_mask, no_mask = frames_with_robot_mask(masks, per_frame_robot_masks=True)
+    assert has_mask.tolist() == [0, 3]
+    assert no_mask.tolist() == [1, 2]
+    with pytest.raises(AssertionError, match="Propagated robot mask is empty"):
+        frames_with_robot_mask(masks, per_frame_robot_masks=False)
+    masks[1, :25, :25] = True
+    with pytest.raises(AssertionError, match="lost tracking"):
+        frames_with_robot_mask(masks, per_frame_robot_masks=False)

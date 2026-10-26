@@ -29,17 +29,18 @@ Notes:
 2. If --visualize is set, a viser server is started. The server shows the robot model, a camera frustum at the
     estimated pose with the SAM vs sim mask overlay, and a plot of lowest population cost vs CMA-ES iteration.
 3. if --visualize-robot-masks is set, debug PNGs are written for the frame-0 SAM masks that enter the union.
-4. If --cache-robot-masks is set (default), each propagated mask is written as soon as it is computed to
-   `<h5_dir>/<h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy`.
-    A later run loads a consecutive prefix of those files and resumes SAM from the last cached frame.
-    Frame 0's SAM 3 union may also be read from the older
-    `robot-mask__<camera>__idx=0__...npy` seed cache. After the last frame, a dimmed-mask video is written to
-    `robot-mask-propagated__<camera>__kmax=<k>__score_threshold=<t>.mp4`.
-    With --per-frame-robot-masks, masks are cached per frame as
-    `robot-mask-per-frame__<camera>__prompt=<p>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy` and only uncached
-    frames are segmented.
+4. If --cache-robot-masks is set (default), masks are cached under
+   `<h5_dir>/<h5_stem>/<filtering>/<propagated_mask|per_frame_mask>/<params>/`. <filtering> is `default`, or
+    `workspace_filtered__pad=<m>__bottompad=<m>__mountradius=<m>` with --workspace-id. <params> names the camera,
+    workspace, prior extrinsics and SAM settings. Each holds one bool mask per frame in `npy/`, a dimmed-mask overlay per frame in
+    `rgb/`, and `masks.mp4` of the overlays. Propagated masks are written as soon as they are computed; a later run
+    loads a consecutive prefix of them and resumes SAM from the last cached frame. With --per-frame-robot-masks only
+    uncached frames are segmented.
+    With --workspace-id, each frame is written to
+    `<filtering>/blacked_out_rgb/<camera>__<workspace>__<prior>/` as original RGB | depth | blacked-out RGB (SAM input)
+    (`rgb_depth/<frame>.png` and `rgb_depth.mp4`).
 5. After optimization, a SAM vs sim overlay at the estimated pose is written for every sampled frame to
-    `<h5_dir>/<h5_stem>/sampled_inputs/`.
+    `<h5_dir>/<h5_stem>/optimization_intermediate_frames/<day_month_year__hour_min_sec>/`.
 
 
 The pseudo-code is as follows:
@@ -84,6 +85,7 @@ import numpy as np
 import tyro
 import yaml
 from jrl2.robots import NAME_TO_ROBOT, get_robot_by_name
+from termcolor import colored
 from transforms3d.quaternions import mat2quat
 
 from r2st.constants import MIN_DEPTH_M, get_color_intrinsics
@@ -102,6 +104,7 @@ from r2st.extrinsics import (
     index_ranges_text,
     load_demo,
     log_elapsed,
+    optimization_frames_dir,
     optimize_extrinsics,
     validate_seed_mode,
 )
@@ -124,7 +127,7 @@ _OVERLAY_BOTH_RGB = np.array([40.0, 220.0, 90.0], dtype=np.float32)
 @dataclasses.dataclass
 class Args:
     h5_path: pathlib.Path
-    """Path to a merged sensor-data h5 file (see data/grail_xarm_july_2/merge_camera_streams.py)."""
+    """Path to a merged sensor-data h5 file (see data/demonstrations/grail_xarm_july_2/merge_camera_streams.py)."""
 
     robot_id: str
     """Jrl2 robot name, e.g. 'xarm7__gripper'. See the README `{robot}__{eef}` table."""
@@ -210,17 +213,15 @@ class Args:
 
     workspace_id: str | None = None
     """Workspace bounds id from r2st.constants.WORKSPACE_BOUNDS (robot-base frame), e.g. 'vention-franka-table'. With
-    --workspace-prior-extrinsics, pixels whose depth lands outside these bounds (padded by 30 cm, 5 cm below) are blacked out
-    before SAM 3, and the SAM masks are cut to the workspace. Pixels without depth are kept. Masks are cached under
-    names that include the workspace id and the prior YAML."""
+    --workspace-prior-extrinsics, pixels whose depth lands outside these bounds (padded by WORKSPACE_PADDING_M,
+    WORKSPACE_BOTTOM_PADDING_M below) or that have no depth are blacked out before SAM 3, and the SAM masks are cut to
+    the workspace. Masks are cached under names that include the workspace id and the prior YAML."""
 
     workspace_prior_extrinsics: pathlib.Path | None = None
     """Approximate extrinsics YAML for --workspace-id, e.g. a previous run's --output-path for this camera."""
 
     cache_robot_masks: bool = True
-    """If set, load/save robot masks as <h5_stem>/robot-mask-propagated__<camera>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy,
-    or <h5_stem>/robot-mask-per-frame__<camera>__prompt=<p>__idx=<frame>__kmax=<k>__score_threshold=<t>.npy with
-    --per-frame-robot-masks."""
+    """If set, load/save robot masks under <h5_stem>/.../<params>/npy/ (see note 4)."""
 
     min_sam_mask_pixels: int = 2500
     """Only sample frames whose SAM robot mask (before erosion) has more than this many pixels (2500 = 50x50). Small
@@ -272,36 +273,31 @@ def _mask_comparison_overlay(rgb: np.ndarray, sam_mask: np.ndarray, sim_mask: np
     return np.clip(out, 0.0, 255.0).astype(np.uint8)
 
 
-def _sampled_frame_prefix(h5_path: pathlib.Path, camera: str, sample_idx: int, frame_idx: int) -> pathlib.Path:
-    return h5_path.parent / h5_path.stem / "sampled_inputs" / f"{camera}__sample={sample_idx}__idx={frame_idx}"
+def _sampled_frame_prefix(frames_dir: pathlib.Path, camera: str, sample_idx: int, frame_idx: int) -> pathlib.Path:
+    return frames_dir / f"{camera}__sample={sample_idx}__idx={frame_idx}"
 
 
 def _save_sampled_frame_inputs(
-    h5_path: pathlib.Path,
+    frames_dir: pathlib.Path,
     camera: str,
     sample_idx: int,
     frame_idx: int,
     rgb: np.ndarray,
     mask: np.ndarray,
-) -> pathlib.Path:
-    """Write the RGB and eroded SAM mask overlay that a sampled frame contributes to the cost.
-
-    Returns the output directory.
-    """
+) -> None:
+    """Write the RGB and eroded SAM mask overlay that a sampled frame contributes to the cost."""
     assert rgb.ndim == 3 and rgb.shape[2] == 3, f"rgb must be HxWx3, got {rgb.shape}"
     assert mask.shape == rgb.shape[:2], f"mask {mask.shape} != rgb {rgb.shape[:2]}"
-    prefix = _sampled_frame_prefix(h5_path, camera, sample_idx, frame_idx)
-    prefix.parent.mkdir(parents=True, exist_ok=True)
+    prefix = _sampled_frame_prefix(frames_dir, camera, sample_idx, frame_idx)
     rgb_path = prefix.with_name(prefix.name + "__rgb.png")
     overlay_path = prefix.with_name(prefix.name + "__mask_overlay.png")
     image_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
     assert cv2.imwrite(str(rgb_path), image_bgr), f"Failed to write {rgb_path}"
     assert cv2.imwrite(str(overlay_path), ImageUtils.demo_overlay(image_bgr, mask)), f"Failed to write {overlay_path}"
-    return prefix.parent
 
 
 def _save_best_pose_overlays(
-    h5_path: pathlib.Path,
+    frames_dir: pathlib.Path,
     camera: str,
     fps_idx: np.ndarray,
     rgb_sel: np.ndarray,
@@ -314,11 +310,13 @@ def _save_best_pose_overlays(
         f"rgb_sel {rgb_sel.shape[0]} must match"
     )
     for i, frame_idx in enumerate(fps_idx):
-        prefix = _sampled_frame_prefix(h5_path, camera, i, int(frame_idx))
+        prefix = _sampled_frame_prefix(frames_dir, camera, i, int(frame_idx))
         path = prefix.with_name(prefix.name + "__best_pose_sam_vs_sim.png")
         overlay = _mask_comparison_overlay(rgb_sel[i], sam_masks[i], sim_masks[i])
         assert cv2.imwrite(str(path), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)), f"Failed to write {path}"
-    print(f"[info] Saved best-pose SAM (red: outside sim) vs sim (blue) overlays to {path.parent}")
+    print(
+        f"[info] Saved best-pose SAM (red: outside sim) vs sim (blue) overlays to {colored(str(path.parent), 'blue')}"
+    )
 
 
 def _distance_to_mask(mask: np.ndarray) -> np.ndarray:
@@ -555,7 +553,9 @@ def main(args: Args) -> None:
     workspace_masks, workspace_tag = compute_workspace_masks(
         args.workspace_id,
         args.workspace_prior_extrinsics,
+        args.h5_path,
         args.camera,
+        rgb_all,
         depth_raw_all,
         color_intrinsics,
         depth_reprojection,
@@ -595,6 +595,7 @@ def main(args: Args) -> None:
 
     rgb_sel = rgb_all[fps_idx]
     qpos_sel = qpos_all[fps_idx]
+    frames_dir = optimization_frames_dir(args.h5_path)
     sam_masks: list[np.ndarray] = []
     for i, frame_idx in enumerate(fps_idx):
         frame_idx = int(frame_idx)
@@ -602,9 +603,9 @@ def main(args: Args) -> None:
         n_mask = int(mask.sum())
         mask = erode_mask(mask, args.mask_erode_px)
         sam_masks.append(mask)
-        inputs_dir = _save_sampled_frame_inputs(args.h5_path, args.camera, i, frame_idx, rgb_sel[i], mask)
+        _save_sampled_frame_inputs(frames_dir, args.camera, i, frame_idx, rgb_sel[i], mask)
         print(f"[info] sam_mask[{i}] frame {frame_idx}: {n_mask} -> {int(mask.sum())} px eroded")
-    print(f"[info] Saved sampled-frame RGB / mask images to {inputs_dir}")
+    print(f"[info] Saved sampled-frame RGB / mask images to {colored(str(frames_dir), 'blue')}")
 
     print(f"[info] Loading Jrl2 robot '{args.robot_id}' ...")
     t0 = time.perf_counter()
@@ -653,7 +654,7 @@ def main(args: Args) -> None:
         args.cma_early_stop_patience,
         vis,
     )
-    _save_best_pose_overlays(args.h5_path, args.camera, fps_idx, rgb_sel, sam_masks, best_sim_masks)
+    _save_best_pose_overlays(frames_dir, args.camera, fps_idx, rgb_sel, sam_masks, best_sim_masks)
     t, q_wxyz = best_T[:3, 3], mat2quat(best_T[:3, :3])
     payload = {
         "camera": args.camera,
@@ -676,7 +677,7 @@ def main(args: Args) -> None:
         "matrix": best_T.tolist(),
     }
     args.output_path.write_text(yaml.safe_dump(payload, sort_keys=False))
-    print(f"✅ Estimated camera extrinsics written to {args.output_path}")
+    print(f"✅ Estimated camera extrinsics written to {colored(str(args.output_path), 'blue')}")
     print(f"[info] cost={best_cost:.4f} px")
     print(f"[info] translation={t}")
     print(f"[info] quaternion_wxyz={q_wxyz}")

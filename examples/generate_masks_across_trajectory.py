@@ -14,7 +14,7 @@ from r2st.utils import H264VideoWriter, ImageUtils, validate_merged_camera_group
 """
 # Example usage:
 uv run python examples/generate_masks_across_trajectory.py \
-    --h5-path data/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
     --camera cam_1 \
     --object-description "robot arm"
 """

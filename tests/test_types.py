@@ -8,6 +8,7 @@ from r2st.types import (
     CameraIntrinsics,
     ObjectAssets,
     ObjectPose,
+    VerticalCylinder,
     WorkspaceBounds,
 )
 
@@ -99,3 +100,19 @@ class TestObjectPose:
                 mesh_path=Path("m"),
                 mask=np.zeros((2, 2), dtype=bool),
             )
+
+
+def test_workspace_bounds_excludes_vertical_cylinders():
+    mount = VerticalCylinder(x_m=1.0, y_m=0.0, radius_m=0.1, min_z_m=-0.02, max_z_m=2.0)
+    wb = WorkspaceBounds(min_x_m=0, max_x_m=1, min_y_m=-1, max_y_m=1, min_z_m=0, max_z_m=1, excluded=(mount,))
+    pts = np.array(
+        [
+            [0.5, 0.0, 0.5],  # inside the box, away from the mount
+            [0.95, 0.0, 0.5],  # inside the mount
+            [0.85, 0.0, 0.5],  # inside the box, just outside the mount radius
+            [1.3, 0.0, 0.5],  # outside the box, inside the padded box, outside the mount
+        ]
+    )
+    assert wb.contains(pts).tolist() == [True, False, True, False]
+    assert wb.padded(0.5).contains(pts).tolist() == [True, False, True, True]
+    assert wb.padded(0.5).excluded == (mount,)
