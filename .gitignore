@@ -27,3 +27,5 @@ src/r2st/models/sam2.1_hiera_large.pt
 
 notes
 notes.sh
+# S2M2 checkpoints (download from https://huggingface.co/minimok/s2m2)
+src/r2st/S2M2/weights/

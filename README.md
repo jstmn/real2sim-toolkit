@@ -31,6 +31,9 @@ uv run hf auth login
 
 # REQUIRED: Get sam3 access at https://huggingface.co/facebook/sam3
 
+# S2M2 stereo depth checkpoints (S/M/L/XL = CH128NTR1/CH192NTR2/CH256NTR3/CH384NTR3)
+uv run hf download minimok/s2m2 CH256NTR3.pth --local-dir src/r2st/S2M2/weights/pretrain_weights
+
 # Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
 # current-gen GPUs (e.g. RTX 50-series/Blackwell). That covers GPU *architectures* back through
@@ -118,20 +121,20 @@ Usage notes:
 ```bash
 
 # Seed CMA-ES with the GUI.
-uv run python examples/estimate_camera_extrinsics.py \
+uv run python examples/estimate_camera_extrinsics_rgb.py \
   --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
-  --n-timesteps 5 \
+  --n-timesteps 10 \
   --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
   --seed-from-gui \
   --visualize \
   --visualize-robot-masks
 
 # You can also seed CMA-ES with a specific pose.
-uv run python examples/estimate_camera_extrinsics.py \
+uv run python examples/estimate_camera_extrinsics_rgb.py \
   --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
@@ -142,15 +145,17 @@ uv run python examples/estimate_camera_extrinsics.py \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 
-# You can also seed CMA-ES with a specific pose.
+
+# Dataset 2
 uv run python examples/estimate_camera_extrinsics_rgb.py \
-  --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-  --robot-id xarm7__gripper \
-  --camera cam_1 \
-  --camera-model-id d435 \
+  --h5-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__12-54-56/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed2i \
+  --camera-model-id zed2i_vga \
   --depth-intrinsics-source rgb \
-  --n-timesteps 5 \
-  --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1__rgb.yaml \
+  --n-timesteps 20 \
+  --per-frame-robot-masks \
+  --output-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__12-54-56/extrinsics_zed2i.rgb.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 ```
@@ -187,7 +192,7 @@ so contact with an object does not expand the robot mask.
 
 ### Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
 
-demonstration, then track that object through the demonstration:**
+demonstration, then track that object through the demonstration:
 Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
@@ -196,7 +201,7 @@ FoundationPose returns object pose in the camera optical frame. Pass `--extrinsi
 ![FoundationPose mustard bottle tracking](media/mustard_bottle__track.foundationpose.gif)
 
 ```bash
-# Start the server: `cd src/r2st/FoundationPose/docker; bash run_container.sh` (you may need sudo for run_container.sh), then in the container:
+# Start the server: `cd src/r2st/FoundationPose/docker; sudo bash run_container.sh`, then in the container:
 cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
 # Track the object in the camera optical frame.
@@ -208,12 +213,13 @@ uv run python examples/track_object.py \
     --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 
+# Dataset 2
 uv run python examples/track_object.py \
-    --h5-path data/demonstrations/raise_cube_0_merged.h5 \
-    --camera camera_north \
-    --camera-model-id d435 \
-    --object-description "blue cube" \
-    --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__12-56-36/traj_0__VGA.h5 \
+    --camera zed2i \
+    --camera-model-id zed2i_vga \
+    --object-description "red cube" \
+    --extrinsics-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__12-54-56/extrinsics_zed2i.rgb.yaml \
     --visualize
 ```
 
@@ -265,10 +271,27 @@ Use grpcio-tools 1.68.1, not this repo's newer `grpcio-tools` dev dependency. Mp
 pins `protobuf<6` (protobuf 5.29 / grpcio 1.82), and protobuf refuses to load stubs whose gencode is newer than its
 runtime. Stubs from 1.68.1 (protobuf 5.28 gencode) load under both that env and this one.
 
+## Stereo depth (S2M2)
+
+`r2st.stereo_depth.S2M2StereoDepth` runs [S2M2](https://github.com/junhong-3dv/s2m2) on a rectified stereo pair
+(vertical disparity < 2 px). The S2M2 package is vendored at `src/r2st/S2M2` and runs in the `uv` venv (no Docker, no
+pip install).
+
+```python
+from r2st.stereo_depth import S2M2StereoDepth
+
+stereo = S2M2StereoDepth("L", refine_iter=3, allow_negative=False, device="cuda")
+result = stereo.predict(left_rgb, right_rgb)  # disparity_px, occlusion, confidence; (H, W) float32
+depth_m = stereo.depth_m(left_rgb, right_rgb, fx=K[0, 0], baseline_m=baseline_m)  # 0 where disparity <= 0
+```
+
+At 672x376 on an RTX 5090, `S` takes about 24 ms per pair and `L` about 54 ms (fp16, no `torch.compile`).
+
 ## Third party models used
 
 * [SAM 3](https://github.com/jstmn/sam3) (fork of [facebookresearch/sam3](https://github.com/facebookresearch/sam3))
 * [FoundationPose](https://github.com/OpenGVLab/FoundationPose)
+* [S2M2](https://github.com/junhong-3dv/s2m2) — learned stereo matching, vendored at `src/r2st/S2M2` (CC BY-NC 4.0, non-commercial only)
 * [Cutie](https://github.com/hkchengrex/Cutie) — 2D tracker used by default (`FoundationPoseTracker(use_2d_tracker=True)`) to
   re-anchor FoundationPose's translation each frame, with a 6-DoF Kalman filter (`use_kalman_filter=True`)
   fusing that measurement (ported from
