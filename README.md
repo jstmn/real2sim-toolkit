@@ -50,6 +50,7 @@ cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 ### OPTIONAL
 # Download saved demonstrations (~12 GB, used by Examples 2, 4, and 5). Requires the gcloud CLI (https://cloud.google.com/sdk/docs/install) and `gcloud auth login`
 gcloud storage cp --recursive gs://r2st-public/demonstrations data/
+gcloud storage cp --recursive gs://r2st-public/meshyai data/
 ```
 
 ## Data format
