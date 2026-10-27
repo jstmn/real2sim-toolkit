@@ -129,15 +129,17 @@ class MeshyAPI:
     def image_to_3d(
         self,
         image_paths: Sequence[str | Path],
-        output_dir: str | Path,
+        glb_path: str | Path,
         enable_pbr: bool = True,
-    ) -> str:
+    ) -> Path:
+        """Run Meshy multi-image-to-3d on `image_paths` and download the GLB to `glb_path`."""
         image_paths = [Path(p) for p in image_paths]
         assert len(image_paths) > 0, "image_paths must not be empty"
-        output_dir = Path(output_dir)
+        glb_path = Path(glb_path)
+        assert glb_path.suffix == ".glb", f"glb_path must end in .glb, got {glb_path}"
         for image_path in image_paths:
             assert image_path.is_file(), f"Image file '{image_path}' not found"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        glb_path.parent.mkdir(parents=True, exist_ok=True)
         image_urls = [_image_path_to_data_uri(image_path) for image_path in image_paths]
         task_id = self._create_task(image_urls, enable_pbr=enable_pbr)
         print(f"[info] Created Meshy image-to-3d task: {task_id}")
@@ -147,8 +149,7 @@ class MeshyAPI:
         glb_url = model_urls.get("glb")
         assert isinstance(glb_url, str) and len(glb_url) > 0, f"Meshy task missing glb URL: {model_urls}"
 
-        glb_path = output_dir / "model_glb.glb"
         self._download_glb(glb_url, glb_path)
         assert glb_path.is_file() and glb_path.stat().st_size > 0, f"Failed to write GLB to {glb_path}"
         print(f"[info] Saved Meshy GLB to {glb_path} ({glb_path.stat().st_size} bytes)")
-        return str(glb_path)
+        return glb_path

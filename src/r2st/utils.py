@@ -122,6 +122,9 @@ def farthest_point_sample_pyg_lib(
 
 MERGED_CAMERA_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
 
+# Masked crops smaller than this on either side give Meshy too little detail to reconstruct from
+MESHY_MIN_IMAGE_SIDE_PX = 100
+
 
 def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
     """Assert `f` matches the merged sensor-data layout from `data/demonstrations/grail_xarm_july_2/merge_camera_streams.py`:
@@ -325,26 +328,40 @@ class MeshUtils:
     @staticmethod
     def generate_with_meshy(
         image_paths: Sequence[str | Path],
-        output_dir: str | Path,
+        glb_path: str | Path,
         *,
         enable_pbr: bool = True,
     ) -> Path:
-        """Generate a GLB via Meshy from one or more images. Reuses `output_dir/model_glb.glb` if present."""
+        """Generate a GLB via Meshy from one or more images and save it to `glb_path`. Reuses `glb_path` if it
+        already exists."""
         from r2st.meshy import MESHY_API_KEY, MeshyAPI
+
+        from PIL import Image
+        from termcolor import colored
 
         image_paths = [Path(p) for p in image_paths]
         assert len(image_paths) > 0, "image_paths must not be empty"
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        existing = output_dir / "model_glb.glb"
-        if existing.is_file():
-            print(f"[info] Reusing existing Meshy GLB at {existing}")
-            return existing
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                width, height = image.size
+            if width < MESHY_MIN_IMAGE_SIDE_PX or height < MESHY_MIN_IMAGE_SIDE_PX:
+                print(
+                    colored(
+                        f"[warning] {image_path} is {width}x{height}, under "
+                        f"{MESHY_MIN_IMAGE_SIDE_PX}x{MESHY_MIN_IMAGE_SIDE_PX}. Meshy is likely to produce a terrible mesh "
+                        "from an image this low-resolution.",
+                        "yellow",
+                    )
+                )
+        glb_path = Path(glb_path)
+        if glb_path.is_file():
+            print(f"[info] Reusing existing Meshy GLB at {glb_path}")
+            return glb_path
         assert MESHY_API_KEY is not None and len(MESHY_API_KEY) > 0, "MESHY_API_KEY is not set"
         api = MeshyAPI(MESHY_API_KEY)
-        result_path = Path(api.image_to_3d(image_paths=image_paths, output_dir=output_dir, enable_pbr=enable_pbr))
-        assert result_path.is_file(), f"MeshyAPI did not create result at {result_path}"
-        return result_path
+        result_path = api.image_to_3d(image_paths=image_paths, glb_path=glb_path, enable_pbr=enable_pbr)
+        assert result_path == glb_path, f"MeshyAPI wrote {result_path}, expected {glb_path}"
+        return glb_path
 
     @staticmethod
     def _pose_mat_to_wxyz_position(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

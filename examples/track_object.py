@@ -1,6 +1,5 @@
 import dataclasses
 import pathlib
-import shutil
 import time
 
 import cv2
@@ -188,23 +187,21 @@ def main(args: Args) -> None:
     _log_elapsed(f"Mask pixels: {int(mask.sum())} / {mask.size}", t0)
 
     object_slug = args.object_description.replace(" ", "_")
-    asset_dir = args.output_dir / f"{args.camera}__{object_slug}"
+    asset_dir = args.output_dir / f"{object_slug}__{args.camera}"
     asset_dir.mkdir(parents=True, exist_ok=True)
     masked_cropped_path = ImageUtils.save_masked_debug(image_bgr0, mask, asset_dir, object_slug)
 
-    print("[info] Generating mesh with Meshy (reuses existing model_glb.glb if present) ...")
-    glb_path = asset_dir / f"{object_slug}_glb.glb"
-    meshy_result = MeshUtils.generate_with_meshy([masked_cropped_path], asset_dir)
-    assert meshy_result.exists(), f"Mesh file not created at {meshy_result}"
-    if meshy_result.resolve() != glb_path.resolve():
-        shutil.copy2(str(meshy_result), str(glb_path))
+    # Same path examples/generate_mesh.py writes for this object and --camera-name, so its mesh is reused
+    glb_path = asset_dir / f"{object_slug}.unscaled.glb"
+    print(f"[info] Generating mesh with Meshy (reuses {glb_path} if present) ...")
+    glb_path = MeshUtils.generate_with_meshy([masked_cropped_path], glb_path)
     assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
     print(f"[info] Mesh: {glb_path.resolve()} ({glb_path.stat().st_size} bytes)")
 
     print("[info] Scaling mesh to masked RealSense point cloud (PCA) ...")
     t0 = time.perf_counter()
     object_pts = masked_depth_to_points(depth0, mask, K)
-    scaled_glb_path = asset_dir / f"{object_slug}_glb_scaled.glb"
+    scaled_glb_path = asset_dir / f"{object_slug}.scaled.glb"
     scaled_glb_path, scale = scale_glb_to_pointcloud(glb_path, object_pts, scaled_glb_path)
     mesh_path_abs = str(scaled_glb_path.resolve())
     _log_elapsed(

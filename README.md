@@ -96,25 +96,21 @@ uv run python examples/generate_masks_across_trajectory.py \
     --object-description "white robot arm"
 ```
 
-### Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
+### Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser
 
-Exactly one of `--object-description` or `--object-description-from-vlm` is required.
+Exactly one of `--object-description` or `--object-description-from-vlm` is required. Note that generated mesh Isn't scaled to match the object that was observed in the real world. Scaling Is performed In track_object.py
 
 ```bash
 # OpenAI returns "red T block" for red_T_block_1.png; SAM 3 returns no mask for that, but does for "red block".
-uv run python examples/generate_mesh.py --images data/red_T_block_1.png --object-description "red block" --visualize
-uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --object-description-from-vlm --visualize
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png --camera-name unknown --object-description "red block" --visualize
+uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --camera-name camera_base --object-description-from-vlm --visualize
+# Frame 0 of zed2i in Oct26_2026_datacollect/PickCube__10-26-2026__12-56-36/traj_0__VGA.h5
+uv run python examples/generate_mesh.py --images data/PickCube_0__zed2i__t=0.rgb.png --camera-name zed2i --object-description "red cube" --visualize
 ```
 
 ### Example 4: Estimate camera extrinsics and save results to a yaml file.
 
-translation=`[0.77785084, -0.49700028, 0.33626095]`
-
-quaternion_wxyz=`[0.37184729, -0.89248569, -0.22639716, 0.11808135]`
-
-Usage notes:
-
-* The primary cause of a bad optimization result is the existence of points in the robot pointcloud that are not in fact on the robot. This can happen when the robot mask is too large, in which case points from the background are included in the pointcloud. The loss function has a squared error on distance to the simulated pointcloud, so such a point will have a large influence on the optimization result. The first way to handle this is to ensure that frame isn't included: `--ignore-timesteps <bad frame index>`. A second approach is to reduce the maximum allowed point distance: `--max-point-distance-m 1.3` such that these points are filtered out.
+This script estimates the extrinsics matrix of the specified camera using a gradient free free optimization procedure. A seed matrix is generated manually, with a specific value, or with a search procedure.
 
 ![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
 
@@ -190,10 +186,9 @@ Robot masks: SAM 3 runs on **frame 0** (union of the top `--sam-kmax` masks). Th
 propagated through the rest of the trajectory with SAM 3 `mask_input` plus the previous mask's bbox,
 so contact with an object does not expand the robot mask.
 
-### Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
+### Example 5: Track an object with FoundationPose++
 
-demonstration, then track that object through the demonstration:
-Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
+Track an object through the demonstration. Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
 FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-path` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.

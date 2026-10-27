@@ -1,6 +1,5 @@
 import dataclasses
 import pathlib
-import shutil
 
 import cv2
 import tyro
@@ -27,6 +26,10 @@ class Args:
     images: list[pathlib.Path]
     """Paths to input images (JPG/PNG) of the object, e.g. from different camera views. Meshy's
     multi-image-to-3d endpoint accepts 1-4 images."""
+
+    camera_name: str
+    """Camera the images came from, e.g. 'zed2i'. Outputs go to <output_dir>/<object>__<camera_name>/, the same
+    directory examples/track_object.py uses for that object and --camera, so the unscaled mesh is shared."""
 
     output_dir: pathlib.Path = pathlib.Path("data/meshyai")
     """Directory to save generated mesh assets."""
@@ -89,6 +92,7 @@ def main(args: Args) -> None:
     assert n_desc_modes == 1, "exactly one of --object-description or --object-description-from-vlm is required"
     if args.object_description is not None:
         assert len(args.object_description) > 0, "object_description must not be empty"
+    assert len(args.camera_name) > 0, "camera_name must not be empty"
 
     predictor = SAM3Predictor()
     loaded = [_load_camera_image(image_path, predictor, args.object_description) for image_path in args.images]
@@ -96,7 +100,7 @@ def main(args: Args) -> None:
     target = loaded[0][1]
     object_assets = ObjectAssets(object_name=target, camera_images=camera_images)
     target_slug = target.replace(" ", "_")
-    asset_dir = args.output_dir / target_slug
+    asset_dir = args.output_dir / f"{target_slug}__{args.camera_name}"
     asset_dir.mkdir(parents=True, exist_ok=True)
 
     masked_cropped_paths = [
@@ -104,12 +108,8 @@ def main(args: Args) -> None:
         for ci in camera_images
     ]
 
-    glb_path = asset_dir / f"{target_slug}_glb.glb"
-    meshy_result = MeshUtils.generate_with_meshy(masked_cropped_paths, asset_dir)
-    assert meshy_result.exists(), f"Mesh file not created at {meshy_result}"
-    if meshy_result != glb_path:
-        shutil.copy2(str(meshy_result), str(glb_path))
-    assert glb_path.exists(), f"Mesh file not created at {glb_path}"
+    glb_path = MeshUtils.generate_with_meshy(masked_cropped_paths, asset_dir / f"{target_slug}.unscaled.glb")
+    assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
     object_assets.glb_filepath = glb_path
     print("✅ Mesh generated successfully!")
     print(f"Target: {target}")
