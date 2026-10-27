@@ -213,7 +213,7 @@ assert DEPTH_INTRINSICS.keys() == DEPTH_TO_COLOR_TRANSLATION.keys(), (
 # Distance between the rectified left and right cameras of a stereo pair, in meters, for stereo depth
 # (depth = fx * baseline / disparity). The baseline does not depend on the streaming resolution. Values are the ZED
 # SDK's factory calibration, `Baseline` (mm) under [STEREO] in /usr/local/zed/settings/SN<serial>.conf. They match the
-# `<cam>_camera_info_right.json` that panda_utils saves next to stereo recordings, whose `p[3]` is -fx * baseline.
+# `<cam>_camera_info_right_rgb.json` saved next to stereo recordings, whose `p[3]` is -fx * baseline.
 STEREO_BASELINE_M: dict[str, float] = {
     # ZED, serial 18838
     "zed_vga": 0.120,

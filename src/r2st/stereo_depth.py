@@ -133,6 +133,19 @@ class S2M2StereoDepth:
         """``(H, W)`` float32 depth in meters on the left image's grid; 0 where disparity is not positive."""
         return disparity_to_depth_m(self.predict(left_rgb, right_rgb).disparity_px, fx, baseline_m)
 
+    def depth_m_sequence(
+        self, left_rgb: np.ndarray, right_rgb: np.ndarray, fx: float, baseline_m: float, desc: str
+    ) -> np.ndarray:
+        """``depth_m`` for every frame of ``(T, H, W, 3)`` uint8 left/right sequences → ``(T, H, W)`` float32."""
+        from tqdm import tqdm
+
+        assert left_rgb.ndim == 4, f"left_rgb must be TxHxWx3, got {left_rgb.shape}"
+        assert left_rgb.shape == right_rgb.shape, f"left_rgb {left_rgb.shape} != right_rgb {right_rgb.shape}"
+        depth = np.zeros(left_rgb.shape[:3], dtype=np.float32)
+        for t in tqdm(range(len(left_rgb)), desc=desc):
+            depth[t] = self.depth_m(left_rgb[t], right_rgb[t], fx, baseline_m)
+        return depth
+
 
 def disparity_to_depth_m(disparity_px: np.ndarray, fx: float, baseline_m: float) -> np.ndarray:
     """``depth = fx * baseline / disparity``. Pixels with disparity <= 0 get depth 0 (no return), matching the h5

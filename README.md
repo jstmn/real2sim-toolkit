@@ -49,8 +49,8 @@ cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
 ### OPTIONAL
 # Download saved demonstrations (~12 GB, used by Examples 2, 4, and 5). Requires the gcloud CLI (https://cloud.google.com/sdk/docs/install) and `gcloud auth login`
-gcloud storage cp --recursive gs://r2st-public/demonstrations data/
-gcloud storage cp --recursive gs://r2st-public/meshyai data/
+gcloud storage cp --recursive --no-clobber gs://r2st-public/demonstrations data/
+gcloud storage cp --recursive --no-clobber gs://r2st-public/meshyai data/
 ```
 
 ## Data format
@@ -62,9 +62,10 @@ single-image layout otherwise. `<cam>` is the value you pass as `--camera` to th
 
 Datasets shared by both layouts:
 
+
 | Dataset                                    | Shape    | Dtype   | Required | Notes                                                                                             |
-| ------------------------------------------ | -------- | ------- | -------- | ------------------------------------------------------------------------------------------------- |
-| `obs/qpos`                                 | `(T, D)` | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0                |
+| -------------------------------------------- | ---------- | --------- | ---------- | --------------------------------------------------------------------------------------------------- |
+| `obs/qpos`                                 | `(T, D)` | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0********        |
 | `obs/qvel`                                 | `(T, D)` | float64 | no       | Joint velocities, same order as `obs/qpos`                                                        |
 | `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)`   | int64   | no       | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
 | `obs/sensor_data/<cam>/timestamp_ms`       | `(T,)`   | float64 | yes      | Time of frame `i` (Unix epoch, ms)                                                                |
@@ -74,12 +75,13 @@ Datasets shared by both layouts:
 One RGB image and an aligned depth image per frame. Checked by `r2st.utils.validate_merged_camera_group`. Used by
 `grail_xarm_july_2` and the panda_utils recordings up to `Oct26_2026_datacollect/CokeInBowl__10-26-2026__13-02-11`.
 
-| Dataset                                    | Shape          | Dtype   | Required | Notes                                                               |
-| ------------------------------------------ | -------------- | ------- | -------- | ------------------------------------------------------------------- |
-| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                 |
+
+| Dataset                                    | Shape          | Dtype   | Required | Notes                                                                     |
+| -------------------------------------------- | ---------------- | --------- | ---------- | --------------------------------------------------------------------------- |
+| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                       |
 | `obs/sensor_data/<cam>/depth`              | `(T, H, W)`    | uint16  | yes      | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K |
-| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)   |
-| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms) |
+| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)         |
+| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms)       |
 
 `data/demonstrations/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this layout
 (`data/demonstrations/grail_xarm_july_2/merge_camera_streams.py`).
@@ -89,22 +91,26 @@ One RGB image and an aligned depth image per frame. Checked by `r2st.utils.valid
 panda_utils' `log_demonstration.py` records each ZED camera as a rectified stereo pair, with the camera's own depth
 stored as `left/depth_noisy`. Used by the panda_utils recordings from `Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45`
 on. The examples use `left/rgb` and `left/depth_noisy` exactly like `rgb` and `depth` above, so pass
-`--depth-intrinsics-source rgb`. Nothing reads `right/` yet.
+`--depth-intrinsics-source rgb`. `right/` is used for S2M2 stereo depth by Example 5 (in place of `left/depth_noisy`) and Example 6.
 
-| Dataset                                               | Shape          | Dtype   | Required by the examples | Notes                                                                 |
-| ----------------------------------------------------- | -------------- | ------- | ------------------------ | --------------------------------------------------------------------- |
-| `obs/sensor_data/<cam>/left/rgb`                      | `(T, H, W, 3)` | uint8   | yes                      | Rectified left RGB                                                    |
-| `obs/sensor_data/<cam>/left/rgb_timestamp_ms`         | `(T,)`         | float64 | yes                      | Capture time of the left image used for frame `i` (Unix epoch, ms)    |
+
+| Dataset                                               | Shape          | Dtype   | Required by the examples | Notes                                                                                    |
+| ------------------------------------------------------- | ---------------- | --------- | -------------------------- | ------------------------------------------------------------------------------------------ |
+| `obs/sensor_data/<cam>/left/rgb`                      | `(T, H, W, 3)` | uint8   | yes                      | Rectified left RGB                                                                       |
+| `obs/sensor_data/<cam>/left/rgb_timestamp_ms`         | `(T,)`         | float64 | yes                      | Capture time of the left image used for frame `i` (Unix epoch, ms)                       |
 | `obs/sensor_data/<cam>/left/depth_noisy`              | `(T, H, W)`    | uint16  | yes                      | Camera depth (ZED), mm, aligned to `left/rgb` (0 = no return). Unproject with the left K |
-| `obs/sensor_data/<cam>/left/depth_noisy_timestamp_ms` | `(T,)`         | float64 | no                       | Capture time of the depth image used for frame `i` (Unix epoch, ms)   |
-| `obs/sensor_data/<cam>/right/rgb`                     | `(T, H, W, 3)` | uint8   | no                       | Rectified right RGB, same size as `left/rgb`                          |
-| `obs/sensor_data/<cam>/right/rgb_timestamp_ms`        | `(T,)`         | float64 | no                       | Capture time of the right image used for frame `i` (Unix epoch, ms)   |
+| `obs/sensor_data/<cam>/left/depth_noisy_timestamp_ms` | `(T,)`         | float64 | no                       | Capture time of the depth image used for frame `i` (Unix epoch, ms)                      |
+| `obs/sensor_data/<cam>/right/rgb`                     | `(T, H, W, 3)` | uint8   | no                       | Rectified right RGB, same size as `left/rgb`                                             |
+| `obs/sensor_data/<cam>/right/rgb_timestamp_ms`        | `(T,)`         | float64 | no                       | Capture time of the right image used for frame `i` (Unix epoch, ms)                      |
 
 `r2st.utils.validate_noisy_depth_camera_group` checks the `left/` RGB-D datasets (what the examples need), and
 `r2st.utils.validate_stereo_depth_camera_group` checks the `left/rgb` + `right/rgb` pair for stereo depth.
 
-Next to each stereo recording, panda_utils also saves `<cam>_camera_info_right.json`. Its `k` equals the left camera's
-(rectified pair), and its projection matrix `p[3]` is `-fx * baseline` (`zed2i`: -31.27 px / 261.08 px = 0.120 m).
+Next to each stereo recording are the ROS camera_info of each stream: `<cam>_camera_info_left_rgb.json`,
+`<cam>_camera_info_left_depth.json` (identical to `left_rgb`, since the depth is registered to the left image) and
+`<cam>_camera_info_right_rgb.json`. The right camera's `k` equals the left's (rectified pair), and its projection matrix
+`p[3]` is `-fx * baseline` (`zed2i`: -31.27 px / 261.08 px = 0.120 m). panda_utils writes these as
+`<cam>_camera_info_{color,depth,right}.json`; the two Oct26 18:5x recordings were renamed by hand.
 
 ## Examples
 
@@ -174,17 +180,31 @@ uv run python examples/estimate_camera_extrinsics_rgb.py \
   --visualize
 
 
-# Dataset 2
+# ============ Dataset 2 ============ 
+# CAMERA: zed2i
 uv run python examples/estimate_camera_extrinsics_rgb.py \
-  --h5-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__12-54-56/traj_0__VGA.h5 \
+  --h5-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
   --robot-id panda_zed_wrist_cam__panda_gripper \
   --camera zed2i \
   --camera-model-id zed2i_vga \
   --depth-intrinsics-source rgb \
   --n-timesteps 20 \
   --per-frame-robot-masks \
-  --output-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__12-54-56/extrinsics_zed2i.rgb.yaml \
+  --output-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
+  --visualize
+
+# CAMERA: zed
+uv run python examples/estimate_camera_extrinsics_rgb.py \
+  --h5-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed \
+  --camera-model-id zed_vga \
+  --depth-intrinsics-source rgb \
+  --n-timesteps 20 \
+  --per-frame-robot-masks \
+  --output-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
+  --seed-pose 0.9296 0.2276 0.1298 0.2800 -0.3911 -0.7200 0.5003 \
   --visualize
 ```
 
@@ -223,6 +243,7 @@ so contact with an object does not expand the robot mask.
 Track an object through the demonstration. Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
+If the camera has a stereo pair (`<cam>/right/rgb`, see Stereo layout), the depth used for mesh scaling and tracking is S2M2 stereo depth from `left/rgb` + `right/rgb` (`--s2m2-model-type`, default `L`); otherwise it is the depth stored in the h5. The script prints which one it uses.
 FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-path` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
 
 ![FoundationPose mustard bottle tracking](media/mustard_bottle__track.foundationpose.gif)
@@ -240,14 +261,37 @@ uv run python examples/track_object.py \
     --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 
-# Dataset 2
+
+# ============ Dataset 2 ============ 
 uv run python examples/track_object.py \
-    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__12-56-36/traj_0__VGA.h5 \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
     --camera zed2i \
     --camera-model-id zed2i_vga \
     --object-description "red cube" \
-    --extrinsics-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__12-54-56/extrinsics_zed2i.rgb.yaml \
+    --extrinsics-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
     --visualize
+
+uv run python examples/track_object.py \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --camera zed \
+    --camera-model-id zed_vga \
+    --object-description "red cube" \
+    --extrinsics-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
+    --visualize
+```
+
+### Example 6: Compare camera depth with S2M2 stereo depth
+
+For each camera, runs S2M2 on every `left/rgb` + `right/rgb` pair of a stereo-layout h5 (fx from `--camera-model-ids`,
+baseline from `r2st.constants.STEREO_BASELINE_M`), then opens viser with a timestep slider and, per camera, toggles for the
+`left/depth_noisy` and S2M2 point clouds. Clouds are in each camera's optical frame, so cameras overlap; only the first is
+on at start. `color by: source` paints noisy orange and S2M2 blue.
+
+```bash
+uv run python examples/compare_noisy_depth_with_s2m2_depth.py \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --cameras zed zed2i zedm \
+    --camera-model-ids zed_vga zed2i_vga zedm_vga
 ```
 
 ## Camera models

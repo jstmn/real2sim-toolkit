@@ -8,7 +8,7 @@ import numpy as np
 import tyro
 from tqdm import tqdm
 
-from r2st.constants import get_color_intrinsics
+from r2st.constants import get_color_intrinsics, get_stereo_baseline_m
 from r2st.core import SAM3Predictor
 from r2st.geometry import (
     depth_mm_to_meters,
@@ -17,12 +17,14 @@ from r2st.geometry import (
 )
 from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
+from r2st.stereo_depth import S2M2StereoDepth
 from r2st.utils import (
     H264VideoWriter,
     ImageUtils,
     MeshUtils,
     TrackingVisualizer,
     rgb_depth_dataset_paths,
+    validate_stereo_depth_camera_group,
 )
 
 """
@@ -84,11 +86,36 @@ class Args:
     use_kalman_filter: bool = True
     """Fuse Cutie (x, y) with FoundationPose via a 6-DoF Kalman filter. Requires use_2d_tracker."""
 
+    s2m2_model_type: str = "L"
+    """S2M2 model size (S, M, L, XL), used when the camera has a left/right stereo pair."""
 
-def _load_rgb_depth(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray]:
-    with h5py.File(h5_path, "r") as f:
-        rgb_path, depth_path = rgb_depth_dataset_paths(f, h5_path, camera)
-        return f[rgb_path][:], f[depth_path][:]
+    s2m2_refine_iter: int = 3
+    """S2M2 local refinement iterations, used when the camera has a left/right stereo pair."""
+
+
+def _load_rgb_depth_m(args: Args, fx: float) -> tuple[np.ndarray, np.ndarray]:
+    """RGB `(T, H, W, 3)` and depth in meters `(T, H, W)` for `args.camera`, limited to `args.max_frames`. If the camera
+    has a left/right stereo pair, the depth is S2M2 stereo depth; otherwise it is the depth stored in the h5."""
+    frames = slice(None) if args.max_frames is None else slice(0, args.max_frames)
+    with h5py.File(args.h5_path, "r") as f:
+        group_path = f"obs/sensor_data/{args.camera}"
+        if f"{group_path}/right/rgb" not in f:
+            rgb_path, depth_path = rgb_depth_dataset_paths(f, args.h5_path, args.camera)
+            print(f"[info] Depth source: {depth_path} (no right/rgb, so no stereo depth)")
+            return f[rgb_path][frames], depth_mm_to_meters(f[depth_path][frames])
+        validate_stereo_depth_camera_group(f, args.h5_path, args.camera)
+        left_rgb = f[f"{group_path}/left/rgb"][frames]
+        right_rgb = f[f"{group_path}/right/rgb"][frames]
+
+    baseline_m = get_stereo_baseline_m(args.camera_model_id)
+    print(
+        f"[info] Depth source: S2M2 {args.s2m2_model_type} on {group_path}/left/rgb + right/rgb "
+        f"(fx={fx:.3f}, baseline={baseline_m * 1000:.2f} mm)"
+    )
+    stereo = S2M2StereoDepth(
+        args.s2m2_model_type, refine_iter=args.s2m2_refine_iter, allow_negative=False, device="cuda"
+    )
+    return left_rgb, stereo.depth_m_sequence(left_rgb, right_rgb, fx, baseline_m, desc="S2M2 depth")
 
 
 def _log_elapsed(label: str, t0: float) -> None:
@@ -149,12 +176,8 @@ def main(args: Args) -> None:
 
     print(f"[info] Loading RGB-D from {args.h5_path} ({args.camera}) ...")
     t0 = time.perf_counter()
-    rgb_all, depth_raw_all = _load_rgb_depth(args.h5_path, args.camera)
+    rgb_all, depth_m_all = _load_rgb_depth_m(args, color_intrinsics.fx)
     num_frames = rgb_all.shape[0]
-    if args.max_frames is not None:
-        num_frames = min(num_frames, args.max_frames)
-        rgb_all = rgb_all[:num_frames]
-        depth_raw_all = depth_raw_all[:num_frames]
     assert rgb_all.ndim == 4 and rgb_all.shape[-1] == 3, f"Expected NxHxWx3 rgb, got {rgb_all.shape}"
     _log_elapsed(f"Loaded {num_frames} frames, resolution {rgb_all.shape[1:3]}", t0)
 
@@ -166,8 +189,7 @@ def main(args: Args) -> None:
     K = color_intrinsics.intrinsic_matrix.astype(np.float64)
     print(f"[info] Color K ({args.camera_model_id}):\n{K}")
 
-    # Merged h5 depth is already in the color pixel grid. Unproject with color K.
-    depth_m_all = depth_mm_to_meters(depth_raw_all)
+    # Both depth sources are on the (left) color pixel grid. Unproject with color K.
     assert depth_m_all.shape == (num_frames, H, W), f"Bad depth shape: {depth_m_all.shape}"
 
     rgb0 = rgb_all[0]
