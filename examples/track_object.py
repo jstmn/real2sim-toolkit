@@ -5,6 +5,7 @@ import time
 import cv2
 import h5py
 import numpy as np
+import trimesh
 import tyro
 from tqdm import tqdm
 
@@ -17,12 +18,14 @@ from r2st.geometry import (
 )
 from r2st.mesh_scaling import scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
-from r2st.stereo_depth import S2M2StereoDepth
+from r2st.stereo_depth import cached_s2m2_depth_m
 from r2st.utils import (
     H264VideoWriter,
     ImageUtils,
     MeshUtils,
     TrackingVisualizer,
+    VisualizerCamera,
+    erode_mask,
     rgb_depth_dataset_paths,
     validate_stereo_depth_camera_group,
 )
@@ -31,10 +34,10 @@ from r2st.utils import (
 # Example usage (FoundationPose gRPC server must already be running in the container):
     uv run python examples/track_object.py \
         --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-        --camera cam_1 \
-        --camera-model-id d435 \
+        --cameras cam_1 \
+        --camera-model-ids d435 \
         --object-description "mustard bottle" \
-        --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
+        --extrinsics-paths data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
         --visualize
 """
 
@@ -44,20 +47,29 @@ class Args:
     h5_path: pathlib.Path
     """Path to a merged sensor-data h5 file (see data/demonstrations/grail_xarm_july_2/merge_camera_streams.py)."""
 
-    camera: str
-    """Camera name to read from within the h5 file, e.g. 'cam_1'."""
+    cameras: list[str]
+    """Camera names in the h5, e.g. `zed zed2i`. The first is tracked and its frame-0 crop is sent to Meshy. Every
+    camera's frame-0 object points go into the merged point cloud that the Meshy mesh is scaled to."""
 
-    camera_model_id: str
-    """Camera model id for calibration lookup, e.g. 'd435'. See the README camera-model table."""
+    camera_model_ids: list[str]
+    """Camera model id for each of --cameras, in the same order, e.g. `zed_vga zed2i_vga`. See the README camera-model
+    table."""
 
     object_description: str
     """Language description of the object to segment and mesh, e.g. 'mustard bottle'."""
 
-    extrinsics_path: pathlib.Path | None = None
-    """YAML from examples/estimate_camera_extrinsics.py (robot-base T camera). If set, poses are also written in the robot-base frame."""
+    extrinsics_paths: list[pathlib.Path] | None = None
+    """Extrinsics YAML from examples/estimate_camera_extrinsics*.py (robot-base T camera) for each of --cameras, in the
+    same order. Required with more than one camera, to merge their point clouds in the robot-base frame. If set, poses
+    are also written in the robot-base frame."""
 
     output_dir: pathlib.Path = pathlib.Path("data/meshyai")
     """Directory to save generated mesh assets and tracking outputs."""
+
+    mesh_path: pathlib.Path | None = None
+    """Known mesh of the object (e.g. measured ground truth), in meters. Used as-is: no Meshy and no PCA scaling.
+    Outputs go to <output_dir>/<mesh stem>__<camera>/. --object-description is still the SAM 3 prompt. Takes a single
+    camera, since extra cameras are only used for scaling."""
 
     server_address: str = "localhost:50051"
     """gRPC address of the FoundationPose pose-tracking server."""
@@ -86,36 +98,91 @@ class Args:
     use_kalman_filter: bool = True
     """Fuse Cutie (x, y) with FoundationPose via a 6-DoF Kalman filter. Requires use_2d_tracker."""
 
-    s2m2_model_type: str = "L"
+    object_mask_erode_px: int = 5
+    """Erode each camera's frame-0 SAM mask with this kernel size (0, or odd: 5 removes about 2 px per side) before
+    unprojecting it to the object points used for mesh scaling and shown in viser. FoundationPose still registers with
+    the full mask."""
+
+    s2m2_model_type: str = "XL"
     """S2M2 model size (S, M, L, XL), used when the camera has a left/right stereo pair."""
 
     s2m2_refine_iter: int = 3
     """S2M2 local refinement iterations, used when the camera has a left/right stereo pair."""
 
 
-def _load_rgb_depth_m(args: Args, fx: float) -> tuple[np.ndarray, np.ndarray]:
-    """RGB `(T, H, W, 3)` and depth in meters `(T, H, W)` for `args.camera`, limited to `args.max_frames`. If the camera
-    has a left/right stereo pair, the depth is S2M2 stereo depth; otherwise it is the depth stored in the h5."""
+@dataclasses.dataclass
+class CameraObservation:
+    """One camera's RGB-D video and its frame-0 segmentation of the object."""
+
+    camera: str
+    K: np.ndarray
+    rgb: np.ndarray
+    """`(T, H, W, 3)` uint8"""
+    depth_m: np.ndarray
+    """`(T, H, W)` float32 on the rgb pixel grid, 0 where there is no depth"""
+    mask0: np.ndarray
+    """`(H, W)` bool object mask on frame 0"""
+    object_pts0: np.ndarray
+    """`(N, 3)` frame-0 object points in this camera's optical frame"""
+
+
+def _load_rgb_depth_m(args: Args, camera: str, camera_model_id: str, fx: float) -> tuple[np.ndarray, np.ndarray]:
+    """RGB `(T, H, W, 3)` and depth in meters `(T, H, W)` for `camera`, limited to `args.max_frames`. If the camera has
+    a left/right stereo pair, the depth is S2M2 stereo depth; otherwise it is the depth stored in the h5."""
     frames = slice(None) if args.max_frames is None else slice(0, args.max_frames)
     with h5py.File(args.h5_path, "r") as f:
-        group_path = f"obs/sensor_data/{args.camera}"
+        group_path = f"obs/sensor_data/{camera}"
         if f"{group_path}/right/rgb" not in f:
-            rgb_path, depth_path = rgb_depth_dataset_paths(f, args.h5_path, args.camera)
+            rgb_path, depth_path = rgb_depth_dataset_paths(f, args.h5_path, camera)
             print(f"[info] Depth source: {depth_path} (no right/rgb, so no stereo depth)")
             return f[rgb_path][frames], depth_mm_to_meters(f[depth_path][frames])
-        validate_stereo_depth_camera_group(f, args.h5_path, args.camera)
+        validate_stereo_depth_camera_group(f, args.h5_path, camera)
         left_rgb = f[f"{group_path}/left/rgb"][frames]
         right_rgb = f[f"{group_path}/right/rgb"][frames]
 
-    baseline_m = get_stereo_baseline_m(args.camera_model_id)
+    baseline_m = get_stereo_baseline_m(camera_model_id)
     print(
         f"[info] Depth source: S2M2 {args.s2m2_model_type} on {group_path}/left/rgb + right/rgb "
         f"(fx={fx:.3f}, baseline={baseline_m * 1000:.2f} mm)"
     )
-    stereo = S2M2StereoDepth(
-        args.s2m2_model_type, refine_iter=args.s2m2_refine_iter, allow_negative=False, device="cuda"
+    depth_m = cached_s2m2_depth_m(
+        args.h5_path, camera, left_rgb, right_rgb, fx, baseline_m, args.s2m2_model_type, args.s2m2_refine_iter
     )
-    return left_rgb, stereo.depth_m_sequence(left_rgb, right_rgb, fx, baseline_m, desc="S2M2 depth")
+    return left_rgb, depth_m
+
+
+def _observe_camera(args: Args, predictor: SAM3Predictor, camera: str, camera_model_id: str) -> CameraObservation:
+    """Load `camera`'s RGB-D, segment `args.object_description` on frame 0 and unproject the masked depth."""
+    color_intrinsics = get_color_intrinsics(camera_model_id)
+    print(f"[info] Loading RGB-D from {args.h5_path} ({camera}) ...")
+    t0 = time.perf_counter()
+    rgb, depth_m = _load_rgb_depth_m(args, camera, camera_model_id, color_intrinsics.fx)
+    num_frames, H, W = rgb.shape[:3]
+    assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"Expected NxHxWx3 rgb, got {rgb.shape}"
+    _log_elapsed(f"{camera}: loaded {num_frames} frames, resolution {(H, W)}", t0)
+    assert (H, W) == (color_intrinsics.height, color_intrinsics.width), (
+        f"{camera} rgb is {H}x{W} but {camera_model_id} color intrinsics are "
+        f"{color_intrinsics.height}x{color_intrinsics.width}"
+    )
+    # Both depth sources are on the (left) color pixel grid. Unproject with color K.
+    assert depth_m.shape == (num_frames, H, W), f"Bad depth shape: {depth_m.shape}"
+    K = color_intrinsics.intrinsic_matrix.astype(np.float64)
+    print(f"[info] Color K ({camera_model_id}):\n{K}")
+
+    print(f"[info] Segmenting '{args.object_description}' on {camera} frame 0 ...")
+    t0 = time.perf_counter()
+    mask0 = ImageUtils.get_sam_mask(predictor, cv2.cvtColor(rgb[0], cv2.COLOR_RGB2BGR), args.object_description)
+    assert mask0.dtype == bool, f"Mask dtype {mask0.dtype} is not bool"
+    assert mask0.sum() > 0, f"Segmentation mask is empty on {camera} for description '{args.object_description}'"
+    _log_elapsed(f"{camera}: mask pixels {int(mask0.sum())} / {mask0.size}", t0)
+    points_mask = erode_mask(mask0, args.object_mask_erode_px)
+    if args.object_mask_erode_px > 0:
+        print(
+            f"[info] {camera}: object points from the mask eroded with a {args.object_mask_erode_px} px kernel "
+            f"({int(points_mask.sum())} / {int(mask0.sum())} pixels)"
+        )
+    object_pts0 = masked_depth_to_points(depth_m[0], points_mask, K)
+    return CameraObservation(camera=camera, K=K, rgb=rgb, depth_m=depth_m, mask0=mask0, object_pts0=object_pts0)
 
 
 def _log_elapsed(label: str, t0: float) -> None:
@@ -130,11 +197,14 @@ def _load_camera_extrinsics_yaml(path: pathlib.Path, camera: str, camera_model_i
     payload = yaml.safe_load(path.read_text())
     assert isinstance(payload, dict), f"Extrinsics YAML must be a mapping, got {type(payload)}"
     assert "camera" in payload, f"Extrinsics YAML missing 'camera': {path}"
-    assert payload["camera"] == camera, f"Extrinsics YAML camera {payload['camera']!r} != --camera {camera!r}"
+    assert payload["camera"] == camera, (
+        f"Extrinsics YAML camera {payload['camera']!r} != camera {camera!r} "
+        "(--cameras and --extrinsics-paths must be in the same order)"
+    )
     assert "camera_model_id" in payload, f"Extrinsics YAML missing 'camera_model_id': {path}"
     assert (
         payload["camera_model_id"] == camera_model_id
-    ), f"Extrinsics YAML camera_model_id {payload['camera_model_id']!r} != --camera-model-id {camera_model_id!r}"
+    ), f"Extrinsics YAML camera_model_id {payload['camera_model_id']!r} != camera_model_id {camera_model_id!r}"
     assert "matrix" in payload, f"Extrinsics YAML missing 'matrix': {path}"
     T = np.asarray(payload["matrix"], dtype=np.float64)
     assert T.shape == (4, 4), f"Extrinsics matrix must be 4x4, got {T.shape}"
@@ -167,69 +237,100 @@ def main(args: Args) -> None:
         "image-plane measurement with FoundationPose's pose estimate each frame."
     )
     assert args.max_frames is None or args.max_frames >= 1, f"max_frames must be >= 1, got {args.max_frames}"
-    T_world_cam = None
-    if args.extrinsics_path is not None:
-        T_world_cam = _load_camera_extrinsics_yaml(args.extrinsics_path, args.camera, args.camera_model_id)
-        print(f"[info] Loaded T_world_cam from {args.extrinsics_path}:\n{T_world_cam}")
+    n_cameras = len(args.cameras)
+    assert n_cameras >= 1, "--cameras must not be empty"
+    assert len(set(args.cameras)) == n_cameras, f"--cameras has duplicates: {args.cameras}"
+    assert (
+        len(args.camera_model_ids) == n_cameras
+    ), f"--camera-model-ids {args.camera_model_ids} must have one entry per --cameras {args.cameras}"
+    if n_cameras > 1:
+        assert args.extrinsics_paths is not None, (
+            "--extrinsics-paths is required with more than one camera: their point clouds are merged in the "
+            "robot-base frame"
+        )
+        assert (
+            args.mesh_path is None
+        ), "--mesh-path is used as-is (no scaling), and extra cameras are only used for scaling. Pass one camera."
+    if args.mesh_path is not None:
+        assert args.mesh_path.is_file(), f"--mesh-path not found: {args.mesh_path}"
+        assert args.mesh_path.suffix == ".glb", f"--mesh-path must be a .glb, got {args.mesh_path}"
 
-    color_intrinsics = get_color_intrinsics(args.camera_model_id)
-
-    print(f"[info] Loading RGB-D from {args.h5_path} ({args.camera}) ...")
-    t0 = time.perf_counter()
-    rgb_all, depth_m_all = _load_rgb_depth_m(args, color_intrinsics.fx)
-    num_frames = rgb_all.shape[0]
-    assert rgb_all.ndim == 4 and rgb_all.shape[-1] == 3, f"Expected NxHxWx3 rgb, got {rgb_all.shape}"
-    _log_elapsed(f"Loaded {num_frames} frames, resolution {rgb_all.shape[1:3]}", t0)
-
-    H, W = rgb_all.shape[1], rgb_all.shape[2]
-    assert (H, W) == (color_intrinsics.height, color_intrinsics.width), (
-        f"{args.camera} rgb is {H}x{W} but {args.camera_model_id} color intrinsics are "
-        f"{color_intrinsics.height}x{color_intrinsics.width}"
-    )
-    K = color_intrinsics.intrinsic_matrix.astype(np.float64)
-    print(f"[info] Color K ({args.camera_model_id}):\n{K}")
-
-    # Both depth sources are on the (left) color pixel grid. Unproject with color K.
-    assert depth_m_all.shape == (num_frames, H, W), f"Bad depth shape: {depth_m_all.shape}"
-
-    rgb0 = rgb_all[0]
-    depth0 = depth_m_all[0]
-    image_bgr0 = cv2.cvtColor(rgb0, cv2.COLOR_RGB2BGR)
+    T_world_cams = None
+    if args.extrinsics_paths is not None:
+        assert (
+            len(args.extrinsics_paths) == n_cameras
+        ), f"--extrinsics-paths {args.extrinsics_paths} must have one entry per --cameras {args.cameras}"
+        T_world_cams = []
+        for path, camera, camera_model_id in zip(
+            args.extrinsics_paths, args.cameras, args.camera_model_ids, strict=True
+        ):
+            T_world_cams.append(_load_camera_extrinsics_yaml(path, camera, camera_model_id))
+            print(f"[info] Loaded T_world_cam for {camera} from {path}:\n{T_world_cams[-1]}")
 
     print("[info] Loading SAM 3 ...")
     t0 = time.perf_counter()
     predictor = SAM3Predictor()
     _log_elapsed("SAM 3 loaded", t0)
-    print(f"[info] Segmenting '{args.object_description}' on frame 0 ...")
-    t0 = time.perf_counter()
-    mask = ImageUtils.get_sam_mask(predictor, image_bgr0, args.object_description)
-    assert mask.dtype == bool, f"Mask dtype {mask.dtype} is not bool"
-    assert mask.sum() > 0, f"Segmentation mask is empty for description '{args.object_description}'"
-    _log_elapsed(f"Mask pixels: {int(mask.sum())} / {mask.size}", t0)
+    observations = [
+        _observe_camera(args, predictor, camera, camera_model_id)
+        for camera, camera_model_id in zip(args.cameras, args.camera_model_ids, strict=True)
+    ]
 
-    object_slug = args.object_description.replace(" ", "_")
-    asset_dir = args.output_dir / f"{object_slug}__{args.camera}"
+    # The first camera is the one tracked
+    tracked = observations[0]
+    camera = tracked.camera
+    T_world_cam = None if T_world_cams is None else T_world_cams[0]
+    rgb_all, depth_m_all, K, mask = tracked.rgb, tracked.depth_m, tracked.K, tracked.mask0
+    num_frames, H, W = rgb_all.shape[:3]
+    rgb0, depth0 = rgb_all[0], depth_m_all[0]
+    image_bgr0 = cv2.cvtColor(rgb0, cv2.COLOR_RGB2BGR)
+
+    object_slug = args.object_description.replace(" ", "_") if args.mesh_path is None else args.mesh_path.stem
+    asset_dir = args.output_dir / f"{object_slug}__{camera}"
     asset_dir.mkdir(parents=True, exist_ok=True)
     masked_cropped_path = ImageUtils.save_masked_debug(image_bgr0, mask, asset_dir, object_slug)
+    for obs in observations[1:]:
+        bgr0 = cv2.cvtColor(obs.rgb[0], cv2.COLOR_RGB2BGR)
+        ImageUtils.save_masked_debug(bgr0, obs.mask0, asset_dir, f"{object_slug}__scaling_view_{obs.camera}")
 
-    # Same path examples/generate_mesh.py writes for this object and --camera-name, so its mesh is reused
-    glb_path = asset_dir / f"{object_slug}.unscaled.glb"
-    print(f"[info] Generating mesh with Meshy (reuses {glb_path} if present) ...")
-    glb_path = MeshUtils.generate_with_meshy([masked_cropped_path], glb_path)
-    assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
-    print(f"[info] Mesh: {glb_path.resolve()} ({glb_path.stat().st_size} bytes)")
+    if args.mesh_path is None:
+        # Same path examples/generate_mesh.py writes for this object and --camera-name, so its mesh is reused
+        glb_path = asset_dir / f"{object_slug}.unscaled.glb"
+        print(f"[info] Generating mesh with Meshy (reuses {glb_path} if present) ...")
+        glb_path = MeshUtils.generate_with_meshy([masked_cropped_path], glb_path)
+        assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
+        print(f"[info] Mesh: {glb_path.resolve()} ({glb_path.stat().st_size} bytes)")
 
-    print("[info] Scaling mesh to masked RealSense point cloud (PCA) ...")
-    t0 = time.perf_counter()
-    object_pts = masked_depth_to_points(depth0, mask, K)
-    scaled_glb_path = asset_dir / f"{object_slug}.scaled.glb"
-    scaled_glb_path, scale = scale_glb_to_pointcloud(glb_path, object_pts, scaled_glb_path)
+        # Merge every camera's frame-0 object points. PCA eigenvalues are pose-invariant, so any common frame works:
+        # the robot base when extrinsics are given, else the (single) camera's optical frame.
+        if T_world_cams is None:
+            scaling_pts = tracked.object_pts0
+        else:
+            per_camera = [
+                obs.object_pts0 @ T[:3, :3].T + T[:3, 3] for obs, T in zip(observations, T_world_cams, strict=True)
+            ]
+            for obs, pts in zip(observations, per_camera, strict=True):
+                print(
+                    f"[info] {obs.camera}: {len(pts)} object points, centroid (robot base) {np.round(pts.mean(0), 4)}"
+                )
+            scaling_pts = np.concatenate(per_camera, axis=0)
+        scaling_pts_path = asset_dir / f"{object_slug}__scaling_points.ply"
+        trimesh.PointCloud(scaling_pts).export(scaling_pts_path)
+        print(f"[info] Saved the merged scaling point cloud ({len(scaling_pts)} points) to {scaling_pts_path}")
+
+        print(f"[info] Scaling mesh to the masked depth point cloud of {args.cameras} (PCA) ...")
+        t0 = time.perf_counter()
+        scaled_glb_path = asset_dir / f"{object_slug}.scaled.glb"
+        scaled_glb_path, scale = scale_glb_to_pointcloud(glb_path, scaling_pts, scaled_glb_path)
+        _log_elapsed(
+            f"PCA scale={scale:.6f}  scaling_pts={len(scaling_pts)}  scaled mesh: {scaled_glb_path.resolve()} "
+            f"({scaled_glb_path.stat().st_size} bytes)",
+            t0,
+        )
+    else:
+        scaled_glb_path = args.mesh_path
+        print(f"[info] Using --mesh-path as-is (no Meshy, no scaling): {scaled_glb_path.resolve()}")
     mesh_path_abs = str(scaled_glb_path.resolve())
-    _log_elapsed(
-        f"PCA scale={scale:.6f}  object_pts={len(object_pts)}  scaled mesh: {mesh_path_abs} "
-        f"({scaled_glb_path.stat().st_size} bytes)",
-        t0,
-    )
     if args.gif:
         gif_path = asset_dir / f"{object_slug}__orbit.gif"
         gif_path = MeshUtils.save_orbit_gif(scaled_glb_path, gif_path)
@@ -242,8 +343,14 @@ def main(args: Args) -> None:
             rgb_all,
             depth_m_all,
             K,
-            mesh_position=object_pts.mean(axis=0),
+            mesh_position=tracked.object_pts0.mean(axis=0),
+            camera_name=camera,
             T_world_cam=T_world_cam,
+            object_points=tracked.object_pts0,
+            extra_cameras=[
+                VisualizerCamera(obs.camera, obs.rgb, obs.depth_m, obs.K, T, obs.object_pts0)
+                for obs, T in zip(observations[1:], ([] if T_world_cams is None else T_world_cams[1:]), strict=True)
+            ],
         )
 
     print(f"[info] Connecting to FoundationPose server at {args.server_address} ...")

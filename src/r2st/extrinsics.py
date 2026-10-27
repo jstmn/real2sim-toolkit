@@ -53,6 +53,7 @@ from r2st.utils import (
     H264VideoWriter,
     ImageUtils,
     MeshUtils,
+    erode_mask,  # noqa: F401 (re-exported: examples/estimate_camera_extrinsics*.py import it from here)
     farthest_point_sample_pyg_lib,
     rgb_depth_dataset_paths,
 )
@@ -487,22 +488,6 @@ def union_top_sam_masks(
     assert n_keep >= 1, f"No SAM masks in top {n} with score > {score_threshold} " f"(scores={scores[:n].tolist()})"
     union = np.any(masks[:n][keep], axis=0)
     return union, np.flatnonzero(keep)
-
-
-def erode_mask(mask: np.ndarray, kernel_px: int) -> np.ndarray:
-    """Erode a bool mask with an elliptical kernel of size `kernel_px`. `kernel_px=0` is a no-op."""
-    assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
-    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
-    assert mask.any(), "Cannot erode an empty mask"
-    assert kernel_px == 0 or (
-        kernel_px >= 1 and kernel_px % 2 == 1
-    ), f"mask_erode_px must be 0 or a positive odd int, got {kernel_px}"
-    if kernel_px == 0:
-        return mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
-    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-    assert eroded.any(), f"Mask empty after erode with kernel_px={kernel_px} (had {int(mask.sum())} pixels)"
-    return eroded
 
 
 def dump_top_sam_masks(

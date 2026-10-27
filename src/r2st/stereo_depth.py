@@ -32,9 +32,39 @@ S2M2_MODEL_CONFIGS = {
 # S2M2 runs at 1/32 resolution internally; inputs are padded up to a multiple of this
 _PAD_FACTOR = 32
 
+# Hex digits of a checkpoint's SHA-256 kept in its id (see s2m2_checkpoint_id)
+_CHECKPOINT_SHA_PREFIX_LEN = 12
+
 # Parameters in the released checkpoints that the released S2M2 module no longer defines (the attention refiner and
 # 4x upsampler that this release replaced with a UNet)
 _UNUSED_CHECKPOINT_PREFIXES = ("feature_flow_attn.", "upsample_mask_4x.", "disp_init.layer_norm1.")
+
+
+def s2m2_checkpoint_path(model_type: str) -> Path:
+    """Path of the `model_type` checkpoint, `CH{feature_channels}NTR{num_transformer}.pth`, asserting it is downloaded."""
+    assert (
+        model_type in S2M2_MODEL_CONFIGS
+    ), f"Unknown model_type {model_type!r}. Available: {sorted(S2M2_MODEL_CONFIGS)}"
+    feature_channels, num_transformer = S2M2_MODEL_CONFIGS[model_type]
+    ckpt_path = S2M2_WEIGHTS_DIR / f"CH{feature_channels}NTR{num_transformer}.pth"
+    assert ckpt_path.is_file(), (
+        f"S2M2 checkpoint not found: {ckpt_path}. Download it with "
+        f"`uv run hf download minimok/s2m2 {ckpt_path.name} --local-dir {S2M2_WEIGHTS_DIR}`"
+    )
+    return ckpt_path
+
+
+def s2m2_checkpoint_id(model_type: str) -> str:
+    """`<checkpoint stem>-<sha256 prefix>`, e.g. `CH256NTR3-770e82227258`: identifies the exact weights, so outputs
+    cached under it go stale if the checkpoint file changes."""
+    import hashlib
+
+    ckpt_path = s2m2_checkpoint_path(model_type)
+    sha256 = hashlib.sha256()
+    with open(ckpt_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 24), b""):
+            sha256.update(chunk)
+    return f"{ckpt_path.stem}-{sha256.hexdigest()[:_CHECKPOINT_SHA_PREFIX_LEN]}"
 
 
 def _ensure_s2m2_on_path() -> None:
@@ -78,11 +108,7 @@ class S2M2StereoDepth:
         S2M2, self._image_pad, self._image_crop = _load_s2m2_deps()
 
         feature_channels, num_transformer = S2M2_MODEL_CONFIGS[model_type]
-        ckpt_path = S2M2_WEIGHTS_DIR / f"CH{feature_channels}NTR{num_transformer}.pth"
-        assert ckpt_path.is_file(), (
-            f"S2M2 checkpoint not found: {ckpt_path}. Download it with "
-            f"`uv run hf download minimok/s2m2 {ckpt_path.name} --local-dir {S2M2_WEIGHTS_DIR}`"
-        )
+        ckpt_path = s2m2_checkpoint_path(model_type)
         self.device = torch.device(device)
         model = S2M2(
             feature_channels=feature_channels,
@@ -133,24 +159,68 @@ class S2M2StereoDepth:
         """``(H, W)`` float32 depth in meters on the left image's grid; 0 where disparity is not positive."""
         return disparity_to_depth_m(self.predict(left_rgb, right_rgb).disparity_px, fx, baseline_m)
 
-    def depth_m_sequence(
-        self, left_rgb: np.ndarray, right_rgb: np.ndarray, fx: float, baseline_m: float, desc: str
-    ) -> np.ndarray:
-        """``depth_m`` for every frame of ``(T, H, W, 3)`` uint8 left/right sequences → ``(T, H, W)`` float32."""
+    def disparity_sequence(self, left_rgb: np.ndarray, right_rgb: np.ndarray, desc: str) -> np.ndarray:
+        """Disparity in pixels for every frame of ``(T, H, W, 3)`` uint8 left/right sequences → ``(T, H, W)``
+        float32."""
         from tqdm import tqdm
 
         assert left_rgb.ndim == 4, f"left_rgb must be TxHxWx3, got {left_rgb.shape}"
         assert left_rgb.shape == right_rgb.shape, f"left_rgb {left_rgb.shape} != right_rgb {right_rgb.shape}"
-        depth = np.zeros(left_rgb.shape[:3], dtype=np.float32)
+        disparity = np.zeros(left_rgb.shape[:3], dtype=np.float32)
         for t in tqdm(range(len(left_rgb)), desc=desc):
-            depth[t] = self.depth_m(left_rgb[t], right_rgb[t], fx, baseline_m)
-        return depth
+            disparity[t] = self.predict(left_rgb[t], right_rgb[t]).disparity_px
+        return disparity
+
+
+def s2m2_disparity_cache_path(
+    h5_path: Path, camera: str, checkpoint_id: str, refine_iter: int, num_frames: int
+) -> Path:
+    """``<h5_dir>/<h5_stem>/s2m2_disparity/<camera>__model=<checkpoint_id>__refine_iter=<n>__frames=<T>.npy``: S2M2
+    disparity of the first ``num_frames`` frames of ``camera``'s ``left/rgb`` + ``right/rgb``. ``checkpoint_id`` is
+    ``s2m2_checkpoint_id``, so the cache is keyed by the exact weights. Disparity, not depth, so the cache does not
+    depend on ``fx`` or the baseline."""
+    name = f"{camera}__model={checkpoint_id}__refine_iter={refine_iter}__frames={num_frames}.npy"
+    return h5_path.parent / h5_path.stem / "s2m2_disparity" / name
+
+
+def cached_s2m2_depth_m(
+    h5_path: Path,
+    camera: str,
+    left_rgb: np.ndarray,
+    right_rgb: np.ndarray,
+    fx: float,
+    baseline_m: float,
+    model_type: str,
+    refine_iter: int,
+) -> np.ndarray:
+    """S2M2 depth ``(T, H, W)`` float32 for ``camera``'s left/right ``(T, H, W, 3)`` sequences read from ``h5_path``.
+    The disparity is cached at ``s2m2_disparity_cache_path``; S2M2 is loaded and run only when it is missing."""
+    checkpoint_id = s2m2_checkpoint_id(model_type)
+    cache_path = s2m2_disparity_cache_path(Path(h5_path), camera, checkpoint_id, refine_iter, len(left_rgb))
+    if cache_path.is_file():
+        disparity = np.load(cache_path)
+        assert disparity.shape == left_rgb.shape[:3], (
+            f"Cached S2M2 disparity {cache_path} has shape {disparity.shape}, expected {left_rgb.shape[:3]}. "
+            "Delete it to recompute."
+        )
+        print(f"[info] Reusing cached S2M2 disparity {cache_path}")
+    else:
+        stereo = S2M2StereoDepth(model_type, refine_iter=refine_iter, allow_negative=False, device="cuda")
+        disparity = stereo.disparity_sequence(left_rgb, right_rgb, desc=f"S2M2 {camera}")
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Write then rename, so an interrupted run never leaves a truncated cache file behind
+        tmp_path = cache_path.with_suffix(".npy.tmp")
+        with open(tmp_path, "wb") as f:
+            np.save(f, disparity)
+        tmp_path.replace(cache_path)
+        print(f"[info] Saved S2M2 disparity cache {cache_path}")
+    return disparity_to_depth_m(disparity, fx, baseline_m)
 
 
 def disparity_to_depth_m(disparity_px: np.ndarray, fx: float, baseline_m: float) -> np.ndarray:
-    """``depth = fx * baseline / disparity``. Pixels with disparity <= 0 get depth 0 (no return), matching the h5
-    depth convention."""
-    assert disparity_px.ndim == 2, f"disparity_px must be HxW, got {disparity_px.shape}"
+    """``depth = fx * baseline / disparity``, elementwise for ``(H, W)`` or ``(T, H, W)``. Pixels with disparity <= 0
+    get depth 0 (no return), matching the h5 depth convention."""
+    assert disparity_px.ndim in (2, 3), f"disparity_px must be HxW or TxHxW, got {disparity_px.shape}"
     assert fx > 0, f"fx must be > 0, got {fx}"
     assert baseline_m > 0, f"baseline_m must be > 0, got {baseline_m}"
     valid = disparity_px > 0

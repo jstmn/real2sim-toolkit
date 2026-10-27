@@ -8,7 +8,7 @@ import tyro
 
 from r2st.constants import get_color_intrinsics, get_stereo_baseline_m
 from r2st.geometry import depth_mm_to_meters, depth_rgb_to_pointcloud
-from r2st.stereo_depth import S2M2StereoDepth
+from r2st.stereo_depth import cached_s2m2_depth_m
 from r2st.utils import (
     validate_noisy_depth_camera_group,
     validate_stereo_depth_camera_group,
@@ -43,7 +43,7 @@ class Args:
     camera_model_ids: list[str]
     """Camera model id for each of --cameras, in the same order, e.g. `zed_vga zed2i_vga zedm_vga`."""
 
-    s2m2_model_type: str = "L"
+    s2m2_model_type: str = "XL"
     """S2M2 model size: S, M, L or XL."""
 
     s2m2_refine_iter: int = 3
@@ -76,9 +76,14 @@ def _log_elapsed(label: str, t0: float) -> None:
 
 
 def _load_camera_depths(
-    h5_path: pathlib.Path, camera: str, camera_model_id: str, stereo: S2M2StereoDepth, max_frames: int | None
+    h5_path: pathlib.Path,
+    camera: str,
+    camera_model_id: str,
+    s2m2_model_type: str,
+    s2m2_refine_iter: int,
+    max_frames: int | None,
 ) -> CameraDepths:
-    """Read `camera`'s left/right RGB and noisy depth, and run S2M2 on every frame."""
+    """Read `camera`'s left/right RGB and noisy depth, and get S2M2 depth for every frame (cached per h5 and camera)."""
     with h5py.File(h5_path, "r") as f:
         validate_noisy_depth_camera_group(f, h5_path, camera)
         validate_stereo_depth_camera_group(f, h5_path, camera)
@@ -97,7 +102,9 @@ def _load_camera_depths(
     baseline_m = get_stereo_baseline_m(camera_model_id)
     print(f"[info] {camera} ({camera_model_id}): fx={intrinsics.fx:.3f} baseline={baseline_m * 1000:.2f} mm")
 
-    s2m2_depth_m = stereo.depth_m_sequence(left_rgb, right_rgb, intrinsics.fx, baseline_m, desc=f"S2M2 {camera}")
+    s2m2_depth_m = cached_s2m2_depth_m(
+        h5_path, camera, left_rgb, right_rgb, intrinsics.fx, baseline_m, s2m2_model_type, s2m2_refine_iter
+    )
     return CameraDepths(
         name=camera,
         K=intrinsics.intrinsic_matrix,
@@ -187,16 +194,14 @@ def main(args: Args) -> None:
     assert args.max_frames is None or args.max_frames >= 1, f"max_frames must be >= 1, got {args.max_frames}"
     assert args.point_size > 0, f"point_size must be > 0, got {args.point_size}"
 
-    t0 = time.perf_counter()
-    stereo = S2M2StereoDepth(
-        args.s2m2_model_type, refine_iter=args.s2m2_refine_iter, allow_negative=False, device="cuda"
-    )
-    _log_elapsed(f"Loaded S2M2 {args.s2m2_model_type}", t0)
-
     cameras = []
     for camera, camera_model_id in zip(args.cameras, args.camera_model_ids, strict=True):
         t0 = time.perf_counter()
-        cameras.append(_load_camera_depths(args.h5_path, camera, camera_model_id, stereo, args.max_frames))
+        cameras.append(
+            _load_camera_depths(
+                args.h5_path, camera, camera_model_id, args.s2m2_model_type, args.s2m2_refine_iter, args.max_frames
+            )
+        )
         _log_elapsed(f"{camera}: {len(cameras[-1].left_rgb)} frames", t0)
 
     viewer = DepthComparisonViewer(cameras, args.stride, args.point_size)

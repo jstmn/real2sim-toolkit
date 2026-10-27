@@ -32,7 +32,8 @@ uv run hf auth login
 # REQUIRED: Get sam3 access at https://huggingface.co/facebook/sam3
 
 # S2M2 stereo depth checkpoints (S/M/L/XL = CH128NTR1/CH192NTR2/CH256NTR3/CH384NTR3)
-uv run hf download minimok/s2m2 CH256NTR3.pth --local-dir src/r2st/S2M2/weights/pretrain_weights
+# The examples default to XL (--s2m2-model-type XL); download the sizes you use
+uv run hf download minimok/s2m2 CH384NTR3.pth CH256NTR3.pth --local-dir src/r2st/S2M2/weights/pretrain_weights
 
 # Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
@@ -180,104 +181,58 @@ uv run python examples/estimate_camera_extrinsics_rgb.py \
   --visualize
 
 
-# ============ Dataset 2 ============ 
-# CAMERA: zed2i
-uv run python examples/estimate_camera_extrinsics_rgb.py \
-  --h5-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
-  --robot-id panda_zed_wrist_cam__panda_gripper \
-  --camera zed2i \
-  --camera-model-id zed2i_vga \
-  --depth-intrinsics-source rgb \
-  --n-timesteps 20 \
-  --per-frame-robot-masks \
-  --output-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
-  --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
-  --visualize
+# ============ Dataset 2: PickCube, 4 cm red cube ============
+# The Meshy cube PCA-scaled to frame-0 depth comes out ~27% too small (2.9 cm), so FoundationPose tilts it and slides
+# it instead of lifting it. With a correctly sized mesh (the last two commands) it tracks flat, with the right yaw, and
+# lifts with the gripper.
 
-# CAMERA: zed
-uv run python examples/estimate_camera_extrinsics_rgb.py \
-  --h5-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
-  --robot-id panda_zed_wrist_cam__panda_gripper \
-  --camera zed \
-  --camera-model-id zed_vga \
-  --depth-intrinsics-source rgb \
-  --n-timesteps 20 \
-  --per-frame-robot-masks \
-  --output-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
-  --seed-pose 0.9296 0.2276 0.1298 0.2800 -0.3911 -0.7200 0.5003 \
-  --visualize
-```
-
-Exactly one seed mode is required:
-
-- `--seed-automatically` evaluates the configured spherical grid before CMA-ES.
-- `--seed-from-gui` starts Viser and waits for a manual seed. Click the 3D view, then use
-  world-frame (robot-base) hotkeys: R/F X, T/G Y, Y/H Z, U/J roll about X, I/K pitch about Y,
-  O/L yaw about Z (top row +, bottom row -). Press Enter or click **Select seed and start CMA-ES**.
-  `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
-- `--seed-pose x y z qw qx qy qz` seeds CMA-ES with that robot-base camera pose.
-
-`--robot-id` is a Jrl2 robot name. The following are supported:
-
-
-| `--robot-id`                         | End effector                                           |
-| -------------------------------------- | -------------------------------------------------------- |
-| `panda`                              | Franka hand (fingers are part of the base description) |
-| `panda_zed_wrist_cam__panda_gripper` | Franka hand + DROID ZED Mini wrist camera              |
-| `ur5`                                | none                                                   |
-| `ur10`                               | none                                                   |
-| `xarm7`                              | none                                                   |
-| `xarm7__gripper`                     | UFACTORY parallel-jaw gripper                          |
-| `xarm7__bio_gripper`                 | UFACTORY BIO gripper                                   |
-| `xarm7__vacuum_gripper`              | UFACTORY vacuum gripper                                |
-
-Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
-are pinned at 0 (closed gripper).
-
-Robot masks: SAM 3 runs on **frame 0** (union of the top `--sam-kmax` masks). That union is
-propagated through the rest of the trajectory with SAM 3 `mask_input` plus the previous mask's bbox,
-so contact with an object does not expand the robot mask.
-
-### Example 5: Track an object with FoundationPose++
-
-Track an object through the demonstration. Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
-Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
-`r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
-If the camera has a stereo pair (`<cam>/right/rgb`, see Stereo layout), the depth used for mesh scaling and tracking is S2M2 stereo depth from `left/rgb` + `right/rgb` (`--s2m2-model-type`, default `L`); otherwise it is the depth stored in the h5. The script prints which one it uses.
-FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-path` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
-
-![FoundationPose mustard bottle tracking](media/mustard_bottle__track.foundationpose.gif)
-
-```bash
-# Start the server: `cd src/r2st/FoundationPose/docker; sudo bash run_container.sh`, then in the container:
-cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
-
-# Track the object in the camera optical frame.
-uv run python examples/track_object.py \
-    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-    --camera cam_1 \
-    --camera-model-id d435 \
-    --object-description "mustard bottle" \
-    --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
-    --visualize
-
-
-# ============ Dataset 2 ============ 
+# zed2i, Meshy mesh + PCA scaling
 uv run python examples/track_object.py \
     --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
-    --camera zed2i \
-    --camera-model-id zed2i_vga \
+    --cameras zed2i \
+    --camera-model-ids zed2i_vga \
     --object-description "red cube" \
-    --extrinsics-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
+    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
     --visualize
 
+# zed, Meshy mesh + PCA scaling
 uv run python examples/track_object.py \
     --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
-    --camera zed \
-    --camera-model-id zed_vga \
+    --cameras zed \
+    --camera-model-ids zed_vga \
     --object-description "red cube" \
-    --extrinsics-path data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
-    --visualize
+    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
+    --visualize --no-use-2d-tracker --no-use-kalman-filter
+
+# Track with zed; PCA-scale the Meshy mesh to the merged frame-0 point cloud of zed and zed2i. Still ~20% small
+# (3.2 cm): both cameras see only the top and near sides of the cube
+uv run python examples/track_object.py \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --cameras zed zed2i \
+    --camera-model-ids zed_vga zed2i_vga \
+    --object-description "red cube" \
+    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
+    --visualize --no-use-2d-tracker --no-use-kalman-filter
+
+# Works: the Meshy mesh scaled by hand to 4 cm (no PCA scaling)
+uv run python examples/track_object.py \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --cameras zed \
+    --camera-model-ids zed_vga \
+    --object-description "red cube" \
+    --mesh-path data/meshyai/red_cube__zed/red_cube_meshy_4cm.glb \
+    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
+    --visualize --no-use-2d-tracker --no-use-kalman-filter
+
+# Works: measured ground-truth 4x4x4 cm cube
+uv run python examples/track_object.py \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --cameras zed \
+    --camera-model-ids zed_vga \
+    --object-description "red cube" \
+    --mesh-path data/meshyai/red_cube_ground_truth__zed2i/red_cube_ground_truth_4x4x4cm.glb \
+    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
+    --visualize --no-use-2d-tracker --no-use-kalman-filter
 ```
 
 ### Example 6: Compare camera depth with S2M2 stereo depth
@@ -356,7 +311,12 @@ result = stereo.predict(left_rgb, right_rgb)  # disparity_px, occlusion, confide
 depth_m = stereo.depth_m(left_rgb, right_rgb, fx=K[0, 0], baseline_m=baseline_m)  # 0 where disparity <= 0
 ```
 
-At 672x376 on an RTX 5090, `S` takes about 24 ms per pair and `L` about 54 ms (fp16, no `torch.compile`).
+At 672x376 on an RTX 5090, `S` takes about 24 ms per pair, `L` about 54 ms and `XL` about 100 ms (fp16, no `torch.compile`).
+
+`r2st.stereo_depth.cached_s2m2_depth_m` (used by Examples 5 and 6) caches S2M2 disparity per h5 and camera at
+`<h5_dir>/<h5_stem>/s2m2_disparity/<camera>__model=<checkpoint>-<sha256[:12]>__refine_iter=<n>__frames=<T>.npy`. The
+key is the checkpoint file's hash, so swapping weights never reuses a stale cache, and it is disparity (not depth),
+so changing `fx` or the stereo baseline in `r2st.constants` does not invalidate it.
 
 ## Third party models used
 

@@ -37,3 +37,62 @@ class TestS2M2StereoDepth:
         est = S2M2StereoDepth("S", refine_iter=1, allow_negative=False, device="cuda")
         with pytest.raises(AssertionError):
             est.predict(np.zeros((64, 64, 3), np.uint8), np.zeros((64, 32, 3), np.uint8))
+
+
+class TestCachedS2M2Depth:
+    def test_caches_disparity_and_reuses_it(self, tmp_path, monkeypatch):
+        from r2st import stereo_depth
+
+        n_constructed = []
+
+        class FakeStereo:
+            def __init__(self, model_type, refine_iter, allow_negative, device):
+                n_constructed.append((model_type, refine_iter))
+
+            def disparity_sequence(self, left_rgb, right_rgb, desc):
+                return np.full(left_rgb.shape[:3], 10.0, dtype=np.float32)
+
+        monkeypatch.setattr(stereo_depth, "S2M2StereoDepth", FakeStereo)
+        monkeypatch.setattr(stereo_depth, "s2m2_checkpoint_id", lambda model_type: f"CKPT_{model_type}-0123456789ab")
+        h5_path = tmp_path / "traj_0.h5"
+        frames = np.zeros((3, 4, 5, 3), dtype=np.uint8)
+
+        depth = stereo_depth.cached_s2m2_depth_m(h5_path, "zed", frames, frames, 500.0, 0.12, "L", 3)
+        cache_path = stereo_depth.s2m2_disparity_cache_path(h5_path, "zed", "CKPT_L-0123456789ab", 3, 3)
+        assert (
+            cache_path
+            == tmp_path / "traj_0" / "s2m2_disparity" / "zed__model=CKPT_L-0123456789ab__refine_iter=3__frames=3.npy"
+        )
+        assert cache_path.is_file() and not cache_path.with_suffix(".npy.tmp").exists()
+        np.testing.assert_allclose(depth, 6.0)
+        assert n_constructed == [("L", 3)]
+
+        # Second call: read from the cache, no model; depth uses the new fx/baseline
+        depth = stereo_depth.cached_s2m2_depth_m(h5_path, "zed", frames, frames, 250.0, 0.12, "L", 3)
+        np.testing.assert_allclose(depth, 3.0)
+        assert n_constructed == [("L", 3)]
+
+    def test_rejects_cache_with_wrong_shape(self, tmp_path, monkeypatch):
+        from r2st import stereo_depth
+
+        monkeypatch.setattr(stereo_depth, "s2m2_checkpoint_id", lambda model_type: f"CKPT_{model_type}-0123456789ab")
+        h5_path = tmp_path / "traj_0.h5"
+        frames = np.zeros((3, 4, 5, 3), dtype=np.uint8)
+        cache_path = stereo_depth.s2m2_disparity_cache_path(h5_path, "zed", "CKPT_L-0123456789ab", 3, 3)
+        cache_path.parent.mkdir(parents=True)
+        np.save(cache_path, np.ones((3, 4, 6), dtype=np.float32))
+        with pytest.raises(AssertionError, match="Delete it to recompute"):
+            stereo_depth.cached_s2m2_depth_m(h5_path, "zed", frames, frames, 500.0, 0.12, "L", 3)
+
+
+def test_checkpoint_id_matches_file_sha256(tmp_path, monkeypatch):
+    import hashlib
+
+    from r2st import stereo_depth
+
+    monkeypatch.setattr(stereo_depth, "S2M2_WEIGHTS_DIR", tmp_path)
+    ckpt = tmp_path / "CH256NTR3.pth"
+    ckpt.write_bytes(b"weights v1")
+    assert stereo_depth.s2m2_checkpoint_id("L") == f"CH256NTR3-{hashlib.sha256(b'weights v1').hexdigest()[:12]}"
+    ckpt.write_bytes(b"weights v2")
+    assert stereo_depth.s2m2_checkpoint_id("L") == f"CH256NTR3-{hashlib.sha256(b'weights v2').hexdigest()[:12]}"
