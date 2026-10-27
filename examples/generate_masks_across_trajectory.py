@@ -9,7 +9,7 @@ import tyro
 from tqdm import tqdm
 
 from r2st.core import SAM3Predictor, bbox_xyxy_from_mask, binary_mask_to_sam_mask_input
-from r2st.utils import H264VideoWriter, ImageUtils, validate_merged_camera_group
+from r2st.utils import H264VideoWriter, ImageUtils, rgb_depth_dataset_paths
 
 """
 # Example usage:
@@ -52,8 +52,8 @@ def _log_elapsed(label: str, t0: float) -> None:
 
 def _load_rgb(h5_path: pathlib.Path, camera: str) -> np.ndarray:
     with h5py.File(h5_path, "r") as f:
-        validate_merged_camera_group(f, h5_path, camera)
-        rgb = f[f"obs/sensor_data/{camera}"]["rgb"][:]
+        rgb_path, _ = rgb_depth_dataset_paths(f, h5_path, camera)
+        rgb = f[rgb_path][:]
     assert rgb.ndim == 4 and rgb.shape[-1] == 3, f"Expected NxHxWx3 rgb, got {rgb.shape}"
     assert rgb.shape[0] >= 1, f"{h5_path}: camera '{camera}' has no frames"
     return rgb

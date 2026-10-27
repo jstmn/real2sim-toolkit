@@ -22,7 +22,7 @@ from r2st.utils import (
     ImageUtils,
     MeshUtils,
     TrackingVisualizer,
-    validate_merged_camera_group,
+    rgb_depth_dataset_paths,
 )
 
 """
@@ -87,9 +87,8 @@ class Args:
 
 def _load_rgb_depth(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray]:
     with h5py.File(h5_path, "r") as f:
-        validate_merged_camera_group(f, h5_path, camera)
-        group = f[f"obs/sensor_data/{camera}"]
-        return group["rgb"][:], group["depth"][:]
+        rgb_path, depth_path = rgb_depth_dataset_paths(f, h5_path, camera)
+        return f[rgb_path][:], f[depth_path][:]
 
 
 def _log_elapsed(label: str, t0: float) -> None:

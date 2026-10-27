@@ -55,25 +55,56 @@ gcloud storage cp --recursive gs://r2st-public/meshyai data/
 
 ## Data format
 
-Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of every dataset belongs to frame `i`.
-`r2st.utils.validate_merged_camera_group` checks the required camera datasets.
+Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of every dataset belongs to frame `i`. Each
+camera group `obs/sensor_data/<cam>/` uses one of two layouts. The examples read both:
+`r2st.utils.rgb_depth_dataset_paths` picks the stereo layout when `obs/sensor_data/<cam>/left/` exists, and the
+single-image layout otherwise. `<cam>` is the value you pass as `--camera` to the examples.
 
+Datasets shared by both layouts:
 
-| Dataset                                    | Shape          | Dtype   | Required | Notes                                                                                             |
-| -------------------------------------------- | ---------------- | --------- | ---------- | --------------------------------------------------------------------------------------------------- |
-| `obs/qpos`                                 | `(T, D)`       | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0                |
-| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                                               |
-| `obs/sensor_data/<cam>/depth`              | `(T, H, W)`    | uint16  | yes      | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K                         |
-| `obs/sensor_data/<cam>/timestamp_ms`       | `(T,)`         | float64 | yes      | Time of frame `i` (Unix epoch, ms)                                                                |
-| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)                                 |
-| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms)                               |
-| `obs/qvel`                                 | `(T, D)`       | float64 | no       | Joint velocities, same order as `obs/qpos`                                                        |
-| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)`         | int64   | no       | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
+| Dataset                                    | Shape    | Dtype   | Required | Notes                                                                                             |
+| ------------------------------------------ | -------- | ------- | -------- | ------------------------------------------------------------------------------------------------- |
+| `obs/qpos`                                 | `(T, D)` | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0                |
+| `obs/qvel`                                 | `(T, D)` | float64 | no       | Joint velocities, same order as `obs/qpos`                                                        |
+| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)`   | int64   | no       | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
+| `obs/sensor_data/<cam>/timestamp_ms`       | `(T,)`   | float64 | yes      | Time of frame `i` (Unix epoch, ms)                                                                |
 
-`<cam>` is the value you pass as `--camera` to the examples.
+### Single-image layout
 
-`data/demonstrations/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this format
+One RGB image and an aligned depth image per frame. Checked by `r2st.utils.validate_merged_camera_group`. Used by
+`grail_xarm_july_2` and the panda_utils recordings up to `Oct26_2026_datacollect/CokeInBowl__10-26-2026__13-02-11`.
+
+| Dataset                                    | Shape          | Dtype   | Required | Notes                                                               |
+| ------------------------------------------ | -------------- | ------- | -------- | ------------------------------------------------------------------- |
+| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                 |
+| `obs/sensor_data/<cam>/depth`              | `(T, H, W)`    | uint16  | yes      | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K |
+| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)   |
+| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms) |
+
+`data/demonstrations/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this layout
 (`data/demonstrations/grail_xarm_july_2/merge_camera_streams.py`).
+
+### Stereo layout
+
+panda_utils' `log_demonstration.py` records each ZED camera as a rectified stereo pair, with the camera's own depth
+stored as `left/depth_noisy`. Used by the panda_utils recordings from `Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45`
+on. The examples use `left/rgb` and `left/depth_noisy` exactly like `rgb` and `depth` above, so pass
+`--depth-intrinsics-source rgb`. Nothing reads `right/` yet.
+
+| Dataset                                               | Shape          | Dtype   | Required by the examples | Notes                                                                 |
+| ----------------------------------------------------- | -------------- | ------- | ------------------------ | --------------------------------------------------------------------- |
+| `obs/sensor_data/<cam>/left/rgb`                      | `(T, H, W, 3)` | uint8   | yes                      | Rectified left RGB                                                    |
+| `obs/sensor_data/<cam>/left/rgb_timestamp_ms`         | `(T,)`         | float64 | yes                      | Capture time of the left image used for frame `i` (Unix epoch, ms)    |
+| `obs/sensor_data/<cam>/left/depth_noisy`              | `(T, H, W)`    | uint16  | yes                      | Camera depth (ZED), mm, aligned to `left/rgb` (0 = no return). Unproject with the left K |
+| `obs/sensor_data/<cam>/left/depth_noisy_timestamp_ms` | `(T,)`         | float64 | no                       | Capture time of the depth image used for frame `i` (Unix epoch, ms)   |
+| `obs/sensor_data/<cam>/right/rgb`                     | `(T, H, W, 3)` | uint8   | no                       | Rectified right RGB, same size as `left/rgb`                          |
+| `obs/sensor_data/<cam>/right/rgb_timestamp_ms`        | `(T,)`         | float64 | no                       | Capture time of the right image used for frame `i` (Unix epoch, ms)   |
+
+`r2st.utils.validate_noisy_depth_camera_group` checks the `left/` RGB-D datasets (what the examples need), and
+`r2st.utils.validate_stereo_depth_camera_group` checks the `left/rgb` + `right/rgb` pair for stereo depth.
+
+Next to each stereo recording, panda_utils also saves `<cam>_camera_info_right.json`. Its `k` equals the left camera's
+(rectified pair), and its projection matrix `p[3]` is `-fx * baseline` (`zed2i`: -31.27 px / 261.08 px = 0.120 m).
 
 ## Examples
 

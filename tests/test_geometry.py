@@ -88,6 +88,16 @@ class TestReprojectDepthToColorFrame:
         assert aligned.dtype == np.float32
         assert aligned[2, 2] == pytest.approx(1.0, abs=1e-5)
 
+    def test_stereo_baseline_constants(self):
+        from r2st.constants import get_stereo_baseline_m
+
+        assert get_stereo_baseline_m("zed2i_vga") == pytest.approx(0.119765)
+        assert get_stereo_baseline_m("zedm_vga") == pytest.approx(0.0631272)
+        with pytest.raises(AssertionError, match="no stereo baseline"):
+            get_stereo_baseline_m("d435")
+        with pytest.raises(AssertionError, match="Unknown camera_model_id"):
+            get_stereo_baseline_m("zed3")
+
     def test_d435_depth_to_color_constants(self):
         from r2st.constants import DEPTH_TO_COLOR_ROTATION, DEPTH_TO_COLOR_TRANSLATION
 

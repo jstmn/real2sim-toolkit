@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import math
 import pathlib
 import shutil
 import threading
@@ -53,7 +54,7 @@ from r2st.utils import (
     ImageUtils,
     MeshUtils,
     farthest_point_sample_pyg_lib,
-    validate_merged_camera_group,
+    rgb_depth_dataset_paths,
 )
 
 CostFn = Callable[[np.ndarray], tuple[float, list[Any]]]
@@ -571,13 +572,12 @@ def index_ranges_text(indices: np.ndarray) -> str:
 def load_demo(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return rgb, depth, and qpos, aligned by frame index (same N)."""
     with h5py.File(h5_path, "r") as f:
-        validate_merged_camera_group(f, h5_path, camera)
+        rgb_path, depth_path = rgb_depth_dataset_paths(f, h5_path, camera)
         assert (
             "obs/qpos" in f
         ), f"{h5_path}: missing 'obs/qpos' (re-merge the demo with data/demonstrations/grail_xarm_july_2/merge_camera_streams.py)"
-        group = f[f"obs/sensor_data/{camera}"]
-        rgb = group["rgb"][:]
-        depth = group["depth"][:]
+        rgb = f[rgb_path][:]
+        depth = f[depth_path][:]
         qpos = np.asarray(f["obs/qpos"][:])
     assert qpos.ndim == 2, f"{h5_path}: obs/qpos must be NxD, got {qpos.shape}"
     assert qpos.shape[0] > 0, f"{h5_path}: obs/qpos is empty"
@@ -1333,7 +1333,7 @@ class ExtrinsicsVisualizerBase:
         @self._iter_slider.on_update
         def _on_iteration(_) -> None:
             value = self._iter_slider.value
-            assert value == value, "iteration slider value is NaN"
+            assert not math.isnan(value), "iteration slider value is NaN"
             value = int(value)
             cap = int(self._n_recorded)
             assert 0 <= value <= self._maxiter, f"iteration {value} not in [0, {self._maxiter}]"

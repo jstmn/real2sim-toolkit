@@ -168,6 +168,89 @@ def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str)
     ), f"{h5_path}:{group_path}: depth resolution {depth.shape[1:]} != rgb resolution {rgb.shape[1:3]}"
 
 
+# Stereo layout under obs/sensor_data/<camera>/ (panda_utils ZED recordings):
+#   timestamp_ms, left/[rgb, rgb_timestamp_ms, depth_noisy, depth_noisy_timestamp_ms], right/[rgb, rgb_timestamp_ms]
+# left/ and right/ are a rectified stereo pair. left/depth_noisy is the camera's own depth (e.g. ZED), registered to
+# left/rgb. The older single-image layout above (rgb, depth at the camera level) is still read via
+# rgb_depth_dataset_paths.
+NOISY_DEPTH_CAMERA_DATASETS = ("timestamp_ms", "left/rgb", "left/rgb_timestamp_ms", "left/depth_noisy")
+STEREO_DEPTH_CAMERA_DATASETS = (
+    "timestamp_ms",
+    "left/rgb",
+    "left/rgb_timestamp_ms",
+    "right/rgb",
+    "right/rgb_timestamp_ms",
+)
+
+
+def _stereo_layout_group(
+    f: h5py.File, h5_path: str | Path, camera: str, required: tuple[str, ...]
+) -> tuple[h5py.Group, int]:
+    """Return `obs/sensor_data/{camera}` and its frame count, after checking `required` and the left image stream."""
+    assert (
+        "obs/sensor_data" in f
+    ), f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {list(f.keys())}"
+    group_path = f"obs/sensor_data/{camera}"
+    assert (
+        group_path in f
+    ), f"Camera '{camera}' not found in {h5_path}. Available: {sorted(f['obs/sensor_data'].keys())}"
+    group = f[group_path]
+    for name in required:
+        assert name in group, f"{h5_path}:{group_path} missing dataset '{name}'"
+    timestamp_ms = group["timestamp_ms"]
+    assert timestamp_ms.ndim == 1, f"{h5_path}:{group_path}/timestamp_ms must be 1D, got {timestamp_ms.shape}"
+    num_frames = timestamp_ms.shape[0]
+    assert num_frames > 0, f"{h5_path}:{group_path} has no frames"
+    _validate_rgb_stream(group, f"{h5_path}:{group_path}", "left", num_frames)
+    return group, num_frames
+
+
+def _validate_rgb_stream(group: h5py.Group, path: str, eye: str, num_frames: int) -> None:
+    rgb, rgb_timestamp_ms = group[f"{eye}/rgb"], group[f"{eye}/rgb_timestamp_ms"]
+    assert rgb.ndim == 4 and rgb.shape[3] == 3, f"{path}/{eye}/rgb must be NxHxWx3, got {rgb.shape}"
+    assert rgb.dtype == np.uint8, f"{path}/{eye}/rgb must be uint8, got {rgb.dtype}"
+    assert rgb.shape[0] == num_frames, f"{path}/{eye}/rgb has {rgb.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert (
+        rgb_timestamp_ms.ndim == 1 and rgb_timestamp_ms.shape[0] == num_frames
+    ), f"{path}/{eye}/rgb_timestamp_ms must be ({num_frames},), got {rgb_timestamp_ms.shape}"
+
+
+def validate_noisy_depth_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
+    """Assert `obs/sensor_data/{camera}` has `left/rgb` and the camera's own depth, `left/depth_noisy`.
+
+    `left/depth_noisy` is uint16 millimeters already aligned to `left/rgb` (same H×W, same rays). Unproject it with the
+    left camera K. Do not treat it as a native depth-camera image.
+    """
+    group, num_frames = _stereo_layout_group(f, h5_path, camera, NOISY_DEPTH_CAMERA_DATASETS)
+    depth, rgb = group["left/depth_noisy"], group["left/rgb"]
+    path = f"{h5_path}:obs/sensor_data/{camera}/left/depth_noisy"
+    assert depth.ndim == 3, f"{path} must be NxHxW, got {depth.shape}"
+    assert depth.dtype == np.uint16, f"{path} must be uint16 millimeters, got {depth.dtype}"
+    assert depth.shape[0] == num_frames, f"{path} has {depth.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert depth.shape[1:] == rgb.shape[1:3], f"{path}: resolution {depth.shape[1:]} != left/rgb {rgb.shape[1:3]}"
+
+
+def validate_stereo_depth_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
+    """Assert `obs/sensor_data/{camera}` has a rectified stereo pair, `left/rgb` and `right/rgb`, of the same size."""
+    group, num_frames = _stereo_layout_group(f, h5_path, camera, STEREO_DEPTH_CAMERA_DATASETS)
+    _validate_rgb_stream(group, f"{h5_path}:obs/sensor_data/{camera}", "right", num_frames)
+    left, right = group["left/rgb"], group["right/rgb"]
+    assert (
+        right.shape == left.shape
+    ), f"{h5_path}:obs/sensor_data/{camera}: right/rgb {right.shape} != left/rgb {left.shape} (not a stereo pair)"
+
+
+def rgb_depth_dataset_paths(f: h5py.File, h5_path: str | Path, camera: str) -> tuple[str, str]:
+    """Validate `camera`'s RGB and camera-depth streams and return their dataset paths, for either layout: stereo
+    (`left/rgb`, `left/depth_noisy`) or the older single-image layout (`rgb`, `depth`)."""
+    group_path = f"obs/sensor_data/{camera}"
+    if f"{group_path}/left" in f:
+        validate_noisy_depth_camera_group(f, h5_path, camera)
+        return f"{group_path}/left/rgb", f"{group_path}/left/depth_noisy"
+    validate_merged_camera_group(f, h5_path, camera)
+    return f"{group_path}/rgb", f"{group_path}/depth"
+
+
 class H264VideoWriter:
     """Stream BGR uint8 frames to an H.264 mp4 through ffmpeg. OpenCV's "mp4v" (MPEG-4 Part 2) does not play in
     VS Code / Cursor, browsers, or stock Ubuntu players."""
@@ -334,10 +417,10 @@ class MeshUtils:
     ) -> Path:
         """Generate a GLB via Meshy from one or more images and save it to `glb_path`. Reuses `glb_path` if it
         already exists."""
-        from r2st.meshy import MESHY_API_KEY, MeshyAPI
-
         from PIL import Image
         from termcolor import colored
+
+        from r2st.meshy import MESHY_API_KEY, MeshyAPI
 
         image_paths = [Path(p) for p in image_paths]
         assert len(image_paths) > 0, "image_paths must not be empty"
@@ -686,14 +769,14 @@ class TrackingVisualizer:
             wxyz=wxyz0,
             position=mesh_position,
         )
-        frustum_kwargs: dict = dict(
-            fov=fov,
-            aspect=aspect,
-            scale=0.12,
-            line_width=1.5,
-            image=rgb_frames[0],
-            format="jpeg",
-        )
+        frustum_kwargs: dict = {
+            "fov": fov,
+            "aspect": aspect,
+            "scale": 0.12,
+            "line_width": 1.5,
+            "image": rgb_frames[0],
+            "format": "jpeg",
+        }
         if T_world_cam is not None:
             frustum_wxyz, frustum_pos = MeshUtils._pose_mat_to_wxyz_position(T_world_cam)
             frustum_kwargs["wxyz"] = frustum_wxyz

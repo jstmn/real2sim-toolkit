@@ -1,5 +1,5 @@
-"""Measured camera calibration, keyed by camera_model_id (e.g. 'd435'), and measured workspace bounds, keyed by
-workspace_id (e.g. 'vention-franka-table').
+"""Measured camera calibration (intrinsics, depth-to-colour extrinsics, stereo baselines), keyed by camera_model_id
+(e.g. 'd435'), and measured workspace bounds, keyed by workspace_id (e.g. 'vention-franka-table').
 
 Values are hardware readouts, not guessed defaults.
 """
@@ -210,6 +210,26 @@ assert DEPTH_INTRINSICS.keys() == DEPTH_TO_COLOR_TRANSLATION.keys(), (
 )
 
 
+# Distance between the rectified left and right cameras of a stereo pair, in meters, for stereo depth
+# (depth = fx * baseline / disparity). The baseline does not depend on the streaming resolution. Values are the ZED
+# SDK's factory calibration, `Baseline` (mm) under [STEREO] in /usr/local/zed/settings/SN<serial>.conf. They match the
+# `<cam>_camera_info_right.json` that panda_utils saves next to stereo recordings, whose `p[3]` is -fx * baseline.
+STEREO_BASELINE_M: dict[str, float] = {
+    # ZED, serial 18838
+    "zed_vga": 0.120,
+    # ZED 2i, serial 33386243
+    "zed2i_hd720": 0.119765,
+    "zed2i_vga": 0.119765,
+    # ZED Mini, serial 15137730
+    "zedm_vga": 0.0631272,
+}
+
+assert STEREO_BASELINE_M.keys() <= DEPTH_INTRINSICS.keys(), (
+    f"STEREO_BASELINE_M keys {sorted(STEREO_BASELINE_M)} must be camera_model_ids in DEPTH_INTRINSICS "
+    f"{sorted(DEPTH_INTRINSICS)}"
+)
+
+
 def _require_camera_model(camera_model_id: str) -> None:
     assert (
         camera_model_id in DEPTH_INTRINSICS
@@ -229,3 +249,11 @@ def get_color_intrinsics(camera_model_id: str) -> CameraIntrinsics:
 def get_depth_to_color_extrinsics(camera_model_id: str) -> tuple[np.ndarray, np.ndarray]:
     _require_camera_model(camera_model_id)
     return DEPTH_TO_COLOR_ROTATION[camera_model_id], DEPTH_TO_COLOR_TRANSLATION[camera_model_id]
+
+
+def get_stereo_baseline_m(camera_model_id: str) -> float:
+    _require_camera_model(camera_model_id)
+    assert (
+        camera_model_id in STEREO_BASELINE_M
+    ), f"camera_model_id {camera_model_id!r} has no stereo baseline. Available: {sorted(STEREO_BASELINE_M)}"
+    return STEREO_BASELINE_M[camera_model_id]

@@ -65,6 +65,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+# Tests that call the real OpenAI API spend credits, so they only run when asked for: `pytest -m live_openai`.
+markers = ["live_openai: calls the real OpenAI API (spends credits)"]
+addopts = "-m 'not live_openai'"
 
 [tool.uv]
 find-links = ["https://data.pyg.org/whl/torch-2.13.0+cu130.html"]

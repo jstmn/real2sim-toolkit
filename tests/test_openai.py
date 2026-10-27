@@ -17,9 +17,11 @@ class TestListObjectsInImage:
 
         img = np.ones((10, 10, 3), dtype=np.uint8) * 128
         mock_client = self._mock_openai("red cup . blue box")
-        with patch("r2st.openai.OpenAI", return_value=mock_client):
-            with patch.dict("os.environ", {"OPENAI_API_KEY": "test"}):
-                result = list_objects_in_image(img)
+        with (
+            patch("r2st.openai.OpenAI", return_value=mock_client),
+            patch.dict("os.environ", {"OPENAI_API_KEY": "test"}),
+        ):
+            result = list_objects_in_image(img)
         assert result == ["red cup", "blue box"]
 
     def test_path_string_input(self, tmp_path):
@@ -30,7 +32,10 @@ class TestListObjectsInImage:
         p = tmp_path / "img.jpg"
         Image.fromarray(np.zeros((10, 10, 3), dtype=np.uint8)).save(p)
         mock_client = self._mock_openai("green block")
-        with patch("r2st.openai.OpenAI", return_value=mock_client):
+        with (
+            patch("r2st.openai.OpenAI", return_value=mock_client),
+            patch.dict("os.environ", {"OPENAI_API_KEY": "test"}),
+        ):
             result = list_objects_in_image(str(p))
         assert result == ["green block"]
 
@@ -53,7 +58,10 @@ class TestListObjectsInImage:
 
         img = np.ones((5, 5, 3), dtype=np.uint8)
         mock_client = self._mock_openai("  red cup  .  blue box  ")
-        with patch("r2st.openai.OpenAI", return_value=mock_client):
+        with (
+            patch("r2st.openai.OpenAI", return_value=mock_client),
+            patch.dict("os.environ", {"OPENAI_API_KEY": "test"}),
+        ):
             result = list_objects_in_image(img)
         assert result == ["red cup", "blue box"]
 
@@ -83,12 +91,8 @@ class TestQueryOpenaiScript:
             main(args)
 
 
+@pytest.mark.live_openai
 class TestLiveOpenAI:
-    @pytest.mark.skipif(
-        not __import__("os").getenv("OPENAI_API_KEY")
-        or __import__("os").getenv("OPENAI_API_KEY") in ("dummy", "test", ""),
-        reason="OPENAI_API_KEY not set or is dummy — skipping live API test",
-    )
     def test_red_block_image_contains_red_or_block(self):
         from pathlib import Path
 
