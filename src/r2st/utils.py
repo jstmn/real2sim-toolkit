@@ -750,6 +750,7 @@ class _CameraCloud:
         visible: bool,
         object_points: np.ndarray | None,
         object_color: tuple[int, int, int],
+        workspace_bounds,
     ):
         H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
         fy = float(K[1, 1])
@@ -758,6 +759,10 @@ class _CameraCloud:
         self.depth_m_frames = depth_m_frames
         self.K = K
         self.T_world_cam = T_world_cam
+        assert (
+            workspace_bounds is None or T_world_cam is not None
+        ), f"{name}: workspace_bounds are in the robot-base frame, so T_world_cam is required to crop to them"
+        self.workspace_bounds = workspace_bounds
         frustum_kwargs: dict = {
             "fov": float(2.0 * np.arctan(H / (2.0 * fy))),
             "aspect": W / H,
@@ -810,6 +815,9 @@ class _CameraCloud:
         pts, colors = depth_rgb_to_pointcloud(self.depth_m_frames[t], self.rgb_frames[t], self.K)
         if self.T_world_cam is not None:
             pts = _transform_points_se3(self.T_world_cam, pts)
+        if self.workspace_bounds is not None:
+            inside = self.workspace_bounds.contains(pts)
+            pts, colors = pts[inside], colors[inside]
         self.pcd.points = pts
         self.pcd.colors = colors
 
@@ -822,6 +830,7 @@ class TrackingVisualizer:
     FoundationPose uses); `extra_cameras` (robot-base frame, so `T_world_cam` is required with them) add their own
     frustums and point clouds. Every point cloud and the mesh have a visibility checkbox. `object_points` (and each
     extra camera's) are the frame-0 masked points, shown in a solid color per camera behind an off-by-default checkbox.
+    `workspace_bounds` (a robot-base `WorkspaceBounds`, so `T_world_cam` is required) crops the shown point clouds to it.
     """
 
     def __init__(
@@ -835,6 +844,7 @@ class TrackingVisualizer:
         T_world_cam: np.ndarray | None = None,
         extra_cameras: list[VisualizerCamera] | None = None,
         object_points: np.ndarray | None = None,
+        workspace_bounds=None,
     ) -> None:
         import viser
 
@@ -919,6 +929,7 @@ class TrackingVisualizer:
                 T_world_cam,
                 visible=True,
                 object_points=object_points,
+                workspace_bounds=workspace_bounds,
                 object_color=_OBJECT_POINT_COLORS[0],
             )
         ]
@@ -934,6 +945,7 @@ class TrackingVisualizer:
                     np.asarray(cam.T_world_cam, dtype=np.float64),
                     visible=True,
                     object_points=cam.object_points,
+                    workspace_bounds=workspace_bounds,
                     object_color=_OBJECT_POINT_COLORS[(i + 1) % len(_OBJECT_POINT_COLORS)],
                 )
             )
@@ -981,11 +993,36 @@ class TrackingVisualizer:
             )
         self._apply_timestep(0)
         if self._num_frames > 1:
+            import threading
+            import time
+
             slider = self._server.gui.add_slider("timestep", min=0, max=self._num_frames - 1, step=1, initial_value=0)
 
             @slider.on_update
             def _on_timestep(_) -> None:
                 self._apply_timestep(int(slider.value))
+
+            play_button = self._server.gui.add_button("Play")
+            playback_fps = self._server.gui.add_slider("playback fps", min=1, max=30, step=1, initial_value=15)
+            playing = threading.Event()
+
+            @play_button.on_click
+            def _on_play(_) -> None:
+                if playing.is_set():
+                    playing.clear()
+                    play_button.label = "Play"
+                else:
+                    playing.set()
+                    play_button.label = "Pause"
+
+            def _play_loop() -> None:
+                # Setting the slider runs _on_timestep, so the scene follows; wraps around at the last frame
+                while True:
+                    playing.wait()
+                    slider.value = (int(slider.value) + 1) % self._num_frames
+                    time.sleep(1.0 / playback_fps.value)
+
+            threading.Thread(target=_play_loop, daemon=True).start()
 
     def _apply_timestep(self, t: int) -> None:
         assert self._poses_scene is not None, "set_poses must be called before applying timesteps"

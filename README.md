@@ -151,6 +151,7 @@ This script estimates the extrinsics matrix of the specified camera using a grad
 ![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
 
 ```bash
+# ============ Dataset 1: GRAIL Xarm6, July 2 2026 ============
 
 # Seed CMA-ES with the GUI.
 uv run python examples/estimate_camera_extrinsics_rgb.py \
@@ -177,59 +178,124 @@ uv run python examples/estimate_camera_extrinsics_rgb.py \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 
+# ============ Dataset 2: RESL Panda, Oct 27 2026 ============
+# CAMERA: zed2i
+uv run python examples/estimate_camera_extrinsics_rgb.py \
+  --h5-path data/demonstrations/Oct27_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed2i \
+  --camera-model-id zed2i_vga \
+  --depth-intrinsics-source rgb \
+  --n-timesteps 20 \
+  --per-frame-robot-masks \
+  --output-path data/demonstrations/Oct27_2026_datacollect/extrinsics_zed2i.rgb.yaml \
+  --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
+  --visualize
 
-# ============ Dataset 2: PickCube, 4 cm red cube ============
-# The Meshy cube PCA-scaled to frame-0 depth comes out ~27% too small (2.9 cm), so FoundationPose tilts it and slides
-# it instead of lifting it. With a correctly sized mesh (the last two commands) it tracks flat, with the right yaw, and
-# lifts with the gripper.
+# CAMERA: zed
+uv run python examples/estimate_camera_extrinsics_rgb.py \
+  --h5-path data/demonstrations/Oct27_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed \
+  --camera-model-id zed_vga \
+  --depth-intrinsics-source rgb \
+  --n-timesteps 20 \
+  --per-frame-robot-masks \
+  --output-path data/demonstrations/Oct27_2026_datacollect/extrinsics_zed.rgb.yaml \
+  --seed-pose 0.9296 0.2276 0.1298 0.2800 -0.3911 -0.7200 0.5003 \
+  --visualize
+```
 
-# zed2i, Meshy mesh + PCA scaling
+Exactly one seed mode is required:
+
+- `--seed-automatically` evaluates the configured spherical grid before CMA-ES.
+- `--seed-from-gui` starts Viser and waits for a manual seed. Click the 3D view, then use
+  world-frame (robot-base) hotkeys: R/F X, T/G Y, Y/H Z, U/J roll about X, I/K pitch about Y,
+  O/L yaw about Z (top row +, bottom row -). Press Enter or click **Select seed and start CMA-ES**.
+  `--gui-translation-step-m` and `--gui-rotation-step-deg` control the increments.
+- `--seed-pose x y z qw qx qy qz` seeds CMA-ES with that robot-base camera pose.
+
+`--robot-id` is a Jrl2 robot name. The following are supported:
+
+
+| `--robot-id`                         | End effector                                           |
+| -------------------------------------- | -------------------------------------------------------- |
+| `panda`                              | Franka hand (fingers are part of the base description) |
+| `panda_zed_wrist_cam__panda_gripper` | Franka hand + DROID ZED Mini wrist camera              |
+| `ur5`                                | none                                                   |
+| `ur10`                               | none                                                   |
+| `xarm7`                              | none                                                   |
+| `xarm7__gripper`                     | UFACTORY parallel-jaw gripper                          |
+| `xarm7__bio_gripper`                 | UFACTORY BIO gripper                                   |
+| `xarm7__vacuum_gripper`              | UFACTORY vacuum gripper                                |
+
+Demo `obs/qpos` is arm joints only. Extra EEF joints (e.g. `drive_joint` on `xarm7__gripper`)
+are pinned at 0 (closed gripper).
+
+Robot masks: SAM 3 runs on **frame 0** (union of the top `--sam-kmax` masks). That union is
+propagated through the rest of the trajectory with SAM 3 `mask_input` plus the previous mask's bbox,
+so contact with an object does not expand the robot mask.
+
+### Example 5: Track an object with FoundationPose++
+
+Track an object through the demonstration. Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
+Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
+`r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
+If the camera has a stereo pair (`<cam>/right/rgb`, see Stereo layout), the depth used for mesh scaling and tracking is S2M2 stereo depth from `left/rgb` + `right/rgb` (`--s2m2-model-type`, default `XL`); otherwise it is the depth stored in the h5. The script prints which one it uses.
+Pass `--mesh-path <mesh>.glb` to track a known mesh (e.g. a measured ground-truth cube, in meters) instead: it is used as-is, with no Meshy call and no PCA scaling, and outputs go to `<output_dir>/<mesh stem>__<camera>/`. `--object-description` is still the SAM 3 prompt.
+FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-paths` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
+`--cameras`, `--camera-model-ids` and `--extrinsics-paths` are parallel lists. The first camera is tracked (and its
+frame-0 crop is what Meshy gets); every camera's frame-0 object points are merged in the robot-base frame for the PCA
+mesh scaling, so more than one camera requires `--extrinsics-paths`. The merged cloud is saved as
+`<desc>__scaling_points.ply`. Those object points come from each camera's frame-0 SAM mask eroded by
+`--object-mask-erode-px` (default 5, about 2 px per side, to drop mixed depth at the object's edges); FoundationPose
+registers with the full mask. In viser, every camera's point cloud, its frame-0 object points and the mesh have
+visibility checkboxes.
+`--crop-pointcloud-to-workspace --workspace-id vention-franka-table` (an `r2st.constants.WORKSPACE_BOUNDS` id; needs
+`--extrinsics-paths`) shows only the point-cloud points inside that robot-base box. Off by default; it only affects
+the viewer.
+
+![FoundationPose mustard bottle tracking](media/mustard_bottle__track.foundationpose.gif)
+
+```bash
+# Start the server: `cd src/r2st/FoundationPose/docker; sudo bash run_container.sh`, then in the container:
+cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
+
+# ============ Dataset 1: GRAIL Xarm6, July 2 2026 ============
+
 uv run python examples/track_object.py \
-    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
-    --cameras zed2i \
-    --camera-model-ids zed2i_vga \
-    --object-description "red cube" \
-    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
+    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --cameras cam_1 \
+    --camera-model-ids d435 \
+    --object-description "mustard bottle" \
+    --extrinsics-paths data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
 
-# zed, Meshy mesh + PCA scaling
-uv run python examples/track_object.py \
-    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
-    --cameras zed \
-    --camera-model-ids zed_vga \
-    --object-description "red cube" \
-    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
-    --visualize --no-use-2d-tracker --no-use-kalman-filter
 
-# Track with zed; PCA-scale the Meshy mesh to the merged frame-0 point cloud of zed and zed2i. Still ~20% small
-# (3.2 cm): both cameras see only the top and near sides of the cube
+# ============ Dataset 2: RESL Panda, Oct 27 2026 ============
+
+# H5_PATH=data/demonstrations/Oct27_2026_datacollect/PickCube_6x6x6cm_Lighting2__10-27-2026__10-27-58/traj_0__VGA.h5  # scene has a lamp here
+H5_PATH=data/demonstrations/Oct27_2026_datacollect/PickCube_6x6x6cm__10-27-2026__10-36-27/traj_0__VGA.h5
+
+# Track with zed2i (both cameras' frame-0 points are merged to scale the Meshy mesh)
 uv run python examples/track_object.py \
-    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --h5-path ${H5_PATH} \
+    --cameras zed2i zed \
+    --camera-model-ids zed2i_vga zed_vga \
+    --object-description "red cube" \
+    --extrinsics-paths data/demonstrations/Oct27_2026_datacollect/extrinsics_zed2i.rgb.yaml data/demonstrations/Oct27_2026_datacollect/extrinsics_zed.rgb.yaml \
+    --crop-pointcloud-to-workspace --workspace-id vention-franka-table \
+    --visualize
+
+# Track with zed
+uv run python examples/track_object.py \
+    --h5-path ${H5_PATH} \
     --cameras zed zed2i \
     --camera-model-ids zed_vga zed2i_vga \
     --object-description "red cube" \
-    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed2i.rgb.yaml \
-    --visualize --no-use-2d-tracker --no-use-kalman-filter
-
-# Works: the Meshy mesh scaled by hand to 4 cm (no PCA scaling)
-uv run python examples/track_object.py \
-    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
-    --cameras zed \
-    --camera-model-ids zed_vga \
-    --object-description "red cube" \
-    --mesh-path data/meshyai/red_cube__zed/red_cube_meshy_4cm.glb \
-    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
-    --visualize --no-use-2d-tracker --no-use-kalman-filter
-
-# Works: measured ground-truth 4x4x4 cm cube
-uv run python examples/track_object.py \
-    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
-    --cameras zed \
-    --camera-model-ids zed_vga \
-    --object-description "red cube" \
-    --mesh-path data/meshyai/red_cube_ground_truth__zed2i/red_cube_ground_truth_4x4x4cm.glb \
-    --extrinsics-paths data/demonstrations/Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45/extrinsics_zed.rgb.yaml \
-    --visualize --no-use-2d-tracker --no-use-kalman-filter
+    --extrinsics-paths data/demonstrations/Oct27_2026_datacollect/extrinsics_zed.rgb.yaml data/demonstrations/Oct27_2026_datacollect/extrinsics_zed2i.rgb.yaml \
+    --crop-pointcloud-to-workspace --workspace-id vention-franka-table \
+    --visualize
 ```
 
 ### Example 6: Compare camera depth with S2M2 stereo depth

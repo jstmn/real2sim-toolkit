@@ -9,7 +9,11 @@ import trimesh
 import tyro
 from tqdm import tqdm
 
-from r2st.constants import get_color_intrinsics, get_stereo_baseline_m
+from r2st.constants import (
+    get_color_intrinsics,
+    get_stereo_baseline_m,
+    get_workspace_bounds,
+)
 from r2st.core import SAM3Predictor
 from r2st.geometry import (
     depth_mm_to_meters,
@@ -97,6 +101,14 @@ class Args:
 
     use_kalman_filter: bool = True
     """Fuse Cutie (x, y) with FoundationPose via a 6-DoF Kalman filter. Requires use_2d_tracker."""
+
+    crop_pointcloud_to_workspace: bool = False
+    """If set, the viser point clouds only show points inside the --workspace-id robot-base box. Viewer only: tracking
+    and mesh scaling are unchanged. Requires --workspace-id and --extrinsics-paths."""
+
+    workspace_id: str | None = None
+    """Workspace id from `r2st.constants.WORKSPACE_BOUNDS` (e.g. 'vention-franka-table'), used by
+    --crop-pointcloud-to-workspace."""
 
     object_mask_erode_px: int = 5
     """Erode each camera's frame-0 SAM mask with this kernel size (0, or odd: 5 removes about 2 px per side) before
@@ -255,6 +267,17 @@ def main(args: Args) -> None:
         assert args.mesh_path.is_file(), f"--mesh-path not found: {args.mesh_path}"
         assert args.mesh_path.suffix == ".glb", f"--mesh-path must be a .glb, got {args.mesh_path}"
 
+    workspace_bounds = None
+    assert (
+        args.crop_pointcloud_to_workspace or args.workspace_id is None
+    ), "--workspace-id is only used by --crop-pointcloud-to-workspace, which is off"
+    if args.crop_pointcloud_to_workspace:
+        assert args.workspace_id is not None, "--crop-pointcloud-to-workspace requires --workspace-id"
+        assert (
+            args.extrinsics_paths is not None
+        ), "--crop-pointcloud-to-workspace needs --extrinsics-paths: the workspace bounds are in the robot-base frame"
+        workspace_bounds = get_workspace_bounds(args.workspace_id)
+
     T_world_cams = None
     if args.extrinsics_paths is not None:
         assert (
@@ -347,6 +370,7 @@ def main(args: Args) -> None:
             camera_name=camera,
             T_world_cam=T_world_cam,
             object_points=tracked.object_pts0,
+            workspace_bounds=workspace_bounds,
             extra_cameras=[
                 VisualizerCamera(obs.camera, obs.rgb, obs.depth_m, obs.K, T, obs.object_pts0)
                 for obs, T in zip(observations[1:], ([] if T_world_cams is None else T_world_cams[1:]), strict=True)
