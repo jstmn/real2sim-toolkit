@@ -85,7 +85,7 @@ DEPTH_INTRINSICS: dict[str, CameraIntrinsics] = {
         cy=365.680359,
     ),
     # ZED / ZED 2i / ZED Mini at VGA. Depth is registered to the rectified left image, so these equal the colour K
-    # (the <cam>_camera_info_depth.json files panda_utils saves are identical to the colour ones).
+    # (the `depth_noisy` entry of the <cam>_camera_info.json panda_utils saves is identical to `left`).
     "zed_vga": CameraIntrinsics(
         width=672,
         height=376,
@@ -145,7 +145,7 @@ COLOR_INTRINSICS: dict[str, CameraIntrinsics] = {
         cy=365.680359,
     ),
     # Left rectified image at VGA, from the ROS camera_info that panda_utils' log_demonstration.py saves as
-    # <cam>_camera_info_color.json next to each trajectory (rectified, so all distortion coefficients are 0).
+    # `left` in <cam>_camera_info.json next to each trajectory (rectified, so all distortion coefficients are 0).
     "zed_vga": CameraIntrinsics(
         width=672,
         height=376,
@@ -213,7 +213,7 @@ assert DEPTH_INTRINSICS.keys() == DEPTH_TO_COLOR_TRANSLATION.keys(), (
 # Distance between the rectified left and right cameras of a stereo pair, in meters, for stereo depth
 # (depth = fx * baseline / disparity). The baseline does not depend on the streaming resolution. Values are the ZED
 # SDK's factory calibration, `Baseline` (mm) under [STEREO] in /usr/local/zed/settings/SN<serial>.conf. They match the
-# `<cam>_camera_info_right.json` that panda_utils saves next to stereo recordings, whose `p[3]` is -fx * baseline.
+# `right` entry of the <cam>_camera_info.json panda_utils saves next to stereo recordings (`p[3]` = -fx * baseline).
 STEREO_BASELINE_M: dict[str, float] = {
     # ZED, serial 18838
     "zed_vga": 0.120,

@@ -103,8 +103,8 @@ on. The examples use `left/rgb` and `left/depth_noisy` exactly like `rgb` and `d
 `r2st.utils.validate_noisy_depth_camera_group` checks the `left/` RGB-D datasets (what the examples need), and
 `r2st.utils.validate_stereo_depth_camera_group` checks the `left/rgb` + `right/rgb` pair for stereo depth.
 
-Next to each stereo recording, panda_utils also saves `<cam>_camera_info_right.json`. Its `k` equals the left camera's
-(rectified pair), and its projection matrix `p[3]` is `-fx * baseline` (`zed2i`: -31.27 px / 261.08 px = 0.120 m).
+Next to each recording, panda_utils also saves `<cam>_camera_info.json`, the ROS camera_info keyed `left`, `depth_noisy`
+and `right` (stereo only). `right.k` equals `left.k` (rectified pair), and `right.p[3]` is `-fx * baseline` (`zed2i`: -31.27 px / 261.08 px = 0.120 m).
 
 ## Examples
 
