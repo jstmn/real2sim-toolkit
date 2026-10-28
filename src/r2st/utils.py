@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import h5py
@@ -120,7 +121,29 @@ def farthest_point_sample_pyg_lib(
     return local
 
 
+def erode_mask(mask: np.ndarray, kernel_px: int) -> np.ndarray:
+    """Erode a bool mask with an elliptical kernel of size `kernel_px` (odd; `2 * n + 1` removes about `n` px from each
+    side). `kernel_px=0` is a no-op."""
+    import cv2
+
+    assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
+    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
+    assert mask.any(), "Cannot erode an empty mask"
+    assert kernel_px == 0 or (
+        kernel_px >= 1 and kernel_px % 2 == 1
+    ), f"mask_erode_px must be 0 or a positive odd int, got {kernel_px}"
+    if kernel_px == 0:
+        return mask
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
+    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
+    assert eroded.any(), f"Mask empty after erode with kernel_px={kernel_px} (had {int(mask.sum())} pixels)"
+    return eroded
+
+
 MERGED_CAMERA_DATASETS = ("rgb", "depth", "timestamp_ms", "rgb_timestamp_ms")
+
+# Masked crops smaller than this on either side give Meshy too little detail to reconstruct from
+MESHY_MIN_IMAGE_SIDE_PX = 100
 
 
 def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
@@ -163,6 +186,89 @@ def validate_merged_camera_group(f: h5py.File, h5_path: str | Path, camera: str)
     assert (
         depth.shape[1:] == rgb.shape[1:3]
     ), f"{h5_path}:{group_path}: depth resolution {depth.shape[1:]} != rgb resolution {rgb.shape[1:3]}"
+
+
+# Stereo layout under obs/sensor_data/<camera>/ (panda_utils ZED recordings):
+#   timestamp_ms, left/[rgb, rgb_timestamp_ms, depth_noisy, depth_noisy_timestamp_ms], right/[rgb, rgb_timestamp_ms]
+# left/ and right/ are a rectified stereo pair. left/depth_noisy is the camera's own depth (e.g. ZED), registered to
+# left/rgb. The older single-image layout above (rgb, depth at the camera level) is still read via
+# rgb_depth_dataset_paths.
+NOISY_DEPTH_CAMERA_DATASETS = ("timestamp_ms", "left/rgb", "left/rgb_timestamp_ms", "left/depth_noisy")
+STEREO_DEPTH_CAMERA_DATASETS = (
+    "timestamp_ms",
+    "left/rgb",
+    "left/rgb_timestamp_ms",
+    "right/rgb",
+    "right/rgb_timestamp_ms",
+)
+
+
+def _stereo_layout_group(
+    f: h5py.File, h5_path: str | Path, camera: str, required: tuple[str, ...]
+) -> tuple[h5py.Group, int]:
+    """Return `obs/sensor_data/{camera}` and its frame count, after checking `required` and the left image stream."""
+    assert (
+        "obs/sensor_data" in f
+    ), f"{h5_path}: missing 'obs/sensor_data' group (not a merged sensor-data h5?). keys: {list(f.keys())}"
+    group_path = f"obs/sensor_data/{camera}"
+    assert (
+        group_path in f
+    ), f"Camera '{camera}' not found in {h5_path}. Available: {sorted(f['obs/sensor_data'].keys())}"
+    group = f[group_path]
+    for name in required:
+        assert name in group, f"{h5_path}:{group_path} missing dataset '{name}'"
+    timestamp_ms = group["timestamp_ms"]
+    assert timestamp_ms.ndim == 1, f"{h5_path}:{group_path}/timestamp_ms must be 1D, got {timestamp_ms.shape}"
+    num_frames = timestamp_ms.shape[0]
+    assert num_frames > 0, f"{h5_path}:{group_path} has no frames"
+    _validate_rgb_stream(group, f"{h5_path}:{group_path}", "left", num_frames)
+    return group, num_frames
+
+
+def _validate_rgb_stream(group: h5py.Group, path: str, eye: str, num_frames: int) -> None:
+    rgb, rgb_timestamp_ms = group[f"{eye}/rgb"], group[f"{eye}/rgb_timestamp_ms"]
+    assert rgb.ndim == 4 and rgb.shape[3] == 3, f"{path}/{eye}/rgb must be NxHxWx3, got {rgb.shape}"
+    assert rgb.dtype == np.uint8, f"{path}/{eye}/rgb must be uint8, got {rgb.dtype}"
+    assert rgb.shape[0] == num_frames, f"{path}/{eye}/rgb has {rgb.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert (
+        rgb_timestamp_ms.ndim == 1 and rgb_timestamp_ms.shape[0] == num_frames
+    ), f"{path}/{eye}/rgb_timestamp_ms must be ({num_frames},), got {rgb_timestamp_ms.shape}"
+
+
+def validate_noisy_depth_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
+    """Assert `obs/sensor_data/{camera}` has `left/rgb` and the camera's own depth, `left/depth_noisy`.
+
+    `left/depth_noisy` is uint16 millimeters already aligned to `left/rgb` (same H×W, same rays). Unproject it with the
+    left camera K. Do not treat it as a native depth-camera image.
+    """
+    group, num_frames = _stereo_layout_group(f, h5_path, camera, NOISY_DEPTH_CAMERA_DATASETS)
+    depth, rgb = group["left/depth_noisy"], group["left/rgb"]
+    path = f"{h5_path}:obs/sensor_data/{camera}/left/depth_noisy"
+    assert depth.ndim == 3, f"{path} must be NxHxW, got {depth.shape}"
+    assert depth.dtype == np.uint16, f"{path} must be uint16 millimeters, got {depth.dtype}"
+    assert depth.shape[0] == num_frames, f"{path} has {depth.shape[0]} frames, timestamp_ms has {num_frames}"
+    assert depth.shape[1:] == rgb.shape[1:3], f"{path}: resolution {depth.shape[1:]} != left/rgb {rgb.shape[1:3]}"
+
+
+def validate_stereo_depth_camera_group(f: h5py.File, h5_path: str | Path, camera: str) -> None:
+    """Assert `obs/sensor_data/{camera}` has a rectified stereo pair, `left/rgb` and `right/rgb`, of the same size."""
+    group, num_frames = _stereo_layout_group(f, h5_path, camera, STEREO_DEPTH_CAMERA_DATASETS)
+    _validate_rgb_stream(group, f"{h5_path}:obs/sensor_data/{camera}", "right", num_frames)
+    left, right = group["left/rgb"], group["right/rgb"]
+    assert (
+        right.shape == left.shape
+    ), f"{h5_path}:obs/sensor_data/{camera}: right/rgb {right.shape} != left/rgb {left.shape} (not a stereo pair)"
+
+
+def rgb_depth_dataset_paths(f: h5py.File, h5_path: str | Path, camera: str) -> tuple[str, str]:
+    """Validate `camera`'s RGB and camera-depth streams and return their dataset paths, for either layout: stereo
+    (`left/rgb`, `left/depth_noisy`) or the older single-image layout (`rgb`, `depth`)."""
+    group_path = f"obs/sensor_data/{camera}"
+    if f"{group_path}/left" in f:
+        validate_noisy_depth_camera_group(f, h5_path, camera)
+        return f"{group_path}/left/rgb", f"{group_path}/left/depth_noisy"
+    validate_merged_camera_group(f, h5_path, camera)
+    return f"{group_path}/rgb", f"{group_path}/depth"
 
 
 class H264VideoWriter:
@@ -325,26 +431,40 @@ class MeshUtils:
     @staticmethod
     def generate_with_meshy(
         image_paths: Sequence[str | Path],
-        output_dir: str | Path,
+        glb_path: str | Path,
         *,
         enable_pbr: bool = True,
     ) -> Path:
-        """Generate a GLB via Meshy from one or more images. Reuses `output_dir/model_glb.glb` if present."""
+        """Generate a GLB via Meshy from one or more images and save it to `glb_path`. Reuses `glb_path` if it
+        already exists."""
+        from PIL import Image
+        from termcolor import colored
+
         from r2st.meshy import MESHY_API_KEY, MeshyAPI
 
         image_paths = [Path(p) for p in image_paths]
         assert len(image_paths) > 0, "image_paths must not be empty"
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        existing = output_dir / "model_glb.glb"
-        if existing.is_file():
-            print(f"[info] Reusing existing Meshy GLB at {existing}")
-            return existing
+        for image_path in image_paths:
+            with Image.open(image_path) as image:
+                width, height = image.size
+            if width < MESHY_MIN_IMAGE_SIDE_PX or height < MESHY_MIN_IMAGE_SIDE_PX:
+                print(
+                    colored(
+                        f"[warning] {image_path} is {width}x{height}, under "
+                        f"{MESHY_MIN_IMAGE_SIDE_PX}x{MESHY_MIN_IMAGE_SIDE_PX}. Meshy is likely to produce a "
+                        "terrible mesh from an image this low-resolution.",
+                        "yellow",
+                    )
+                )
+        glb_path = Path(glb_path)
+        if glb_path.is_file():
+            print(f"[info] Reusing existing Meshy GLB at {glb_path}")
+            return glb_path
         assert MESHY_API_KEY is not None and len(MESHY_API_KEY) > 0, "MESHY_API_KEY is not set"
         api = MeshyAPI(MESHY_API_KEY)
-        result_path = Path(api.image_to_3d(image_paths=image_paths, output_dir=output_dir, enable_pbr=enable_pbr))
-        assert result_path.is_file(), f"MeshyAPI did not create result at {result_path}"
-        return result_path
+        result_path = api.image_to_3d(image_paths=image_paths, glb_path=glb_path, enable_pbr=enable_pbr)
+        assert result_path == glb_path, f"MeshyAPI wrote {result_path}, expected {glb_path}"
+        return glb_path
 
     @staticmethod
     def _pose_mat_to_wxyz_position(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -402,6 +522,7 @@ class MeshUtils:
             depth_m_frames,
             K,
             mesh_position=np.asarray(poses_cam)[0, :3, 3],
+            camera_name="camera",
             T_world_cam=T_world_cam,
         )
         vis.set_poses(poses_cam)
@@ -595,11 +716,121 @@ def _transform_points_se3(T: np.ndarray, pts: np.ndarray) -> np.ndarray:
     return (pts.astype(np.float64) @ T[:3, :3].T + T[:3, 3]).astype(np.float32)
 
 
+@dataclass
+class VisualizerCamera:
+    """An extra camera for `TrackingVisualizer`: its RGB-D video and robot-base pose, shown as a frustum and a point
+    cloud next to the tracked camera's."""
+
+    name: str
+    rgb_frames: np.ndarray
+    depth_m_frames: np.ndarray
+    K: np.ndarray
+    T_world_cam: np.ndarray
+    object_points: np.ndarray | None
+    """`(N, 3)` frame-0 object points (masked depth) in this camera's optical frame, or None"""
+
+
+# Solid colors for the per-camera frame-0 object points: the tracked camera first, then the extra cameras in order
+_OBJECT_POINT_COLORS = ((255, 140, 0), (40, 140, 255), (60, 200, 90), (200, 60, 200))
+
+
+class _CameraCloud:
+    """One camera's frustum, point cloud and visibility checkbox in a `TrackingVisualizer` scene, plus (if
+    `object_points` is given) its static frame-0 object points in a solid color, off by default."""
+
+    def __init__(
+        self,
+        server,
+        name: str,
+        label: str,
+        rgb_frames,
+        depth_m_frames,
+        K,
+        T_world_cam,
+        visible: bool,
+        object_points: np.ndarray | None,
+        object_color: tuple[int, int, int],
+        workspace_bounds,
+    ):
+        H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
+        fy = float(K[1, 1])
+        assert fy > 0, f"{name}: K[1,1] (fy) must be > 0, got {fy}"
+        self.rgb_frames = rgb_frames
+        self.depth_m_frames = depth_m_frames
+        self.K = K
+        self.T_world_cam = T_world_cam
+        assert (
+            workspace_bounds is None or T_world_cam is not None
+        ), f"{name}: workspace_bounds are in the robot-base frame, so T_world_cam is required to crop to them"
+        self.workspace_bounds = workspace_bounds
+        frustum_kwargs: dict = {
+            "fov": float(2.0 * np.arctan(H / (2.0 * fy))),
+            "aspect": W / H,
+            "scale": 0.12,
+            "line_width": 1.5,
+            "image": rgb_frames[0],
+            "format": "jpeg",
+        }
+        if T_world_cam is not None:
+            frustum_kwargs["wxyz"], frustum_kwargs["position"] = MeshUtils._pose_mat_to_wxyz_position(T_world_cam)
+        self.frustum = server.scene.add_camera_frustum(f"/cameras/{name}", **frustum_kwargs)
+        self.pcd = server.scene.add_point_cloud(
+            f"/clouds/{name}",
+            points=np.zeros((1, 3), dtype=np.float32),
+            colors=np.zeros((1, 3), dtype=np.uint8),
+            point_size=0.002,
+            point_shape="circle",
+            visible=visible,
+        )
+        self.checkbox = server.gui.add_checkbox(label, initial_value=visible)
+
+        if object_points is not None:
+            assert (
+                object_points.ndim == 2 and object_points.shape[1] == 3
+            ), f"{name}: object_points must be (N, 3), got {object_points.shape}"
+            if T_world_cam is not None:
+                object_points = _transform_points_se3(T_world_cam, object_points)
+            object_pcd = server.scene.add_point_cloud(
+                f"/object_clouds/{name}",
+                points=np.asarray(object_points, dtype=np.float32),
+                colors=object_color,
+                point_size=0.0015,
+                point_shape="circle",
+                visible=False,
+            )
+            object_checkbox = server.gui.add_checkbox(f"{name} object points (frame 0)", initial_value=False)
+
+            @object_checkbox.on_update
+            def _on_object_toggle(_) -> None:
+                object_pcd.visible = object_checkbox.value
+
+    def update(self, t: int) -> None:
+        """Show frame `t` in the frustum and, if the cloud is enabled, recompute the point cloud."""
+        from r2st.geometry import depth_rgb_to_pointcloud
+
+        self.frustum.image = self.rgb_frames[t]
+        self.pcd.visible = self.checkbox.value
+        if not self.checkbox.value:
+            return
+        pts, colors = depth_rgb_to_pointcloud(self.depth_m_frames[t], self.rgb_frames[t], self.K)
+        if self.T_world_cam is not None:
+            pts = _transform_points_se3(self.T_world_cam, pts)
+        if self.workspace_bounds is not None:
+            inside = self.workspace_bounds.contains(pts)
+            pts, colors = pts[inside], colors[inside]
+        self.pcd.points = pts
+        self.pcd.colors = colors
+
+
 class TrackingVisualizer:
     """Viser scene for pose tracking. Construct as soon as the scaled mesh exists; call `set_poses` later.
 
     If `T_world_cam` is set (robot-base T camera from Example 4), the scene is shown in the robot-base
-    frame. Otherwise it stays in the camera optical frame.
+    frame. Otherwise it stays in the camera optical frame. `camera_name` is the tracked camera (whose RGB-D
+    FoundationPose uses); `extra_cameras` (robot-base frame, so `T_world_cam` is required with them) add their own
+    frustums and point clouds. Every point cloud and the mesh have a visibility checkbox. `object_points` (and each
+    extra camera's) are the frame-0 masked points, shown in a solid color per camera behind an off-by-default checkbox.
+    `workspace_bounds` (a robot-base `WorkspaceBounds`, so `T_world_cam` is required) crops the shown point clouds to it.
     """
 
     def __init__(
@@ -609,11 +840,13 @@ class TrackingVisualizer:
         depth_m_frames: np.ndarray,
         K: np.ndarray,
         mesh_position: np.ndarray,
+        camera_name: str,
         T_world_cam: np.ndarray | None = None,
+        extra_cameras: list[VisualizerCamera] | None = None,
+        object_points: np.ndarray | None = None,
+        workspace_bounds=None,
     ) -> None:
         import viser
-
-        from r2st.geometry import depth_rgb_to_pointcloud
 
         glb_path = Path(glb_path)
         assert glb_path.is_file(), f"GLB not found at {glb_path}"
@@ -638,18 +871,23 @@ class TrackingVisualizer:
             assert np.allclose(T_world_cam[3], [0.0, 0.0, 0.0, 1.0]), f"Bad homogeneous row: {T_world_cam[3]}"
             mesh_position = _transform_points_se3(T_world_cam, mesh_position.reshape(1, 3))[0].astype(np.float64)
 
-        H, W = int(rgb_frames.shape[1]), int(rgb_frames.shape[2])
-        fy = float(K[1, 1])
-        assert fy > 0, f"K[1,1] (fy) must be > 0, got {fy}"
-        fov = float(2.0 * np.arctan(H / (2.0 * fy)))
-        aspect = W / H
+        extra_cameras = [] if extra_cameras is None else extra_cameras
+        assert len(camera_name) > 0, "camera_name must not be empty"
+        assert (
+            T_world_cam is not None or not extra_cameras
+        ), "extra_cameras are shown in the robot-base frame, so T_world_cam (the tracked camera's pose) is required"
+        for cam in extra_cameras:
+            assert cam.name != camera_name, f"extra camera {cam.name!r} is the tracked camera"
+            assert (
+                cam.rgb_frames.shape[0] == self._num_frames
+            ), f"{cam.name} has {cam.rgb_frames.shape[0]} frames, {camera_name} has {self._num_frames}"
+            assert cam.T_world_cam.shape == (4, 4), f"{cam.name}: T_world_cam must be 4x4, got {cam.T_world_cam.shape}"
         wxyz0 = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
 
         self._rgb_frames = rgb_frames
-        self._depth_m_frames = depth_m_frames
-        self._K = K
         self._T_world_cam = T_world_cam
         self._poses_scene: np.ndarray | None = None
+        self._t = 0
 
         self._server = viser.ViserServer()
         if T_world_cam is None:
@@ -669,29 +907,51 @@ class TrackingVisualizer:
             wxyz=wxyz0,
             position=mesh_position,
         )
-        frustum_kwargs: dict = dict(
-            fov=fov,
-            aspect=aspect,
-            scale=0.12,
-            line_width=1.5,
-            image=rgb_frames[0],
-            format="jpeg",
+        self._server.gui.add_markdown(
+            f"FoundationPose tracks with **{camera_name}** (its RGB-D)."
+            + (f" Also shown: {', '.join(cam.name for cam in extra_cameras)}." if extra_cameras else "")
         )
-        if T_world_cam is not None:
-            frustum_wxyz, frustum_pos = MeshUtils._pose_mat_to_wxyz_position(T_world_cam)
-            frustum_kwargs["wxyz"] = frustum_wxyz
-            frustum_kwargs["position"] = frustum_pos
-        self._frustum = self._server.scene.add_camera_frustum("/camera", **frustum_kwargs)
-        pts0, colors0 = depth_rgb_to_pointcloud(depth_m_frames[0], rgb_frames[0], K)
-        if T_world_cam is not None:
-            pts0 = _transform_points_se3(T_world_cam, pts0)
-        self._pcd_handle = self._server.scene.add_point_cloud(
-            "/scene_pcd",
-            points=pts0,
-            colors=colors0,
-            point_size=0.002,
-            point_shape="circle",
-        )
+        mesh_checkbox = self._server.gui.add_checkbox("mesh", initial_value=True)
+
+        @mesh_checkbox.on_update
+        def _on_mesh_toggle(_) -> None:
+            self._mesh_handle.visible = mesh_checkbox.value
+            self._axes_handle.visible = mesh_checkbox.value
+
+        self._clouds = [
+            _CameraCloud(
+                self._server,
+                camera_name,
+                f"{camera_name} point cloud (FoundationPose input)",
+                rgb_frames,
+                depth_m_frames,
+                K,
+                T_world_cam,
+                visible=True,
+                object_points=object_points,
+                workspace_bounds=workspace_bounds,
+                object_color=_OBJECT_POINT_COLORS[0],
+            )
+        ]
+        for i, cam in enumerate(extra_cameras):
+            self._clouds.append(
+                _CameraCloud(
+                    self._server,
+                    cam.name,
+                    f"{cam.name} point cloud",
+                    cam.rgb_frames,
+                    cam.depth_m_frames,
+                    cam.K,
+                    np.asarray(cam.T_world_cam, dtype=np.float64),
+                    visible=True,
+                    object_points=cam.object_points,
+                    workspace_bounds=workspace_bounds,
+                    object_color=_OBJECT_POINT_COLORS[(i + 1) % len(_OBJECT_POINT_COLORS)],
+                )
+            )
+        for cloud in self._clouds:
+            cloud.checkbox.on_update(lambda _, cloud=cloud: cloud.update(self._t))
+            cloud.update(0)
         if T_world_cam is None:
             self._server.initial_camera.up = (0.0, -1.0, 0.0)
             self._server.initial_camera.look_at = mesh_position
@@ -733,15 +993,38 @@ class TrackingVisualizer:
             )
         self._apply_timestep(0)
         if self._num_frames > 1:
+            import threading
+            import time
+
             slider = self._server.gui.add_slider("timestep", min=0, max=self._num_frames - 1, step=1, initial_value=0)
 
             @slider.on_update
             def _on_timestep(_) -> None:
                 self._apply_timestep(int(slider.value))
 
-    def _apply_timestep(self, t: int) -> None:
-        from r2st.geometry import depth_rgb_to_pointcloud
+            play_button = self._server.gui.add_button("Play")
+            playback_fps = self._server.gui.add_slider("playback fps", min=1, max=30, step=1, initial_value=15)
+            playing = threading.Event()
 
+            @play_button.on_click
+            def _on_play(_) -> None:
+                if playing.is_set():
+                    playing.clear()
+                    play_button.label = "Play"
+                else:
+                    playing.set()
+                    play_button.label = "Pause"
+
+            def _play_loop() -> None:
+                # Setting the slider runs _on_timestep, so the scene follows; wraps around at the last frame
+                while True:
+                    playing.wait()
+                    slider.value = (int(slider.value) + 1) % self._num_frames
+                    time.sleep(1.0 / playback_fps.value)
+
+            threading.Thread(target=_play_loop, daemon=True).start()
+
+    def _apply_timestep(self, t: int) -> None:
         assert self._poses_scene is not None, "set_poses must be called before applying timesteps"
         assert 0 <= t < self._num_frames, f"timestep {t} out of range [0, {self._num_frames})"
         wxyz, position = MeshUtils._pose_mat_to_wxyz_position(self._poses_scene[t])
@@ -749,13 +1032,10 @@ class TrackingVisualizer:
         self._mesh_handle.position = position
         self._axes_handle.wxyz = wxyz
         self._axes_handle.position = position
-        self._frustum.image = self._rgb_frames[t]
+        self._t = t
         self._gui_image.image = self._rgb_frames[t]
-        pts, colors = depth_rgb_to_pointcloud(self._depth_m_frames[t], self._rgb_frames[t], self._K)
-        if self._T_world_cam is not None:
-            pts = _transform_points_se3(self._T_world_cam, pts)
-        self._pcd_handle.points = pts
-        self._pcd_handle.colors = colors
+        for cloud in self._clouds:
+            cloud.update(t)
         frame_name = "robot base" if self._T_world_cam is not None else "cam"
         self._pose_md.content = (
             f"**t = {t} / {self._num_frames - 1}**\n\n"

@@ -197,7 +197,7 @@ def project_axes_to_image(pose_cam: np.ndarray, K: np.ndarray, axis_len: float =
             return None
         u = K[0, 0] * p[0] / p[2] + K[0, 2]
         v = K[1, 1] * p[1] / p[2] + K[1, 2]
-        pts_img.append((int(round(u)), int(round(v))))
+        pts_img.append((round(u), round(v)))
     return pts_img
 
 

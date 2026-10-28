@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import hashlib
+import math
 import pathlib
 import shutil
 import threading
@@ -52,8 +53,9 @@ from r2st.utils import (
     H264VideoWriter,
     ImageUtils,
     MeshUtils,
+    erode_mask,  # noqa: F401 (re-exported: examples/estimate_camera_extrinsics*.py import it from here)
     farthest_point_sample_pyg_lib,
-    validate_merged_camera_group,
+    rgb_depth_dataset_paths,
 )
 
 CostFn = Callable[[np.ndarray], tuple[float, list[Any]]]
@@ -488,22 +490,6 @@ def union_top_sam_masks(
     return union, np.flatnonzero(keep)
 
 
-def erode_mask(mask: np.ndarray, kernel_px: int) -> np.ndarray:
-    """Erode a bool mask with an elliptical kernel of size `kernel_px`. `kernel_px=0` is a no-op."""
-    assert mask.ndim == 2, f"mask must be 2D, got {mask.shape}"
-    assert mask.dtype == bool, f"mask dtype must be bool, got {mask.dtype}"
-    assert mask.any(), "Cannot erode an empty mask"
-    assert kernel_px == 0 or (
-        kernel_px >= 1 and kernel_px % 2 == 1
-    ), f"mask_erode_px must be 0 or a positive odd int, got {kernel_px}"
-    if kernel_px == 0:
-        return mask
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_px, kernel_px))
-    eroded = cv2.erode(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
-    assert eroded.any(), f"Mask empty after erode with kernel_px={kernel_px} (had {int(mask.sum())} pixels)"
-    return eroded
-
-
 def dump_top_sam_masks(
     image_bgr: np.ndarray,
     masks: np.ndarray,
@@ -571,13 +557,12 @@ def index_ranges_text(indices: np.ndarray) -> str:
 def load_demo(h5_path: pathlib.Path, camera: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return rgb, depth, and qpos, aligned by frame index (same N)."""
     with h5py.File(h5_path, "r") as f:
-        validate_merged_camera_group(f, h5_path, camera)
+        rgb_path, depth_path = rgb_depth_dataset_paths(f, h5_path, camera)
         assert (
             "obs/qpos" in f
         ), f"{h5_path}: missing 'obs/qpos' (re-merge the demo with data/demonstrations/grail_xarm_july_2/merge_camera_streams.py)"
-        group = f[f"obs/sensor_data/{camera}"]
-        rgb = group["rgb"][:]
-        depth = group["depth"][:]
+        rgb = f[rgb_path][:]
+        depth = f[depth_path][:]
         qpos = np.asarray(f["obs/qpos"][:])
     assert qpos.ndim == 2, f"{h5_path}: obs/qpos must be NxD, got {qpos.shape}"
     assert qpos.shape[0] > 0, f"{h5_path}: obs/qpos is empty"
@@ -1333,7 +1318,7 @@ class ExtrinsicsVisualizerBase:
         @self._iter_slider.on_update
         def _on_iteration(_) -> None:
             value = self._iter_slider.value
-            assert value == value, "iteration slider value is NaN"
+            assert not math.isnan(value), "iteration slider value is NaN"
             value = int(value)
             cap = int(self._n_recorded)
             assert 0 <= value <= self._maxiter, f"iteration {value} not in [0, {self._maxiter}]"

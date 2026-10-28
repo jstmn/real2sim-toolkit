@@ -17,6 +17,7 @@ dependencies = [
     "numpy",
     "onnx>=1.22.0",
     "onnxruntime>=1.28.0",
+    "onnxscript==0.7.2",
     "open3d>=0.19.0",
     "openai",
     "opencv-python>=4.0",
@@ -26,6 +27,7 @@ dependencies = [
     "pyyaml>=6.0.3",
     "requests>=2.34.2",
     "sam3",
+    "tensorrt-cu13==11.4.0.106",
     "termcolor>=3.3.0",
     "torch>=2.13.0",
     "torchvision>=0.28.0",
@@ -65,6 +67,9 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+# Tests that call the real OpenAI API spend credits, so they only run when asked for: `pytest -m live_openai`.
+markers = ["live_openai: calls the real OpenAI API (spends credits)"]
+addopts = "-m 'not live_openai'"
 
 [tool.uv]
 find-links = ["https://data.pyg.org/whl/torch-2.13.0+cu130.html"]

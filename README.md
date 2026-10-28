@@ -31,6 +31,10 @@ uv run hf auth login
 
 # REQUIRED: Get sam3 access at https://huggingface.co/facebook/sam3
 
+# S2M2 stereo depth checkpoints (S/M/L/XL = CH128NTR1/CH192NTR2/CH256NTR3/CH384NTR3)
+# The examples default to XL (--s2m2-model-type XL); download the sizes you use
+uv run hf download minimok/s2m2 CH384NTR3.pth CH256NTR3.pth --local-dir src/r2st/S2M2/weights/pretrain_weights
+
 # Build and start the FoundationPose docker container (docker installation steps at https://docs.docker.com/engine/install/ubuntu/). Note that you need `nvidia-container-toolkit` installed as well (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 # The image is built locally (not pulled) because it's built on CUDA 12.8 + PyTorch 2.8 to support
 # current-gen GPUs (e.g. RTX 50-series/Blackwell). That covers GPU *architectures* back through
@@ -46,30 +50,65 @@ cd /real2sim-toolkit/src/r2st/FoundationPose && bash build_all.sh
 
 ### OPTIONAL
 # Download saved demonstrations (~12 GB, used by Examples 2, 4, and 5). Requires the gcloud CLI (https://cloud.google.com/sdk/docs/install) and `gcloud auth login`
-gcloud storage cp --recursive gs://r2st-public/demonstrations data/
+gcloud storage cp --recursive --no-clobber gs://r2st-public/demonstrations data/
+gcloud storage cp --recursive --no-clobber gs://r2st-public/meshyai data/
 ```
 
 ## Data format
 
-Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of every dataset belongs to frame `i`.
-`r2st.utils.validate_merged_camera_group` checks the required camera datasets.
+Demonstrations are HDF5 files with a ManiSkill-style `obs/` tree. Row `i` of every dataset belongs to frame `i`. Each
+camera group `obs/sensor_data/<cam>/` uses one of two layouts. The examples read both:
+`r2st.utils.rgb_depth_dataset_paths` picks the stereo layout when `obs/sensor_data/<cam>/left/` exists, and the
+single-image layout otherwise. `<cam>` is the value you pass as `--camera` to the examples.
+
+Datasets shared by both layouts:
 
 
-| Dataset                                    | Shape          | Dtype   | Required | Notes                                                                                             |
-| -------------------------------------------- | ---------------- | --------- | ---------- | --------------------------------------------------------------------------------------------------- |
-| `obs/qpos`                                 | `(T, D)`       | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0                |
-| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                                               |
-| `obs/sensor_data/<cam>/depth`              | `(T, H, W)`    | uint16  | yes      | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K                         |
-| `obs/sensor_data/<cam>/timestamp_ms`       | `(T,)`         | float64 | yes      | Time of frame `i` (Unix epoch, ms)                                                                |
-| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)                                 |
-| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms)                               |
-| `obs/qvel`                                 | `(T, D)`       | float64 | no       | Joint velocities, same order as `obs/qpos`                                                        |
-| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)`         | int64   | no       | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
+| Dataset                                    | Shape    | Dtype   | Required | Notes                                                                                             |
+| -------------------------------------------- | ---------- | --------- | ---------- | --------------------------------------------------------------------------------------------------- |
+| `obs/qpos`                                 | `(T, D)` | float64 | yes      | Leading prefix of the Jrl2 robot's actuated joints. Missing joints are pinned to 0********        |
+| `obs/qvel`                                 | `(T, D)` | float64 | no       | Joint velocities, same order as `obs/qpos`                                                        |
+| `obs/robot_arm_ns`, `obs/robot_gripper_ns` | `(T,)`   | int64   | no       | Robot controller clocks. Their `clock` attribute names the clock. Only comparable with themselves |
+| `obs/sensor_data/<cam>/timestamp_ms`       | `(T,)`   | float64 | yes      | Time of frame `i` (Unix epoch, ms)                                                                |
 
-`<cam>` is the value you pass as `--camera` to the examples.
+### Single-image layout
 
-`data/demonstrations/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this format
+One RGB image and an aligned depth image per frame. Checked by `r2st.utils.validate_merged_camera_group`. Used by
+`grail_xarm_july_2` and the panda_utils recordings up to `Oct26_2026_datacollect/CokeInBowl__10-26-2026__13-02-11`.
+
+
+| Dataset                                    | Shape          | Dtype   | Required | Notes                                                                     |
+| -------------------------------------------- | ---------------- | --------- | ---------- | --------------------------------------------------------------------------- |
+| `obs/sensor_data/<cam>/rgb`                | `(T, H, W, 3)` | uint8   | yes      | RGB                                                                       |
+| `obs/sensor_data/<cam>/depth`              | `(T, H, W)`    | uint16  | yes      | Millimeters, aligned to `rgb` (0 = no return). Unproject with the color K |
+| `obs/sensor_data/<cam>/rgb_timestamp_ms`   | `(T,)`         | float64 | yes      | Capture time of the RGB image used for frame `i` (Unix epoch, ms)         |
+| `obs/sensor_data/<cam>/depth_timestamp_ms` | `(T,)`         | float64 | no       | Capture time of the depth image used for frame `i` (Unix epoch, ms)       |
+
+`data/demonstrations/grail_xarm_july_2/README.md` describes how that dataset's raw recordings are merged into this layout
 (`data/demonstrations/grail_xarm_july_2/merge_camera_streams.py`).
+
+### Stereo layout
+
+panda_utils' `log_demonstration.py` records each ZED camera as a rectified stereo pair, with the camera's own depth
+stored as `left/depth_noisy`. Used by the panda_utils recordings from `Oct26_2026_datacollect/Calibration__10-26-2026__18-52-45`
+on. The examples use `left/rgb` and `left/depth_noisy` exactly like `rgb` and `depth` above, so pass
+`--depth-intrinsics-source rgb`. `right/` is used for S2M2 stereo depth by Example 5 (in place of `left/depth_noisy`) and Example 6.
+
+
+| Dataset                                               | Shape          | Dtype   | Required by the examples | Notes                                                                                    |
+| ------------------------------------------------------- | ---------------- | --------- | -------------------------- | ------------------------------------------------------------------------------------------ |
+| `obs/sensor_data/<cam>/left/rgb`                      | `(T, H, W, 3)` | uint8   | yes                      | Rectified left RGB                                                                       |
+| `obs/sensor_data/<cam>/left/rgb_timestamp_ms`         | `(T,)`         | float64 | yes                      | Capture time of the left image used for frame `i` (Unix epoch, ms)                       |
+| `obs/sensor_data/<cam>/left/depth_noisy`              | `(T, H, W)`    | uint16  | yes                      | Camera depth (ZED), mm, aligned to `left/rgb` (0 = no return). Unproject with the left K |
+| `obs/sensor_data/<cam>/left/depth_noisy_timestamp_ms` | `(T,)`         | float64 | no                       | Capture time of the depth image used for frame `i` (Unix epoch, ms)                      |
+| `obs/sensor_data/<cam>/right/rgb`                     | `(T, H, W, 3)` | uint8   | no                       | Rectified right RGB, same size as `left/rgb`                                             |
+| `obs/sensor_data/<cam>/right/rgb_timestamp_ms`        | `(T,)`         | float64 | no                       | Capture time of the right image used for frame `i` (Unix epoch, ms)                      |
+
+`r2st.utils.validate_noisy_depth_camera_group` checks the `left/` RGB-D datasets (what the examples need), and
+`r2st.utils.validate_stereo_depth_camera_group` checks the `left/rgb` + `right/rgb` pair for stereo depth.
+
+Next to each recording, panda_utils also saves `<cam>_camera_info.json`, the ROS camera_info keyed `left`, `depth_noisy`
+and `right` (stereo only). `right.k` equals `left.k` (rectified pair), and `right.p[3]` is `-fx * baseline` (`zed2i`: -31.27 px / 261.08 px = 0.120 m).
 
 ## Examples
 
@@ -93,45 +132,42 @@ uv run python examples/generate_masks_across_trajectory.py \
     --object-description "white robot arm"
 ```
 
-### Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser:
+### Example 3: Generate a mesh for the object in `data/red_T_block_1.png` and visualize it with viser
 
-Exactly one of `--object-description` or `--object-description-from-vlm` is required.
+Exactly one of `--object-description` or `--object-description-from-vlm` is required. Note that generated mesh Isn't scaled to match the object that was observed in the real world. Scaling Is performed In track_object.py
 
 ```bash
 # OpenAI returns "red T block" for red_T_block_1.png; SAM 3 returns no mask for that, but does for "red block".
-uv run python examples/generate_mesh.py --images data/red_T_block_1.png --object-description "red block" --visualize
-uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --object-description-from-vlm --visualize
+uv run python examples/generate_mesh.py --images data/red_T_block_1.png --camera-name unknown --object-description "red block" --visualize
+uv run python examples/generate_mesh.py --images data/raise_cube_0__camera_base__t=0.rgb.png --camera-name camera_base --object-description-from-vlm --visualize
+# Frame 0 of zed2i in Oct26_2026_datacollect/PickCube__10-26-2026__12-56-36/traj_0__VGA.h5
+uv run python examples/generate_mesh.py --images data/PickCube_0__zed2i__t=0.rgb.png --camera-name zed2i --object-description "red cube" --visualize
 ```
 
 ### Example 4: Estimate camera extrinsics and save results to a yaml file.
 
-translation=`[0.77785084, -0.49700028, 0.33626095]`
-
-quaternion_wxyz=`[0.37184729, -0.89248569, -0.22639716, 0.11808135]`
-
-Usage notes:
-
-* The primary cause of a bad optimization result is the existence of points in the robot pointcloud that are not in fact on the robot. This can happen when the robot mask is too large, in which case points from the background are included in the pointcloud. The loss function has a squared error on distance to the simulated pointcloud, so such a point will have a large influence on the optimization result. The first way to handle this is to ensure that frame isn't included: `--ignore-timesteps <bad frame index>`. A second approach is to reduce the maximum allowed point distance: `--max-point-distance-m 1.3` such that these points are filtered out.
+This script estimates the extrinsics matrix of the specified camera using a gradient free free optimization procedure. A seed matrix is generated manually, with a specific value, or with a search procedure.
 
 ![CMA-ES camera extrinsics](media/cma_extrinsics.gif)
 
 ```bash
+# ============ Dataset 1: GRAIL Xarm6, July 2 2026 ============
 
 # Seed CMA-ES with the GUI.
-uv run python examples/estimate_camera_extrinsics.py \
+uv run python examples/estimate_camera_extrinsics_rgb.py \
   --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
   --camera-model-id d435 \
   --depth-intrinsics-source rgb \
-  --n-timesteps 5 \
+  --n-timesteps 10 \
   --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
   --seed-from-gui \
   --visualize \
   --visualize-robot-masks
 
 # You can also seed CMA-ES with a specific pose.
-uv run python examples/estimate_camera_extrinsics.py \
+uv run python examples/estimate_camera_extrinsics_rgb.py \
   --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
   --robot-id xarm7__gripper \
   --camera cam_1 \
@@ -142,16 +178,31 @@ uv run python examples/estimate_camera_extrinsics.py \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
   --visualize
 
-# You can also seed CMA-ES with a specific pose.
+# ============ Dataset 2: RESL Panda, Oct 27 2026 ============
+# CAMERA: zed2i
 uv run python examples/estimate_camera_extrinsics_rgb.py \
-  --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-  --robot-id xarm7__gripper \
-  --camera cam_1 \
-  --camera-model-id d435 \
+  --h5-path data/demonstrations/Oct27_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed2i \
+  --camera-model-id zed2i_vga \
   --depth-intrinsics-source rgb \
-  --n-timesteps 5 \
-  --output-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1__rgb.yaml \
+  --n-timesteps 20 \
+  --per-frame-robot-masks \
+  --output-path data/demonstrations/Oct27_2026_datacollect/extrinsics_zed2i.rgb.yaml \
   --seed-pose 0.8200 -0.7400 0.5400 0.5166 -0.8070 -0.1869 0.2165 \
+  --visualize
+
+# CAMERA: zed
+uv run python examples/estimate_camera_extrinsics_rgb.py \
+  --h5-path data/demonstrations/Oct27_2026_datacollect/Calibration__10-26-2026__18-52-45/traj_0__VGA.h5 \
+  --robot-id panda_zed_wrist_cam__panda_gripper \
+  --camera zed \
+  --camera-model-id zed_vga \
+  --depth-intrinsics-source rgb \
+  --n-timesteps 20 \
+  --per-frame-robot-masks \
+  --output-path data/demonstrations/Oct27_2026_datacollect/extrinsics_zed.rgb.yaml \
+  --seed-pose 0.9296 0.2276 0.1298 0.2800 -0.3911 -0.7200 0.5003 \
   --visualize
 ```
 
@@ -185,36 +236,84 @@ Robot masks: SAM 3 runs on **frame 0** (union of the top `--sam-kmax` masks). Th
 propagated through the rest of the trajectory with SAM 3 `mask_input` plus the previous mask's bbox,
 so contact with an object does not expand the robot mask.
 
-### Example 5: Generate a mesh for the "mustard bottle" seen in the first frame of a
+### Example 5: Track an object with FoundationPose++
 
-demonstration, then track that object through the demonstration:**
-Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
+Track an object through the demonstration. Pass `--visualize` to start a viser server with the mesh and a timestep slider over predicted poses.
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
-FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-path` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
+If the camera has a stereo pair (`<cam>/right/rgb`, see Stereo layout), the depth used for mesh scaling and tracking is S2M2 stereo depth from `left/rgb` + `right/rgb` (`--s2m2-model-type`, default `XL`); otherwise it is the depth stored in the h5. The script prints which one it uses.
+Pass `--scaled-mesh-path <mesh>.glb` to track a known mesh (e.g. a measured ground-truth cube, in meters) instead: it is used as-is, with no Meshy call and no PCA scaling, and outputs go to `<output_dir>/<mesh stem>__<camera>/`. Pass `--unscaled-mesh-path <mesh>.glb` to skip only the Meshy call: the mesh (e.g. the `.unscaled.glb` of an earlier run) is PCA-scaled to the cameras' object points like a Meshy mesh, with outputs also in `<output_dir>/<mesh stem>__<camera>/`. `--object-description` is still the SAM 3 prompt.
+FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-paths` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
+`--cameras`, `--camera-model-ids` and `--extrinsics-paths` are parallel lists. The first camera is tracked (and its
+frame-0 crop is what Meshy gets); every camera's frame-0 object points are merged in the robot-base frame for the PCA
+mesh scaling, so more than one camera requires `--extrinsics-paths`. Those object points come from each camera's
+frame-0 SAM mask eroded by `--object-mask-erode-px` (default 5, about 2 px per side, to drop mixed depth at the object's
+edges); FoundationPose registers with the full mask. The cameras never see the object's bottom, so scaling to the raw
+points makes the mesh too small (about 13% on 4 and 6 cm cubes). By default
+(`--object-pointcloud-processing floor-points+5mm-voxel`) the table plane is fit to the depth around the object; if the
+object rests on it, every object point is also projected onto the plane (the bottom face), and the result is reduced
+to one point per 5 mm voxel. That brought the cubes to within about 2%. Pass `--object-pointcloud-processing none` to
+scale to the raw points. The cloud the mesh is scaled to is saved as `<desc>__scaling_points.ply`. In viser, every camera's point cloud, its frame-0 object points and the mesh have
+visibility checkboxes.
+`--crop-pointcloud-to-workspace --workspace-id vention-franka-table` (an `r2st.constants.WORKSPACE_BOUNDS` id; needs
+`--extrinsics-paths`) shows only the point-cloud points inside that robot-base box. Off by default; it only affects
+the viewer.
 
 ![FoundationPose mustard bottle tracking](media/mustard_bottle__track.foundationpose.gif)
 
 ```bash
-# Start the server: `cd src/r2st/FoundationPose/docker; bash run_container.sh` (you may need sudo for run_container.sh), then in the container:
+# Start the server: `cd src/r2st/FoundationPose/docker; sudo bash run_container.sh`, then in the container:
 cd /real2sim-toolkit/src && python -m r2st.pose_grpc.server
 
-# Track the object in the camera optical frame.
-uv run python examples/track_object.py \
-    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
-    --camera cam_1 \
-    --camera-model-id d435 \
-    --object-description "mustard bottle" \
-    --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
-    --visualize
+# ============ Dataset 1: GRAIL Xarm6, July 2 2026 ============
 
 uv run python examples/track_object.py \
-    --h5-path data/demonstrations/raise_cube_0_merged.h5 \
-    --camera camera_north \
-    --camera-model-id d435 \
-    --object-description "blue cube" \
-    --extrinsics-path data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
+    --h5-path data/demonstrations/grail_xarm_july_2/0802_mustard/demonstration_0/merged_sensor_data.h5 \
+    --cameras cam_1 \
+    --camera-model-ids d435 \
+    --object-description "mustard bottle" \
+    --extrinsics-paths data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
     --visualize
+
+
+# ============ Dataset 2: RESL Panda, Oct 27 2026 ============
+
+# H5_PATH=data/demonstrations/Oct27_2026_datacollect/PickCube_6x6x6cm_Lighting2__10-27-2026__10-27-58/traj_0__VGA.h5  # scene has a lamp here
+H5_PATH=data/demonstrations/Oct27_2026_datacollect/PickCube_6x6x6cm__10-27-2026__10-36-27/traj_0__VGA.h5
+
+# Track with zed2i (both cameras' frame-0 points are merged to scale the Meshy mesh)
+uv run python examples/track_object.py \
+    --h5-path ${H5_PATH} \
+    --cameras zed2i zed \
+    --camera-model-ids zed2i_vga zed_vga \
+    --object-description "red cube" \
+    --extrinsics-paths data/demonstrations/Oct27_2026_datacollect/extrinsics_zed2i.rgb.yaml data/demonstrations/Oct27_2026_datacollect/extrinsics_zed.rgb.yaml \
+    --crop-pointcloud-to-workspace --workspace-id vention-franka-table \
+    --visualize
+
+# Track with zed
+uv run python examples/track_object.py \
+    --h5-path ${H5_PATH} \
+    --cameras zed zed2i \
+    --camera-model-ids zed_vga zed2i_vga \
+    --object-description "red cube" \
+    --extrinsics-paths data/demonstrations/Oct27_2026_datacollect/extrinsics_zed.rgb.yaml data/demonstrations/Oct27_2026_datacollect/extrinsics_zed2i.rgb.yaml \
+    --crop-pointcloud-to-workspace --workspace-id vention-franka-table \
+    --visualize
+```
+
+### Example 6: Compare camera depth with S2M2 stereo depth
+
+For each camera, runs S2M2 on every `left/rgb` + `right/rgb` pair of a stereo-layout h5 (fx from `--camera-model-ids`,
+baseline from `r2st.constants.STEREO_BASELINE_M`), then opens viser with a timestep slider and, per camera, toggles for the
+`left/depth_noisy` and S2M2 point clouds. Clouds are in each camera's optical frame, so cameras overlap; only the first is
+on at start. `color by: source` paints noisy orange and S2M2 blue.
+
+```bash
+uv run python examples/compare_noisy_depth_with_s2m2_depth.py \
+    --h5-path data/demonstrations/Oct26_2026_datacollect/PickCube__10-26-2026__18-55-12/traj_0__VGA.h5 \
+    --cameras zed zed2i zedm \
+    --camera-model-ids zed_vga zed2i_vga zedm_vga
 ```
 
 ## Camera models
@@ -265,10 +364,62 @@ Use grpcio-tools 1.68.1, not this repo's newer `grpcio-tools` dev dependency. Mp
 pins `protobuf<6` (protobuf 5.29 / grpcio 1.82), and protobuf refuses to load stubs whose gencode is newer than its
 runtime. Stubs from 1.68.1 (protobuf 5.28 gencode) load under both that env and this one.
 
+## Stereo depth (S2M2)
+
+`r2st.stereo_depth.S2M2StereoDepth` runs [S2M2](https://github.com/junhong-3dv/s2m2) on a rectified stereo pair
+(vertical disparity < 2 px). The S2M2 package is vendored at `src/r2st/S2M2` and runs in the `uv` venv (no Docker, no
+pip install).
+
+```python
+from r2st.stereo_depth import S2M2StereoDepth
+
+stereo = S2M2StereoDepth("L", refine_iter=3, allow_negative=False, device="cuda")
+result = stereo.predict(left_rgb, right_rgb)  # disparity_px, occlusion, confidence; (H, W) float32
+depth_m = stereo.depth_m(left_rgb, right_rgb, fx=K[0, 0], baseline_m=baseline_m)  # 0 where disparity <= 0
+```
+
+At 672x376 on an RTX 5090, `S` takes about 24 ms per pair, `L` about 54 ms and `XL` about 100 ms (fp16, no `torch.compile`).
+
+### TensorRT
+
+`r2st.stereo_depth.S2M2TensorRTStereoDepth` has the same interface and runs a TensorRT engine of the model. At 672x376
+on an RTX 4090, `XL` (refine_iter 3) takes 44 ms per pair instead of PyTorch's 93 ms, and its disparity differs from
+PyTorch's by a median of 0.04 px (p99 0.75 px) on real ZED 2i frames. Build the engine once per model, refine_iter,
+`allow_negative` and image size (~10 min for `XL`):
+
+```bash
+uv run python examples/build_s2m2_tensorrt_engine.py \
+    --model-type XL --refine-iter 3 --allow-negative False --height 376 --width 672 --device cuda:0
+```
+
+```python
+from r2st.stereo_depth import S2M2TensorRTStereoDepth
+
+stereo = S2M2TensorRTStereoDepth("XL", refine_iter=3, allow_negative=False, image_hw=(376, 672), device="cuda")
+```
+
+The engine is saved in `src/r2st/S2M2/weights/tensorrt/` as
+`<checkpoint>-<sha256[:12]>__refine_iter=<n>__allow_negative=<b>__<W>x<H>__trt<version>__<gpu>.engine`. It runs only
+with the TensorRT version and GPU it was built with, so build it from the env that runs it: this env has
+`tensorrt-cu13`, and Mpc-4-Manipulation's env, which runs the live tracker on CUDA 12 torch, has `tensorrt-cu12`.
+How it is built (`build_s2m2_tensorrt_engine`):
+
+* The model is exported to ONNX (opset 20) under the same fp16 autocast `S2M2StereoDepth` runs it with, so the graph
+  carries autocast's fp16/fp32 casts. TensorRT 11 builds strongly typed networks only (no `--fp16` flag, which
+  upstream's `trtexec` recipe needs), and keeps exactly those types.
+* Builder optimization level 5: at the default 3, TensorRT picks a ~15x slower tactic for the 1x1 convolutions on
+  small feature maps, and the engine is slower than PyTorch (118 ms).
+
+`r2st.stereo_depth.cached_s2m2_depth_m` (used by Examples 5 and 6) caches S2M2 disparity per h5 and camera at
+`<h5_dir>/<h5_stem>/s2m2_disparity/<camera>__model=<checkpoint>-<sha256[:12]>__refine_iter=<n>__frames=<T>.npy`. The
+key is the checkpoint file's hash, so swapping weights never reuses a stale cache, and it is disparity (not depth),
+so changing `fx` or the stereo baseline in `r2st.constants` does not invalidate it.
+
 ## Third party models used
 
 * [SAM 3](https://github.com/jstmn/sam3) (fork of [facebookresearch/sam3](https://github.com/facebookresearch/sam3))
 * [FoundationPose](https://github.com/OpenGVLab/FoundationPose)
+* [S2M2](https://github.com/junhong-3dv/s2m2) — learned stereo matching, vendored at `src/r2st/S2M2` (CC BY-NC 4.0, non-commercial only)
 * [Cutie](https://github.com/hkchengrex/Cutie) — 2D tracker used by default (`FoundationPoseTracker(use_2d_tracker=True)`) to
   re-anchor FoundationPose's translation each frame, with a 6-DoF Kalman filter (`use_kalman_filter=True`)
   fusing that measurement (ported from
