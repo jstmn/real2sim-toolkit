@@ -252,7 +252,10 @@ def build_s2m2_tensorrt_engine(
     assert not engine_path.exists(), f"{engine_path} already exists. Delete it to rebuild."
     stereo = S2M2StereoDepth(model_type, refine_iter=refine_iter, allow_negative=allow_negative, device=device)
     assert stereo.device.type == "cuda", f"TensorRT needs a CUDA device, got {device!r}"
-    example = torch.zeros((1, 3, *_padded_hw(image_hw)), dtype=torch.float32, device=stereo.device)
+    # Two separate tensors: torch.export merges an input passed twice, and the engine would then read only `right`
+    example_left, example_right = (
+        torch.zeros((1, 3, *_padded_hw(image_hw)), dtype=torch.float32, device=stereo.device) for _ in range(2)
+    )
 
     S2M2_TENSORRT_DIR.mkdir(parents=True, exist_ok=True)
     logger = trt.Logger(trt.Logger.WARNING)
@@ -261,11 +264,11 @@ def build_s2m2_tensorrt_engine(
     parser = trt.OnnxParser(network, logger)
     with tempfile.TemporaryDirectory(dir=S2M2_TENSORRT_DIR) as tmp_dir:
         onnx_path = Path(tmp_dir) / "s2m2.onnx"
-        print(f"[info] Exporting S2M2 {model_type} at {example.shape[-1]}x{example.shape[-2]} to ONNX")
+        print(f"[info] Exporting S2M2 {model_type} at {example_left.shape[-1]}x{example_left.shape[-2]} to ONNX")
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
             program = torch.onnx.export(
                 stereo.model,
-                (example, example),
+                (example_left, example_right),
                 dynamo=True,
                 opset_version=_ONNX_OPSET,
                 input_names=list(_TENSORRT_INPUTS),
@@ -282,7 +285,7 @@ def build_s2m2_tensorrt_engine(
         print(
             f"[info] Building the TensorRT {trt.__version__} engine (optimization level {_TENSORRT_OPTIMIZATION_LEVEL})"
         )
-        with torch.cuda.device(example.device):
+        with torch.cuda.device(example_left.device):
             plan = builder.build_serialized_network(network, config)
     assert plan is not None, "TensorRT failed to build the S2M2 engine; see its log above"
     # Write then rename, so an interrupted build never leaves a truncated engine behind
@@ -325,6 +328,7 @@ class S2M2TensorRTStereoDepth(_S2M2StereoDepthBase):
             expected = self._input_shape if name in _TENSORRT_INPUTS else (1, 1, *self._input_shape[2:])
             assert shape == expected, f"{engine_path.name}: {name} is {shape}, expected {expected}"
             assert self._engine.get_tensor_dtype(name) == trt.float32, f"{engine_path.name}: {name} is not float32"
+        self._stream = torch.cuda.Stream(self.device)
         # Reused for every pair: predict copies them to the host before the next pair runs
         self._outputs = tuple(
             torch.empty((1, 1, *self._input_shape[2:]), dtype=torch.float32, device=self.device)
@@ -344,10 +348,17 @@ class S2M2TensorRTStereoDepth(_S2M2StereoDepthBase):
             assert t.shape == self._input_shape and t.dtype == torch.float32, f"{name}: {t.shape} {t.dtype}"
             assert t.is_contiguous(), f"{name} is not contiguous"
             self._context.set_tensor_address(name, t.data_ptr())
-        # On torch's current stream, so it runs after the padding and before the crop, with no extra sync
+        # On its own stream (on the default stream, TensorRT adds syncs of its own), ordered after the padding and
+        # before the crop on torch's current stream. The inputs are recorded on it, so their memory is not reused
+        # while it reads them.
+        current = torch.cuda.current_stream(self.device)
+        self._stream.wait_stream(current)
+        left.record_stream(self._stream)
+        right.record_stream(self._stream)
         with torch.cuda.device(self.device):
-            ran = self._context.execute_async_v3(torch.cuda.current_stream(self.device).cuda_stream)
+            ran = self._context.execute_async_v3(self._stream.cuda_stream)
         assert ran, "TensorRT failed to run the S2M2 engine; see its log above"
+        current.wait_stream(self._stream)
         return self._outputs
 
 
