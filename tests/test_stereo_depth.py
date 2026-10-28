@@ -2,7 +2,13 @@ import numpy as np
 import pytest
 import torch
 
-from r2st.stereo_depth import S2M2_WEIGHTS_DIR, S2M2StereoDepth, disparity_to_depth_m
+from r2st.stereo_depth import (
+    S2M2_WEIGHTS_DIR,
+    S2M2StereoDepth,
+    S2M2TensorRTStereoDepth,
+    disparity_to_depth_m,
+    s2m2_tensorrt_engine_path,
+)
 
 
 class TestDisparityToDepth:
@@ -96,3 +102,61 @@ def test_checkpoint_id_matches_file_sha256(tmp_path, monkeypatch):
     assert stereo_depth.s2m2_checkpoint_id("L") == f"CH256NTR3-{hashlib.sha256(b'weights v1').hexdigest()[:12]}"
     ckpt.write_bytes(b"weights v2")
     assert stereo_depth.s2m2_checkpoint_id("L") == f"CH256NTR3-{hashlib.sha256(b'weights v2').hexdigest()[:12]}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_tensorrt_engine_path_names_its_build(monkeypatch):
+    pytest.importorskip("tensorrt")
+    import tensorrt as trt
+
+    from r2st import stereo_depth
+
+    monkeypatch.setattr(stereo_depth, "s2m2_checkpoint_id", lambda model_type: f"CKPT_{model_type}-0123456789ab")
+    path = s2m2_tensorrt_engine_path("XL", 3, False, (376, 672), "cuda")
+    gpu = torch.cuda.get_device_name(0).replace(" ", "_")
+    assert path.parent == stereo_depth.S2M2_TENSORRT_DIR
+    assert (
+        path.name
+        == f"CKPT_XL-0123456789ab__refine_iter=3__allow_negative=False__672x376__trt{trt.__version__}__{gpu}.engine"
+    )
+    assert stereo_depth._padded_hw((376, 672)) == (384, 672)
+    with pytest.raises(AssertionError):
+        s2m2_tensorrt_engine_path("XL", 0, False, (376, 672), "cuda")
+
+
+def _xl_vga_engine_built() -> bool:
+    """Whether the XL, refine_iter=3, 672x376 engine is built for this env's TensorRT and GPU."""
+    import importlib.util
+
+    if not torch.cuda.is_available() or not (S2M2_WEIGHTS_DIR / "CH384NTR3.pth").is_file():
+        return False
+    if importlib.util.find_spec("tensorrt") is None:
+        return False
+    return s2m2_tensorrt_engine_path("XL", 3, False, (376, 672), "cuda").is_file()
+
+
+@pytest.mark.skipif(
+    not _xl_vga_engine_built(), reason="needs the XL 672x376 TensorRT engine (build_s2m2_tensorrt_engine)"
+)
+class TestS2M2TensorRTStereoDepth:
+    def test_matches_pytorch_on_shifted_pair(self):
+        """The engine is the PyTorch model under the same fp16 autocast, so their disparities nearly agree."""
+        rng = np.random.default_rng(0)
+        shift_px = 8
+        texture = (rng.random((376, 672 + shift_px, 3)) * 255).astype(np.uint8)
+        left = np.ascontiguousarray(texture[:, :-shift_px])
+        right = np.ascontiguousarray(texture[:, shift_px:])
+        disp_trt = S2M2TensorRTStereoDepth("XL", 3, False, (376, 672), "cuda").predict(left, right).disparity_px
+        disp_torch = S2M2StereoDepth("XL", refine_iter=3, allow_negative=False, device="cuda").predict(left, right)
+        assert disp_trt.shape == (376, 672)
+        interior = disp_trt[32:-32, 64:-64]
+        assert abs(float(np.median(interior)) - shift_px) < 0.5, f"median disparity {np.median(interior)}"
+        err = np.abs(disp_trt - disp_torch.disparity_px)[32:-32, 64:-64]
+        assert (
+            np.median(err) < 0.05 and np.percentile(err, 99) < 1.0
+        ), f"median {np.median(err)}, p99 {np.percentile(err, 99)}"
+
+    def test_rejects_other_image_size(self):
+        est = S2M2TensorRTStereoDepth("XL", 3, False, (376, 672), "cuda")
+        with pytest.raises(AssertionError, match="the engine takes"):
+            est.predict(np.zeros((480, 640, 3), np.uint8), np.zeros((480, 640, 3), np.uint8))

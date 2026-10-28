@@ -242,14 +242,18 @@ Track an object through the demonstration. Pass `--visualize` to start a viser s
 Note: FoundationPose runs inside the Docker container (see Installation above), but the rest of the toolkit runs on the host in the `uv` venv.
 `r2st.pose_grpc` bridges the two: a server (`r2st.pose_grpc.server`) runs inside the container and exposes `FoundationPoseTracker`'s `register`/`track` over gRPC; a client (`r2st.pose_grpc.client.FoundationPoseClient`) is used from host-side code (e.g. `examples/track_object.py`) to call it.
 If the camera has a stereo pair (`<cam>/right/rgb`, see Stereo layout), the depth used for mesh scaling and tracking is S2M2 stereo depth from `left/rgb` + `right/rgb` (`--s2m2-model-type`, default `XL`); otherwise it is the depth stored in the h5. The script prints which one it uses.
-Pass `--mesh-path <mesh>.glb` to track a known mesh (e.g. a measured ground-truth cube, in meters) instead: it is used as-is, with no Meshy call and no PCA scaling, and outputs go to `<output_dir>/<mesh stem>__<camera>/`. `--object-description` is still the SAM 3 prompt.
+Pass `--scaled-mesh-path <mesh>.glb` to track a known mesh (e.g. a measured ground-truth cube, in meters) instead: it is used as-is, with no Meshy call and no PCA scaling, and outputs go to `<output_dir>/<mesh stem>__<camera>/`. Pass `--unscaled-mesh-path <mesh>.glb` to skip only the Meshy call: the mesh (e.g. the `.unscaled.glb` of an earlier run) is PCA-scaled to the cameras' object points like a Meshy mesh, with outputs also in `<output_dir>/<mesh stem>__<camera>/`. `--object-description` is still the SAM 3 prompt.
 FoundationPose returns object pose in the camera optical frame. Pass `--extrinsics-paths` with the YAML from Example 4 to also write those poses in the robot-base frame and show the viser scene there.
 `--cameras`, `--camera-model-ids` and `--extrinsics-paths` are parallel lists. The first camera is tracked (and its
 frame-0 crop is what Meshy gets); every camera's frame-0 object points are merged in the robot-base frame for the PCA
-mesh scaling, so more than one camera requires `--extrinsics-paths`. The merged cloud is saved as
-`<desc>__scaling_points.ply`. Those object points come from each camera's frame-0 SAM mask eroded by
-`--object-mask-erode-px` (default 5, about 2 px per side, to drop mixed depth at the object's edges); FoundationPose
-registers with the full mask. In viser, every camera's point cloud, its frame-0 object points and the mesh have
+mesh scaling, so more than one camera requires `--extrinsics-paths`. Those object points come from each camera's
+frame-0 SAM mask eroded by `--object-mask-erode-px` (default 5, about 2 px per side, to drop mixed depth at the object's
+edges); FoundationPose registers with the full mask. The cameras never see the object's bottom, so scaling to the raw
+points makes the mesh too small (about 13% on 4 and 6 cm cubes). By default
+(`--object-pointcloud-processing floor-points+5mm-voxel`) the table plane is fit to the depth around the object; if the
+object rests on it, every object point is also projected onto the plane (the bottom face), and the result is reduced
+to one point per 5 mm voxel. That brought the cubes to within about 2%. Pass `--object-pointcloud-processing none` to
+scale to the raw points. The cloud the mesh is scaled to is saved as `<desc>__scaling_points.ply`. In viser, every camera's point cloud, its frame-0 object points and the mesh have
 visibility checkboxes.
 `--crop-pointcloud-to-workspace --workspace-id vention-franka-table` (an `r2st.constants.WORKSPACE_BOUNDS` id; needs
 `--extrinsics-paths`) shows only the point-cloud points inside that robot-base box. Off by default; it only affects
@@ -375,6 +379,36 @@ depth_m = stereo.depth_m(left_rgb, right_rgb, fx=K[0, 0], baseline_m=baseline_m)
 ```
 
 At 672x376 on an RTX 5090, `S` takes about 24 ms per pair, `L` about 54 ms and `XL` about 100 ms (fp16, no `torch.compile`).
+
+### TensorRT
+
+`r2st.stereo_depth.S2M2TensorRTStereoDepth` has the same interface and runs a TensorRT engine of the model. At 672x376
+on an RTX 4090, `XL` (refine_iter 3) takes 44 ms per pair instead of PyTorch's 93 ms, and its disparity differs from
+PyTorch's by a median of 0.04 px (p99 0.75 px) on real ZED 2i frames. Build the engine once per model, refine_iter,
+`allow_negative` and image size (~10 min for `XL`):
+
+```bash
+uv run python examples/build_s2m2_tensorrt_engine.py \
+    --model-type XL --refine-iter 3 --allow-negative False --height 376 --width 672 --device cuda:0
+```
+
+```python
+from r2st.stereo_depth import S2M2TensorRTStereoDepth
+
+stereo = S2M2TensorRTStereoDepth("XL", refine_iter=3, allow_negative=False, image_hw=(376, 672), device="cuda")
+```
+
+The engine is saved in `src/r2st/S2M2/weights/tensorrt/` as
+`<checkpoint>-<sha256[:12]>__refine_iter=<n>__allow_negative=<b>__<W>x<H>__trt<version>__<gpu>.engine`. It runs only
+with the TensorRT version and GPU it was built with, so build it from the env that runs it: this env has
+`tensorrt-cu13`, and Mpc-4-Manipulation's env, which runs the live tracker on CUDA 12 torch, has `tensorrt-cu12`.
+How it is built (`build_s2m2_tensorrt_engine`):
+
+* The model is exported to ONNX (opset 20) under the same fp16 autocast `S2M2StereoDepth` runs it with, so the graph
+  carries autocast's fp16/fp32 casts. TensorRT 11 builds strongly typed networks only (no `--fp16` flag, which
+  upstream's `trtexec` recipe needs), and keeps exactly those types.
+* Builder optimization level 5: at the default 3, TensorRT picks a ~15x slower tactic for the 1x1 convolutions on
+  small feature maps, and the engine is slower than PyTorch (118 ms).
 
 `r2st.stereo_depth.cached_s2m2_depth_m` (used by Examples 5 and 6) caches S2M2 disparity per h5 and camera at
 `<h5_dir>/<h5_stem>/s2m2_disparity/<camera>__model=<checkpoint>-<sha256[:12]>__refine_iter=<n>__frames=<T>.npy`. The

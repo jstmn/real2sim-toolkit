@@ -1846,6 +1846,23 @@ wheels = [
 ]
 
 [[package]]
+name = "onnx-ir"
+version = "1.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes" },
+    { name = "numpy" },
+    { name = "onnx" },
+    { name = "packaging" },
+    { name = "sympy" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/31/9c/19dee739ae9a7c647ab16fdb990da1b73abe9aa604c4e3c5c30138acc693/onnx_ir-1.1.0.tar.gz", hash = "sha256:b72176de575d820ec26864d17270d58ef886a7cf64db7649d15fcc3d5ae2a8ee", size = 169010, upload-time = "2026-10-20T19:40:42.215Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/eb/80/1a63440081d94e25b96be6b29119f41119fe5c9521063edbdb7baeeb9589/onnx_ir-1.1.0-py3-none-any.whl", hash = "sha256:76cc313a788c073b75271c1b6abb172aaf90fcc6335ed40f9f3238b2064a2fa3", size = 192241, upload-time = "2026-10-20T19:40:40.651Z" },
+]
+
+[[package]]
 name = "onnxruntime"
 version = "1.28.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1861,6 +1878,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/95/df/5486ab03e9be288d5268867054c8b04bebcf95bfd12e801c05cc67703dab/onnxruntime-1.28.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0a83bdb70d143cede762b677789bf2a7acca54b3fb82565601d5c30695aa933c", size = 19214257, upload-time = "2026-07-25T01:22:01.695Z" },
     { url = "https://files.pythonhosted.org/packages/3e/3b/986ca67c274932ba9ac5332fb10de56f643dfd433c74e33f8ae8f847cf24/onnxruntime-1.28.0-cp312-cp312-win_amd64.whl", hash = "sha256:c35064f9b3c43c81c5d5d282091401d0f1ff22796d93ccade4ea2ece5e137ab8", size = 13755036, upload-time = "2026-07-25T01:22:26.89Z" },
     { url = "https://files.pythonhosted.org/packages/1d/46/059dba81d46c6ba88e0c2d1c64321ac8098847d678423300a183d42ecbd6/onnxruntime-1.28.0-cp312-cp312-win_arm64.whl", hash = "sha256:e02feeb0165c5f13b4cc954738078d59b90128516ac12b671ee24a530242bf02", size = 13454462, upload-time = "2026-07-25T01:22:17.38Z" },
+]
+
+[[package]]
+name = "onnxscript"
+version = "0.7.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "ml-dtypes" },
+    { name = "numpy" },
+    { name = "onnx" },
+    { name = "onnx-ir" },
+    { name = "packaging" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/0a/01/3e3fab8d643ca097ea4aa9e51246643699dfaaa0650589744fe44bc46651/onnxscript-0.7.2.tar.gz", hash = "sha256:2c664f6383d10f332a4d47b2876dcab16dba84909fe703656b19abc281fda165", size = 646719, upload-time = "2026-09-09T17:06:44.567Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/3b/06260997cdc41138e58718588a6c87d0eb342bbe0dda8a6aae91d163c384/onnxscript-0.7.2-py3-none-any.whl", hash = "sha256:d0e7121c6a1eefd608058928e111cbdb76709f70d269ff0d07aee493bd1d13c9", size = 754215, upload-time = "2026-09-09T17:06:46.442Z" },
 ]
 
 [[package]]
@@ -2373,6 +2407,7 @@ dependencies = [
     { name = "numpy" },
     { name = "onnx" },
     { name = "onnxruntime" },
+    { name = "onnxscript" },
     { name = "open3d" },
     { name = "openai" },
     { name = "opencv-python" },
@@ -2382,6 +2417,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "sam3" },
+    { name = "tensorrt-cu13" },
     { name = "termcolor" },
     { name = "torch" },
     { name = "torchvision" },
@@ -2425,6 +2461,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "onnx", specifier = ">=1.22.0" },
     { name = "onnxruntime", specifier = ">=1.28.0" },
+    { name = "onnxscript", specifier = "==0.7.2" },
     { name = "open3d", specifier = ">=0.19.0" },
     { name = "openai" },
     { name = "opencv-python", specifier = ">=4.0" },
@@ -2434,6 +2471,7 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "sam3", editable = "src/r2st/sam3" },
+    { name = "tensorrt-cu13", specifier = "==11.4.0.106" },
     { name = "termcolor", specifier = ">=3.3.0" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "torchvision", specifier = ">=0.28.0" },
@@ -2875,6 +2913,33 @@ sdist = { url = "https://files.pythonhosted.org/packages/46/58/8c37dea7bbf769b20
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/55/db07de81b5c630da5cbf5c7df646580ca26dfaefa593667fc6f2fe016d2e/tabulate-0.10.0-py3-none-any.whl", hash = "sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3", size = 39814, upload-time = "2026-03-04T18:55:31.284Z" },
 ]
+
+[[package]]
+name = "tensorrt-cu13"
+version = "11.4.0.106"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "tensorrt-cu13-bindings" },
+    { name = "tensorrt-cu13-libs" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/57/df/a0044af5a9becb484004fcbfb9bf91758ae7bc42dc85a5a91dd30d0c420a/tensorrt_cu13-11.4.0.106.tar.gz", hash = "sha256:ae8489f9e0b9593eaa67ced3422864f5d5d597bbcb2caafb58f8afb293977271", size = 17970, upload-time = "2026-10-08T18:46:38.79Z" }
+
+[[package]]
+name = "tensorrt-cu13-bindings"
+version = "11.4.0.106"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/60/b6/f1a28d45bc43d98954381a14417b4254f8c96fbd7813427776feb8b20f21/tensorrt_cu13_bindings-11.4.0.106-cp312-none-manylinux_2_28_x86_64.whl", hash = "sha256:5fc7a6c412881f7212030893bd5531b1a0ff415c72c7678dfe4ead7a7765b38d", size = 1261182, upload-time = "2026-10-08T18:50:04.596Z" },
+    { url = "https://files.pythonhosted.org/packages/64/f4/e58cf129437aa6b0e9a79b3ce506f00f25699a123cbdfe55d62d12d9c331/tensorrt_cu13_bindings-11.4.0.106-cp312-none-manylinux_2_35_aarch64.whl", hash = "sha256:b5e20f07857f1065ecc80cfb319acf62bd39755b512baa8e1932014edf1aab6c", size = 1232740, upload-time = "2026-10-08T18:50:27.481Z" },
+    { url = "https://files.pythonhosted.org/packages/8d/93/9ea63e5161fb60fff9b4b678ff665b712cd562264cc743c2733584a37420/tensorrt_cu13_bindings-11.4.0.106-cp312-none-win_amd64.whl", hash = "sha256:29f4a027db683f5b86824cc7df79d357a1b6f3b8401761ef6497c1ae81f21dc3", size = 895997, upload-time = "2026-10-08T18:50:51.96Z" },
+    { url = "https://files.pythonhosted.org/packages/97/f3/d784f25c45bfdd95f23fee2b1d30b7f4cb01e41163f7ffc8533eed038023/tensorrt_cu13_bindings-11.4.0.106-cp312-none-win_arm64.whl", hash = "sha256:33d4eb012c0e573dadf63e564dea25c357bb34bd2a6b0cad00e1b6baf82bef45", size = 833245, upload-time = "2026-10-08T18:51:10.036Z" },
+]
+
+[[package]]
+name = "tensorrt-cu13-libs"
+version = "11.4.0.106"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/3e/a0/328dd4e184ec6e3296a1676a2f7c2d014faf53c32339f3dd4f358ddeb1b1/tensorrt_cu13_libs-11.4.0.106.tar.gz", hash = "sha256:fc29af15a9bb5489567a58a98a56d457de64c16ab3c8ea010ef21447ff29bbea", size = 15508, upload-time = "2026-10-08T18:48:37.773Z" }
 
 [[package]]
 name = "termcolor"

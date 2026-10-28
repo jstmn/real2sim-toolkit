@@ -1,6 +1,7 @@
 import dataclasses
 import pathlib
 import time
+from typing import Literal
 
 import cv2
 import h5py
@@ -20,7 +21,7 @@ from r2st.geometry import (
     masked_depth_to_points,
     transform_pose_cam_to_world,
 )
-from r2st.mesh_scaling import scale_glb_to_pointcloud
+from r2st.mesh_scaling import floor_points_and_voxelize, scale_glb_to_pointcloud
 from r2st.pose_grpc.client import FoundationPoseClient
 from r2st.stereo_depth import cached_s2m2_depth_m
 from r2st.utils import (
@@ -44,6 +45,11 @@ from r2st.utils import (
         --extrinsics-paths data/demonstrations/grail_xarm_july_2/extrinsics_cam_1.yaml \
         --visualize
 """
+
+
+# Scene points for the table-plane fit leave out the object mask dilated by this kernel, so the object's edges (where
+# the mask and depth disagree) are not mistaken for table
+SCENE_EXCLUDE_DILATE_PX = 25
 
 
 @dataclasses.dataclass
@@ -70,10 +76,14 @@ class Args:
     output_dir: pathlib.Path = pathlib.Path("data/meshyai")
     """Directory to save generated mesh assets and tracking outputs."""
 
-    mesh_path: pathlib.Path | None = None
+    scaled_mesh_path: pathlib.Path | None = None
     """Known mesh of the object (e.g. measured ground truth), in meters. Used as-is: no Meshy and no PCA scaling.
     Outputs go to <output_dir>/<mesh stem>__<camera>/. --object-description is still the SAM 3 prompt. Takes a single
     camera, since extra cameras are only used for scaling."""
+
+    unscaled_mesh_path: pathlib.Path | None = None
+    """Mesh of the object at an unknown scale (e.g. from an earlier Meshy run). Used instead of calling Meshy, then
+    PCA-scaled to the cameras' object points like a Meshy mesh. Outputs go to <output_dir>/<mesh stem>__<camera>/."""
 
     server_address: str = "localhost:50051"
     """gRPC address of the FoundationPose pose-tracking server."""
@@ -121,6 +131,13 @@ class Args:
     s2m2_refine_iter: int = 3
     """S2M2 local refinement iterations, used when the camera has a left/right stereo pair."""
 
+    object_pointcloud_processing: Literal["none", "floor-points+5mm-voxel"] = "floor-points+5mm-voxel"
+    """How the merged frame-0 object points are processed before the Meshy mesh is scaled to them (see
+    r2st.mesh_scaling.floor_points_and_voxelize). 'floor-points+5mm-voxel': fit the table plane to the scene points
+    around the object; if the object rests on it, add every object point projected onto the plane (the bottom face no
+    camera sees); then keep one point per 5 mm voxel. On the 4 and 6 cm red cubes this cut the size error from about 13%
+    to about 1.5%. 'none': scale to the object points as-is. Not used with --scaled-mesh-path."""
+
 
 @dataclasses.dataclass
 class CameraObservation:
@@ -136,6 +153,9 @@ class CameraObservation:
     """`(H, W)` bool object mask on frame 0"""
     object_pts0: np.ndarray
     """`(N, 3)` frame-0 object points in this camera's optical frame"""
+    scene_pts0: np.ndarray
+    """`(M, 3)` frame-0 points away from the object (outside the mask dilated by `SCENE_EXCLUDE_DILATE_PX`), in this
+    camera's optical frame. Used to fit the table plane for --object-pointcloud-processing."""
 
 
 def _load_rgb_depth_m(args: Args, camera: str, camera_model_id: str, fx: float) -> tuple[np.ndarray, np.ndarray]:
@@ -194,7 +214,11 @@ def _observe_camera(args: Args, predictor: SAM3Predictor, camera: str, camera_mo
             f"({int(points_mask.sum())} / {int(mask0.sum())} pixels)"
         )
     object_pts0 = masked_depth_to_points(depth_m[0], points_mask, K)
-    return CameraObservation(camera=camera, K=K, rgb=rgb, depth_m=depth_m, mask0=mask0, object_pts0=object_pts0)
+    near_object = cv2.dilate(mask0.astype(np.uint8), np.ones((SCENE_EXCLUDE_DILATE_PX,) * 2, np.uint8)).astype(bool)
+    scene_pts0 = masked_depth_to_points(depth_m[0], ~near_object & (depth_m[0] > 0), K)
+    return CameraObservation(
+        camera=camera, K=K, rgb=rgb, depth_m=depth_m, mask0=mask0, object_pts0=object_pts0, scene_pts0=scene_pts0
+    )
 
 
 def _log_elapsed(label: str, t0: float) -> None:
@@ -260,12 +284,21 @@ def main(args: Args) -> None:
             "--extrinsics-paths is required with more than one camera: their point clouds are merged in the "
             "robot-base frame"
         )
-        assert (
-            args.mesh_path is None
-        ), "--mesh-path is used as-is (no scaling), and extra cameras are only used for scaling. Pass one camera."
-    if args.mesh_path is not None:
-        assert args.mesh_path.is_file(), f"--mesh-path not found: {args.mesh_path}"
-        assert args.mesh_path.suffix == ".glb", f"--mesh-path must be a .glb, got {args.mesh_path}"
+        assert args.scaled_mesh_path is None, (
+            "--scaled-mesh-path is used as-is (no scaling), and extra cameras are only used for scaling. Pass one "
+            "camera."
+        )
+    assert (
+        args.scaled_mesh_path is None or args.unscaled_mesh_path is None
+    ), "Pass at most one of --scaled-mesh-path and --unscaled-mesh-path"
+    for flag, path in (
+        ("--scaled-mesh-path", args.scaled_mesh_path),
+        ("--unscaled-mesh-path", args.unscaled_mesh_path),
+    ):
+        if path is not None:
+            assert path.is_file(), f"{flag} not found: {path}"
+            assert path.suffix == ".glb", f"{flag} must be a .glb, got {path}"
+    given_mesh_path = args.scaled_mesh_path if args.scaled_mesh_path is not None else args.unscaled_mesh_path
 
     workspace_bounds = None
     assert (
@@ -308,7 +341,7 @@ def main(args: Args) -> None:
     rgb0, depth0 = rgb_all[0], depth_m_all[0]
     image_bgr0 = cv2.cvtColor(rgb0, cv2.COLOR_RGB2BGR)
 
-    object_slug = args.object_description.replace(" ", "_") if args.mesh_path is None else args.mesh_path.stem
+    object_slug = args.object_description.replace(" ", "_") if given_mesh_path is None else given_mesh_path.stem
     asset_dir = args.output_dir / f"{object_slug}__{camera}"
     asset_dir.mkdir(parents=True, exist_ok=True)
     masked_cropped_path = ImageUtils.save_masked_debug(image_bgr0, mask, asset_dir, object_slug)
@@ -316,18 +349,22 @@ def main(args: Args) -> None:
         bgr0 = cv2.cvtColor(obs.rgb[0], cv2.COLOR_RGB2BGR)
         ImageUtils.save_masked_debug(bgr0, obs.mask0, asset_dir, f"{object_slug}__scaling_view_{obs.camera}")
 
-    if args.mesh_path is None:
-        # Same path examples/generate_mesh.py writes for this object and --camera-name, so its mesh is reused
-        glb_path = asset_dir / f"{object_slug}.unscaled.glb"
-        print(f"[info] Generating mesh with Meshy (reuses {glb_path} if present) ...")
-        glb_path = MeshUtils.generate_with_meshy([masked_cropped_path], glb_path)
-        assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
-        print(f"[info] Mesh: {glb_path.resolve()} ({glb_path.stat().st_size} bytes)")
+    if args.scaled_mesh_path is None:
+        if args.unscaled_mesh_path is None:
+            # Same path examples/generate_mesh.py writes for this object and --camera-name, so its mesh is reused
+            glb_path = asset_dir / f"{object_slug}.unscaled.glb"
+            print(f"[info] Generating mesh with Meshy (reuses {glb_path} if present) ...")
+            glb_path = MeshUtils.generate_with_meshy([masked_cropped_path], glb_path)
+            assert glb_path.is_file(), f"Mesh file not created at {glb_path}"
+            print(f"[info] Mesh: {glb_path.resolve()} ({glb_path.stat().st_size} bytes)")
+        else:
+            glb_path = args.unscaled_mesh_path
+            print(f"[info] Using --unscaled-mesh-path (no Meshy, PCA-scaled below): {glb_path.resolve()}")
 
         # Merge every camera's frame-0 object points. PCA eigenvalues are pose-invariant, so any common frame works:
         # the robot base when extrinsics are given, else the (single) camera's optical frame.
         if T_world_cams is None:
-            scaling_pts = tracked.object_pts0
+            scaling_pts, scene_pts = tracked.object_pts0, tracked.scene_pts0
         else:
             per_camera = [
                 obs.object_pts0 @ T[:3, :3].T + T[:3, 3] for obs, T in zip(observations, T_world_cams, strict=True)
@@ -337,6 +374,13 @@ def main(args: Args) -> None:
                     f"[info] {obs.camera}: {len(pts)} object points, centroid (robot base) {np.round(pts.mean(0), 4)}"
                 )
             scaling_pts = np.concatenate(per_camera, axis=0)
+            scene_pts = np.concatenate(
+                [obs.scene_pts0 @ T[:3, :3].T + T[:3, 3] for obs, T in zip(observations, T_world_cams, strict=True)],
+                axis=0,
+            )
+        if args.object_pointcloud_processing == "floor-points+5mm-voxel":
+            scaling_pts, summary = floor_points_and_voxelize(scaling_pts, scene_pts)
+            print(f"[info] Object point cloud processing ({args.object_pointcloud_processing}): {summary}")
         scaling_pts_path = asset_dir / f"{object_slug}__scaling_points.ply"
         trimesh.PointCloud(scaling_pts).export(scaling_pts_path)
         print(f"[info] Saved the merged scaling point cloud ({len(scaling_pts)} points) to {scaling_pts_path}")
@@ -351,8 +395,8 @@ def main(args: Args) -> None:
             t0,
         )
     else:
-        scaled_glb_path = args.mesh_path
-        print(f"[info] Using --mesh-path as-is (no Meshy, no scaling): {scaled_glb_path.resolve()}")
+        scaled_glb_path = args.scaled_mesh_path
+        print(f"[info] Using --scaled-mesh-path as-is (no Meshy, no scaling): {scaled_glb_path.resolve()}")
     mesh_path_abs = str(scaled_glb_path.resolve())
     if args.gif:
         gif_path = asset_dir / f"{object_slug}__orbit.gif"
