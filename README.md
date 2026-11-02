@@ -293,3 +293,15 @@ Error inside the container: `CUDA initialization: ... Error 804: forward compati
 `docker build` fails with `docker-credential-pass: executable file not found in $PATH`: `credsStore` in `~/.docker/config.json` is `pass`, but the helper is not on `PATH`. Put `$HOME/.local/bin` on `PATH` (a literal `~/.local/bin` in PATH is not expanded) and retry.
 
 `estimate_camera_extrinsics*.py` fails with `AssertionError: SAM 3 propagation produced an empty mask`: propagation lost the robot partway through the demo. Pass `--per-frame-robot-masks` to segment each frame independently.
+
+## Bibtex
+
+```
+@software{r2st,
+  author = {Jeremy Morgan},
+  title  = {real2sim-toolkit},
+  url    = {https://github.com/jstmn/real2sim-toolkit},
+  year   = {2026},
+  note   = {Git commit \texttt{<FILL IN>}, accessed <FILL IN>}
+}
+```
